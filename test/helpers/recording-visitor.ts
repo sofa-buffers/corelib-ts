@@ -1,0 +1,159 @@
+/**
+ * Visitors used by the decode tests.
+ *
+ * {@link TranscodeVisitor} re-encodes everything it decodes into a fresh
+ * {@link OStream}; if the re-encoded bytes equal the input, the decoder read
+ * every field, value and length correctly. {@link RecordingVisitor} instead
+ * collects a flat event log for direct value assertions.
+ */
+
+import { ArrayKind, FixlenSubtype, OStream, type Visitor } from "../../src/index.js";
+
+/** Decodes into an OStream so the round-tripped bytes can be compared to input. */
+export class TranscodeVisitor implements Visitor {
+  private array: { kind: ArrayKind; id: number; vals: (bigint | number)[] } | null = null;
+  private fix: { sub: FixlenSubtype; id: number; buf: Uint8Array; got: number } | null = null;
+
+  constructor(private readonly out: OStream) {}
+
+  unsigned(id: number, value: bigint): void {
+    this.out.writeUnsigned(id, value);
+  }
+  signed(id: number, value: bigint): void {
+    this.out.writeSigned(id, value);
+  }
+  fp32(id: number, value: number): void {
+    this.out.writeFp32(id, value);
+  }
+  fp64(id: number, value: number): void {
+    this.out.writeFp64(id, value);
+  }
+
+  string(id: number, total: number, offset: number, chunk: Uint8Array): void {
+    this.fixChunk(FixlenSubtype.String, id, total, offset, chunk);
+  }
+  blob(id: number, total: number, offset: number, chunk: Uint8Array): void {
+    this.fixChunk(FixlenSubtype.Blob, id, total, offset, chunk);
+  }
+
+  arrayBegin(id: number, kind: ArrayKind, _count: number): void {
+    this.array = { kind, id, vals: [] };
+  }
+  arrayUnsigned(_id: number, _index: number, value: bigint): void {
+    this.array!.vals.push(value);
+  }
+  arraySigned(_id: number, _index: number, value: bigint): void {
+    this.array!.vals.push(value);
+  }
+  arrayFp32(_id: number, _index: number, value: number): void {
+    this.array!.vals.push(value);
+  }
+  arrayFp64(_id: number, _index: number, value: number): void {
+    this.array!.vals.push(value);
+  }
+  arrayEnd(id: number): void {
+    const a = this.array!;
+    this.array = null;
+    if (a.kind === ArrayKind.Unsigned) this.out.writeUnsignedArray(id, a.vals);
+    else if (a.kind === ArrayKind.Signed) this.out.writeSignedArray(id, a.vals);
+    else if (a.kind === ArrayKind.Fp32) this.out.writeFp32Array(id, a.vals as number[]);
+    else this.out.writeFp64Array(id, a.vals as number[]);
+  }
+
+  sequenceBegin(id: number): Visitor {
+    this.out.writeSequenceBegin(id);
+    return this; // single shared OStream — nesting is encoded by begin/end calls
+  }
+  sequenceEnd(): void {
+    this.out.writeSequenceEnd();
+  }
+
+  private fixChunk(sub: FixlenSubtype, id: number, total: number, offset: number, chunk: Uint8Array): void {
+    if (this.fix === null || this.fix.id !== id || this.fix.sub !== sub) {
+      this.fix = { sub, id, buf: new Uint8Array(total), got: 0 };
+    }
+    this.fix.buf.set(chunk, offset);
+    this.fix.got += chunk.length;
+    if (this.fix.got >= total) {
+      this.out.writeFixlen(id, this.fix.buf, sub);
+      this.fix = null;
+    }
+  }
+}
+
+/** One decoded event, for direct assertions. */
+export type Event =
+  | { kind: "unsigned"; id: number; value: bigint }
+  | { kind: "signed"; id: number; value: bigint }
+  | { kind: "fp32"; id: number; value: number }
+  | { kind: "fp64"; id: number; value: number }
+  | { kind: "string"; id: number; text: string }
+  | { kind: "blob"; id: number; bytes: Uint8Array }
+  | { kind: "array"; id: number; arrayKind: ArrayKind; values: (bigint | number)[] }
+  | { kind: "sequenceBegin"; id: number }
+  | { kind: "sequenceEnd" };
+
+/** Collects a flat event log; string/blob chunks are concatenated. */
+export class RecordingVisitor implements Visitor {
+  readonly events: Event[] = [];
+  private array: { id: number; arrayKind: ArrayKind; values: (bigint | number)[] } | null = null;
+  private fix: { id: number; isString: boolean; buf: Uint8Array; got: number } | null = null;
+
+  unsigned(id: number, value: bigint): void {
+    this.events.push({ kind: "unsigned", id, value });
+  }
+  signed(id: number, value: bigint): void {
+    this.events.push({ kind: "signed", id, value });
+  }
+  fp32(id: number, value: number): void {
+    this.events.push({ kind: "fp32", id, value });
+  }
+  fp64(id: number, value: number): void {
+    this.events.push({ kind: "fp64", id, value });
+  }
+  string(id: number, total: number, offset: number, chunk: Uint8Array): void {
+    this.fixChunk(true, id, total, offset, chunk);
+  }
+  blob(id: number, total: number, offset: number, chunk: Uint8Array): void {
+    this.fixChunk(false, id, total, offset, chunk);
+  }
+  arrayBegin(id: number, kind: ArrayKind): void {
+    this.array = { id, arrayKind: kind, values: [] };
+  }
+  arrayUnsigned(_id: number, _i: number, value: bigint): void {
+    this.array!.values.push(value);
+  }
+  arraySigned(_id: number, _i: number, value: bigint): void {
+    this.array!.values.push(value);
+  }
+  arrayFp32(_id: number, _i: number, value: number): void {
+    this.array!.values.push(value);
+  }
+  arrayFp64(_id: number, _i: number, value: number): void {
+    this.array!.values.push(value);
+  }
+  arrayEnd(id: number): void {
+    this.events.push({ kind: "array", id, arrayKind: this.array!.arrayKind, values: this.array!.values });
+    this.array = null;
+  }
+  sequenceBegin(id: number): Visitor {
+    this.events.push({ kind: "sequenceBegin", id });
+    return this;
+  }
+  sequenceEnd(): void {
+    this.events.push({ kind: "sequenceEnd" });
+  }
+
+  private fixChunk(isString: boolean, id: number, total: number, offset: number, chunk: Uint8Array): void {
+    if (this.fix === null || this.fix.id !== id || this.fix.isString !== isString) {
+      this.fix = { id, isString, buf: new Uint8Array(total), got: 0 };
+    }
+    this.fix.buf.set(chunk, offset);
+    this.fix.got += chunk.length;
+    if (this.fix.got >= total) {
+      if (isString) this.events.push({ kind: "string", id, text: new TextDecoder().decode(this.fix.buf) });
+      else this.events.push({ kind: "blob", id, bytes: this.fix.buf });
+      this.fix = null;
+    }
+  }
+}

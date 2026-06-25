@@ -1,0 +1,74 @@
+{
+  "name": "@sofabuffers/corelib",
+  "version": "0.1.0",
+  "description": "Streaming, dependency-free TypeScript implementation of the SofaBuffers binary serialization format — usable from Node.js, browsers, Electron, and classic <script>.",
+  "keywords": [
+    "sofabuffers",
+    "serialization",
+    "deserialization",
+    "binary",
+    "streaming",
+    "varint",
+    "tlv",
+    "protocol",
+    "encoding"
+  ],
+  "license": "MIT",
+  "author": "SofaBuffers",
+  "homepage": "https://github.com/sofa-buffers/corelib-ts#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sofa-buffers/corelib-ts.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sofa-buffers/corelib-ts/issues"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "unpkg": "./dist/index.global.js",
+  "jsdelivr": "./dist/index.global.js",
+  "exports": {
+    ".": {
+      "types": {
+        "import": "./dist/index.d.ts",
+        "require": "./dist/index.d.cts"
+      },
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage",
+    "bench": "tsx bench/bench.ts",
+    "perf": "tsx bench/perf.ts",
+    "bench:callgrind": "bash bench/run_callgrind.sh",
+    "docs": "typedoc",
+    "prepublishOnly": "npm run typecheck && npm run test && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@vitest/coverage-v8": "^2.1.8",
+    "tsup": "^8.3.5",
+    "tsx": "^4.19.2",
+    "typedoc": "^0.27.9",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

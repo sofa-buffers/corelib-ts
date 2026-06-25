@@ -1,0 +1,14 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["src/index.ts"],
+  "out": "docs",
+  "name": "SofaBuffers TypeScript",
+  "readme": "none",
+  "githubPages": true,
+  "includeVersion": true,
+  "excludeInternal": true,
+  "navigationLinks": {
+    "GitHub": "https://github.com/sofa-buffers/corelib-ts",
+    "SofaBuffers": "https://github.com/sofa-buffers"
+  }
+}

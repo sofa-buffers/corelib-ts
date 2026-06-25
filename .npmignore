@@ -1,0 +1,14 @@
+# Publish only the built package + docs; source, tests and tooling stay out.
+src/
+test/
+bench/
+docs/
+coverage/
+typedoc.json
+.github/
+.devcontainer/
+tsconfig*.json
+tsup.config.ts
+vitest.config.ts
+test_vectors.json
+*.tsbuildinfo

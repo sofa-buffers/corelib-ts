@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build (ESM + CJS + IIFE + types)
+        run: npm run build
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+
+      - name: Coverage
+        run: npm run coverage
+
+      - name: Compute badge JSON from lcov
+        run: |
+          mkdir -p "$RUNNER_TEMP/badges"
+          awk -F: '
+            /^LF:/ { lf += $2 } /^LH:/ { lh += $2 }
+            /^BRF:/ { brf += $2 } /^BRH:/ { brh += $2 }
+            END {
+              lines    = (lf  > 0) ? lh  / lf  * 100 : 0
+              branches = (brf > 0) ? brh / brf * 100 : 0
+              printf "%.1f %.1f\n", lines, branches
+            }' coverage/lcov.info > "$RUNNER_TEMP/pct.txt"
+          read LINES BRANCHES < "$RUNNER_TEMP/pct.txt"
+          color() {
+            awk -v v="$1" 'BEGIN { print (v+0 >= 90) ? "brightgreen" : (v+0 >= 75) ? "yellow" : "red" }'
+          }
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' \
+            "$LINES" "$(color "$LINES")" > "$RUNNER_TEMP/badges/coverage.json"
+          printf '{"schemaVersion":1,"label":"branches","message":"%s%%","color":"%s"}\n' \
+            "$BRANCHES" "$(color "$BRANCHES")" > "$RUNNER_TEMP/badges/branches.json"
+          echo "coverage=$LINES% branches=$BRANCHES%"
+
+      - name: Publish badges to the badges branch
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan badges
+          git reset --hard
+          cp "$RUNNER_TEMP/badges/coverage.json" "$RUNNER_TEMP/badges/branches.json" .
+          git add coverage.json branches.json
+          git commit -m "ci: update coverage badges"
+          git push -f origin badges
+
+  docs:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Build API docs (TypeDoc)
+        run: npm run docs
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
