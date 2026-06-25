@@ -7,6 +7,12 @@
  * so the wire type lives in the low three bits and the field id in the rest.
  */
 
+/**
+ * The SofaBuffers API version this library implements. The generator and other
+ * tooling read it to verify compatibility. Bumped only on a breaking API change.
+ */
+export const API_VERSION = 1;
+
 /** The three low bits of a field header: what kind of field follows. */
 export const WireType = {
   /** Unsigned varint scalar. */

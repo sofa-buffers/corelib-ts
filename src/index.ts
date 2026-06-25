@@ -25,6 +25,7 @@
  */
 
 export {
+  API_VERSION,
   ArrayKind,
   FixlenSubtype,
   WireType,

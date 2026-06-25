@@ -42,7 +42,7 @@ const DEFAULT_CAPACITY = 256;
 export class OStream {
   private buf: Uint8Array;
   private pos: number;
-  private readonly start: number;
+  private start: number;
   private readonly flushSink: FlushSink | undefined;
   private readonly canGrow: boolean;
   private depth = 0;
@@ -92,6 +92,23 @@ export class OStream {
       this.flushSink(this.buf.subarray(this.start, this.pos));
       this.pos = this.start;
     }
+  }
+
+  /**
+   * Install a fresh output buffer to write into, mid-stream. Intended for the
+   * streaming (flush-sink) mode: call it from inside your flush callback to hand
+   * the encoder a new buffer for the next batch of bytes, so encoding continues
+   * without interruption. `offset` reserves space at the front of the new
+   * buffer. Any not-yet-flushed bytes in the old buffer are dropped, so
+   * {@link flush} first (the flush callback fires before you swap).
+   */
+  setBuffer(buffer: Uint8Array, offset = 0): void {
+    if (offset < 0 || offset > buffer.length) {
+      throw argumentError(`offset ${offset} out of range`);
+    }
+    this.buf = buffer;
+    this.start = offset;
+    this.pos = offset;
   }
 
   // --- scalars ------------------------------------------------------------

@@ -31,6 +31,24 @@ describe("OStream streaming", () => {
     expect(bytes()).toEqual(mem.bytes());
   });
 
+  it("accepts a brand-new buffer mid-stream via setBuffer", () => {
+    const { sink, bytes } = collect();
+    let swaps = 0;
+    const os = new OStream(new Uint8Array(8), 0, (chunk) => {
+      sink(chunk); // copy out before swapping
+      os.setBuffer(new Uint8Array(8)); // hand the encoder a fresh buffer each drain
+      swaps++;
+    });
+    for (let i = 0; i < 200; i++) os.writeUnsigned(i, BigInt(i * 1000));
+    os.flush();
+
+    const mem = new OStream();
+    for (let i = 0; i < 200; i++) mem.writeUnsigned(i, BigInt(i * 1000));
+
+    expect(bytes()).toEqual(mem.bytes());
+    expect(swaps).toBeGreaterThan(1);
+  });
+
   it("streams every array kind through a small buffer (per-element path)", () => {
     const build = (os: OStream): void => {
       os.writeUnsignedArray(1, [1, 2, 300000, 1n << 50n]);

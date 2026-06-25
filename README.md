@@ -36,8 +36,14 @@ unit tests here use the exact byte vectors from the
 (`test_vectors.json`) to guarantee byte-for-byte interoperability with the C,
 C++, Rust, C#, Java, Go and Python implementations.
 
-npm package: `@sofabuffers/corelib`. Ships ESM, CommonJS, a browser global
-(`SofaBuffers`) and full type declarations.
+Requires **Node.js 18+** (or any modern browser / Electron / Deno / Bun).
+Install from npm:
+
+```bash
+npm install @sofabuffers/corelib
+```
+
+Ships ESM, CommonJS, a browser global (`SofaBuffers`) and full type declarations.
 
 ## Why this design
 
@@ -51,11 +57,6 @@ npm package: `@sofabuffers/corelib`. Ships ESM, CommonJS, a browser global
 | Reserve-offset | `new OStream(buf, offset)` leaves room at the front of the buffer for a lower-layer protocol header (saves a copy). |
 | Explicit endianness | IEEE-754 values are written / read little-endian via `DataView`, so behaviour is identical on every engine. |
 | Pluggable acceleration | Hot paths run through a swappable `Kernel`; an optional native (N-API) or WebAssembly build can replace it with no API change. |
-
-## Source documentation
-
-[API documentation](https://sofa-buffers.github.io/corelib-ts/) — generated from
-the TSDoc comments and published to GitHub Pages on every push to `main`.
 
 ## Usage
 
@@ -122,23 +123,40 @@ const blobSink: Visitor = {
 };
 ```
 
-## Format coverage
+## API summary
 
-The TypeScript build always includes the full format — unsigned / signed
-varints, `fp32` / `fp64`, strings, blobs, arrays and nested sequences. The value
-type is 64-bit (`bigint`), matching the C default configuration so the wire image
-and varint lengths are identical. Booleans are encoded as the unsigned values
-`0` / `1` (the wire has no separate boolean type), and floats are always
-little-endian.
+**Encoder — `OStream`**
 
-## Layering vs. the C library
+- `new OStream()` — in-memory, auto-growing; `new OStream(buffer, offset?, flush?)` — stream into a caller buffer, draining to `flush` when full.
+- `writeUnsigned(id, number|bigint)`, `writeSigned(id, number|bigint)`, `writeBoolean(id, boolean)`, `writeFp32(id, number)`, `writeFp64(id, number)`, `writeString(id, string)`, `writeBlob(id, Uint8Array)`, `writeFixlen(id, bytes, subtype)`.
+- `writeUnsignedArray` / `writeSignedArray` / `writeFp32Array` / `writeFp64Array(id, values)`.
+- `writeSequenceBegin(id)` / `writeSequenceEnd()`.
+- `flush()`, `setBuffer(buffer, offset?)` (install a fresh buffer mid-stream), `bytesUsed`, `bytes()`.
 
-| C file | TypeScript | Status |
-|--------|------------|--------|
-| `sofab.h` (types / constants) | `SofabError`, `WireType`, `FixlenSubtype`, `ArrayKind`, constants | ported |
-| `ostream.c` | `OStream` (+ `FlushSink`) | ported |
-| `istream.c` | `IStream` + `Visitor` | ported (push / visitor model, with a child-returning `sequenceBegin` for nesting) |
-| `object.c` (descriptor transcoder) | — | not ported. The idiomatic TypeScript equivalent is generated message classes — a schema-driven generator emitting `Visitor` / encode glue; the streaming core above already covers serialize / deserialize. |
+**Decoder — `IStream` + `Visitor`**
+
+- `new IStream()`, `feed(chunk, visitor)`, `end()`; `decode(bytes, visitor)` for the one-shot case.
+- `Visitor` (every method optional — an unhandled field is skipped): `unsigned(id, bigint)`, `signed(id, bigint)`, `fp32(id, number)`, `fp64(id, number)`, `string(id, total, offset, chunk)`, `blob(...)`, `arrayBegin(id, kind, count)`, `arrayUnsigned(id, i, bigint)`, `arraySigned(...)`, `arrayFp32(id, i, number)`, `arrayFp64(...)`, `arrayEnd(id)`, `sequenceBegin(id): Visitor | void`, `sequenceEnd()`.
+
+**Constants & helpers:** `API_VERSION` (= 1), `ID_MAX`, `FIXLEN_MAX`, `ARRAY_MAX`, `WireType`, `FixlenSubtype`, `ArrayKind`; errors via `SofabError` (`.code: SofabErrorCode`); acceleration via `getKernel` / `setKernel`, `loadNativeKernel`, `loadWasmKernel`.
+
+## Feature flags
+
+The TypeScript build always ships the **full format** — there are no compile-time
+toggles like the C library's `SOFAB_DISABLE_*` switches, because the browser /
+Node / Electron targets are not code-size constrained.
+
+| Capability | Default |
+|------------|---------|
+| unsigned / signed varints | always on |
+| `fp32` / `fp64` | always on |
+| string / blob | always on |
+| arrays (integer + fixlen) | always on |
+| nested sequences | always on |
+| scalar value width | 64-bit (`bigint`), matching the C default — identical wire image |
+
+Booleans are encoded as the unsigned values `0` / `1` (the wire has no separate
+boolean type), and IEEE-754 floats are always little-endian.
 
 ## Build & test
 
@@ -198,6 +216,15 @@ setKernel(myKernel);
 The boundary is deliberately *bulk* (a whole array per call, into guaranteed
 capacity), so the cost of crossing into native code is amortised rather than paid
 per element. The pure-JS kernel remains the fallback everywhere.
+
+## Layering vs. the C library
+
+| C file | TypeScript | Status |
+|--------|------------|--------|
+| `sofab.h` (types / constants) | `SofabError`, `WireType`, `FixlenSubtype`, `ArrayKind`, constants | ported |
+| `ostream.c` | `OStream` (+ `FlushSink`) | ported |
+| `istream.c` | `IStream` + `Visitor` | ported (push / visitor model, with a child-returning `sequenceBegin` for nesting) |
+| `object.c` (descriptor transcoder) | — | not ported. The idiomatic TypeScript equivalent is generated message classes — a schema-driven generator emitting `Visitor` / encode glue; the streaming core above already covers serialize / deserialize. |
 
 ## Testing & coverage
 
