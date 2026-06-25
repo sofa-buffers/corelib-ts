@@ -10,5 +10,5 @@ typedoc.json
 tsconfig*.json
 tsup.config.ts
 vitest.config.ts
-test_vectors.json
+assets/test_vectors.json
 *.tsbuildinfo

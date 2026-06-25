@@ -31,7 +31,7 @@ export interface Vector {
 }
 
 export function loadVectors(): Vector[] {
-  const path = fileURLToPath(new URL("../../test_vectors.json", import.meta.url));
+  const path = fileURLToPath(new URL("../../assets/test_vectors.json", import.meta.url));
   const doc = parseJsonWithBigInt(readFileSync(path, "utf8")) as unknown as {
     vectors: Vector[];
   };
