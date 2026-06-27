@@ -1,9 +1,9 @@
-<p align="center"><img src="assets/sofabuffers_logo.png" alt="SofaBuffers Logo" height="140"></p>
+<p align="center"><img src="assets/sofabuffers_logo.png" alt="SofaBuffers" height="140"></p>
 
 # SofaBuffers
 
-<b>Structured Objects For Anyone</b><br>
-<i>... so optimized, feels amazing.</i>
+**Structured Objects For Anyone** \
+*... so optimized, feels amazing.*
 
 [Would you like to know more?](https://github.com/sofa-buffers)
 
@@ -163,12 +163,28 @@ boolean type), and IEEE-754 floats are always little-endian.
 ```bash
 npm ci
 npm run typecheck      # tsc --noEmit (strict)
-npm test               # vitest
+npm test               # vitest: vectors, chunked feeding, errors, round-trips
+npm run coverage       # vitest --coverage (v8): text + html + lcov
 npm run build          # tsup -> ESM + CJS + IIFE + .d.ts in dist/
 ```
 
 Requires Node.js 18+. The `.devcontainer/` here builds a ready-to-use image
 (`./.devcontainer/start.sh`) with Node and tooling preinstalled.
+
+Tests live in `test/` as focused suites:
+
+- `vectors.test.ts` — encode + decode every shared `test_vectors.json` vector, byte-exact vs. the C reference
+- `istream.chunked.test.ts` — every vector fed one byte (and seven bytes) at a time
+- `errors.test.ts` — every malformed-input rejection branch + encoder argument validation
+- `ostream.test.ts` — flush-sink streaming smaller than the buffer, reserve-offset, typed-array inputs
+- `roundtrip.test.ts` — value preservation across the type system, 64-bit boundaries, nested sequences
+- `varint.test.ts` — LEB128 / zig-zag boundaries
+- `visitor-defaults.test.ts` — a no-op visitor silently drops every field kind
+- `kernel.test.ts` — the acceleration seam: kernel swap parity + native fallback
+
+The CI workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds,
+type-checks and tests on Node 18/20/24, measures coverage, and publishes the
+coverage / branches badge JSON consumed above to the `badges` branch.
 
 ## Benchmarks
 
@@ -226,24 +242,3 @@ per element. The pure-JS kernel remains the fallback everywhere.
 | `istream.c` | `IStream` + `Visitor` | ported (push / visitor model, with a child-returning `sequenceBegin` for nesting) |
 | `object.c` (descriptor transcoder) | — | not ported. The idiomatic TypeScript equivalent is generated message classes — a schema-driven generator emitting `Visitor` / encode glue; the streaming core above already covers serialize / deserialize. |
 
-## Testing & coverage
-
-```bash
-npm test               # vitest: vectors, chunked feeding, errors, round-trips
-npm run coverage       # vitest --coverage (v8): text + html + lcov
-```
-
-Tests live in `test/` as focused suites:
-
-- `vectors.test.ts` — encode + decode every shared `test_vectors.json` vector, byte-exact vs. the C reference
-- `istream.chunked.test.ts` — every vector fed one byte (and seven bytes) at a time
-- `errors.test.ts` — every malformed-input rejection branch + encoder argument validation
-- `ostream.test.ts` — flush-sink streaming smaller than the buffer, reserve-offset, typed-array inputs
-- `roundtrip.test.ts` — value preservation across the type system, 64-bit boundaries, nested sequences
-- `varint.test.ts` — LEB128 / zig-zag boundaries
-- `visitor-defaults.test.ts` — a no-op visitor silently drops every field kind
-- `kernel.test.ts` — the acceleration seam: kernel swap parity + native fallback
-
-The CI workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds,
-type-checks and tests on Node 18/20/24, measures coverage, and publishes the
-coverage / branches badge JSON consumed above to the `badges` branch.
