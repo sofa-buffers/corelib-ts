@@ -1,0 +1,45 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits"
+  ],
+  "timezone": "Europe/Berlin",
+  "schedule": ["before 6am on monday"],
+  "labels": ["dependencies"],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on monday"]
+  },
+  "packageRules": [
+    {
+      "description": "Group all GitHub Actions bumps into one PR.",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    },
+    {
+      "description": "Group non-major npm devDependencies (the package has no runtime deps).",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["devDependencies"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "npm dev dependencies"
+    },
+    {
+      "description": "Devcontainer base image (.devcontainer/Dockerfile -> ubuntu).",
+      "matchManagers": ["dockerfile"],
+      "groupName": "devcontainer image"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track the pinned Node.js major (ARG NODE_VERSION) in the devcontainer Dockerfile.",
+      "managerFilePatterns": ["/(^|/)\\.devcontainer/Dockerfile$/"],
+      "matchStrings": ["ARG NODE_VERSION=(?<currentValue>\\S+)"],
+      "depNameTemplate": "node",
+      "datasourceTemplate": "node-version",
+      "versioningTemplate": "node"
+    }
+  ]
+}
