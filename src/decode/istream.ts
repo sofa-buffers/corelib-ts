@@ -28,10 +28,14 @@ import { DecoderState } from "./state.js";
  * a time between {@link Visitor.arrayBegin} and {@link Visitor.arrayEnd}.
  */
 export interface Visitor {
-  /** An unsigned integer field. */
-  unsigned?(id: number, value: bigint): void;
-  /** A signed integer field. */
-  signed?(id: number, value: bigint): void;
+  /**
+   * An unsigned integer field. Number-first: `value` is a `number` when it fits
+   * exactly (`≤ 2^53-1`, covering ids, u8..u32 and small u64s) and a `bigint`
+   * only beyond that, so the common case avoids a per-value bigint allocation.
+   */
+  unsigned?(id: number, value: number | bigint): void;
+  /** A signed integer field. Number-first like {@link unsigned} (`|value| ≤ 2^53-1` ⇒ `number`). */
+  signed?(id: number, value: number | bigint): void;
   /** An IEEE-754 32-bit float field. */
   fp32?(id: number, value: number): void;
   /** An IEEE-754 64-bit double field. */
@@ -42,10 +46,10 @@ export interface Visitor {
   blob?(id: number, total: number, offset: number, chunk: Uint8Array): void;
   /** Start of an array; `count` elements of `kind` follow. */
   arrayBegin?(id: number, kind: ArrayKind, count: number): void;
-  /** One unsigned array element. */
-  arrayUnsigned?(id: number, index: number, value: bigint): void;
-  /** One signed array element. */
-  arraySigned?(id: number, index: number, value: bigint): void;
+  /** One unsigned array element. Number-first like {@link unsigned}. */
+  arrayUnsigned?(id: number, index: number, value: number | bigint): void;
+  /** One signed array element. Number-first like {@link signed}. */
+  arraySigned?(id: number, index: number, value: number | bigint): void;
   /** One fp32 array element. */
   arrayFp32?(id: number, index: number, value: number): void;
   /** One fp64 array element. */

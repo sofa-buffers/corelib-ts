@@ -28,7 +28,7 @@ describe("skipping", () => {
     build(os);
 
     // Visitor handles only the trailing field; everything else is skipped.
-    let tail: bigint | undefined;
+    let tail: number | bigint | undefined;
     const seen: number[] = [];
     const visitor: Visitor = {
       unsigned(id, v) {
@@ -38,7 +38,7 @@ describe("skipping", () => {
     };
 
     expect(() => decode(os.bytes(), visitor)).not.toThrow();
-    expect(tail).toBe(999n); // resynced correctly after the skipped sequence
+    expect(tail).toBe(999); // resynced correctly after the skipped sequence
     // id 1 appears top-level and inside the skipped sequence; id 9 is the tail.
     expect(seen).toEqual([1, 1, 9]);
   });
@@ -48,7 +48,7 @@ describe("skipping", () => {
     build(os);
     const bytes = os.bytes();
 
-    let tail: bigint | undefined;
+    let tail: number | bigint | undefined;
     const visitor: Visitor = {
       unsigned(id, v) {
         if (id === 9) tail = v;
@@ -59,7 +59,7 @@ describe("skipping", () => {
     for (let i = 0; i < bytes.length; i++) is.feed(bytes.subarray(i, i + 1), visitor);
     is.end();
 
-    expect(tail).toBe(999n);
+    expect(tail).toBe(999);
   });
 
   it("a fully empty visitor consumes the whole message and ends cleanly", () => {

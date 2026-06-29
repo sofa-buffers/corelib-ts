@@ -16,10 +16,10 @@ export class TranscodeVisitor implements Visitor {
 
   constructor(private readonly out: OStream) {}
 
-  unsigned(id: number, value: bigint): void {
+  unsigned(id: number, value: number | bigint): void {
     this.out.writeUnsigned(id, value);
   }
-  signed(id: number, value: bigint): void {
+  signed(id: number, value: number | bigint): void {
     this.out.writeSigned(id, value);
   }
   fp32(id: number, value: number): void {
@@ -39,10 +39,10 @@ export class TranscodeVisitor implements Visitor {
   arrayBegin(id: number, kind: ArrayKind, _count: number): void {
     this.array = { kind, id, vals: [] };
   }
-  arrayUnsigned(_id: number, _index: number, value: bigint): void {
+  arrayUnsigned(_id: number, _index: number, value: number | bigint): void {
     this.array!.vals.push(value);
   }
-  arraySigned(_id: number, _index: number, value: bigint): void {
+  arraySigned(_id: number, _index: number, value: number | bigint): void {
     this.array!.vals.push(value);
   }
   arrayFp32(_id: number, _index: number, value: number): void {
@@ -83,8 +83,8 @@ export class TranscodeVisitor implements Visitor {
 
 /** One decoded event, for direct assertions. */
 export type Event =
-  | { kind: "unsigned"; id: number; value: bigint }
-  | { kind: "signed"; id: number; value: bigint }
+  | { kind: "unsigned"; id: number; value: number | bigint }
+  | { kind: "signed"; id: number; value: number | bigint }
   | { kind: "fp32"; id: number; value: number }
   | { kind: "fp64"; id: number; value: number }
   | { kind: "string"; id: number; text: string }
@@ -113,10 +113,10 @@ export class SkipVisitor implements Visitor {
     readonly events: Event[] = [],
   ) {}
 
-  unsigned(id: number, value: bigint): void {
+  unsigned(id: number, value: number | bigint): void {
     if (!this.skip.has(id)) this.events.push({ kind: "unsigned", id, value });
   }
-  signed(id: number, value: bigint): void {
+  signed(id: number, value: number | bigint): void {
     if (!this.skip.has(id)) this.events.push({ kind: "signed", id, value });
   }
   fp32(id: number, value: number): void {
@@ -134,10 +134,10 @@ export class SkipVisitor implements Visitor {
   arrayBegin(id: number, kind: ArrayKind): void {
     if (!this.skip.has(id)) this.array = { id, arrayKind: kind, values: [] };
   }
-  arrayUnsigned(id: number, _i: number, value: bigint): void {
+  arrayUnsigned(id: number, _i: number, value: number | bigint): void {
     if (!this.skip.has(id)) this.array!.values.push(value);
   }
-  arraySigned(id: number, _i: number, value: bigint): void {
+  arraySigned(id: number, _i: number, value: number | bigint): void {
     if (!this.skip.has(id)) this.array!.values.push(value);
   }
   arrayFp32(id: number, _i: number, value: number): void {
@@ -217,10 +217,10 @@ export class RecordingVisitor implements Visitor {
   private array: { id: number; arrayKind: ArrayKind; values: (bigint | number)[] } | null = null;
   private fix: { id: number; isString: boolean; buf: Uint8Array; got: number } | null = null;
 
-  unsigned(id: number, value: bigint): void {
+  unsigned(id: number, value: number | bigint): void {
     this.events.push({ kind: "unsigned", id, value });
   }
-  signed(id: number, value: bigint): void {
+  signed(id: number, value: number | bigint): void {
     this.events.push({ kind: "signed", id, value });
   }
   fp32(id: number, value: number): void {
@@ -238,10 +238,10 @@ export class RecordingVisitor implements Visitor {
   arrayBegin(id: number, kind: ArrayKind): void {
     this.array = { id, arrayKind: kind, values: [] };
   }
-  arrayUnsigned(_id: number, _i: number, value: bigint): void {
+  arrayUnsigned(_id: number, _i: number, value: number | bigint): void {
     this.array!.values.push(value);
   }
-  arraySigned(_id: number, _i: number, value: bigint): void {
+  arraySigned(_id: number, _i: number, value: number | bigint): void {
     this.array!.values.push(value);
   }
   arrayFp32(_id: number, _i: number, value: number): void {

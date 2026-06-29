@@ -82,13 +82,13 @@ class FastDecoder {
       switch (type) {
         case WireType.Unsigned: {
           this.readVarint();
-          top.unsigned?.(id, this.big());
+          top.unsigned?.(id, this.unsignedValue());
           break;
         }
 
         case WireType.Signed: {
           this.readVarint();
-          top.signed?.(id, zigzagDecode(this.big()));
+          top.signed?.(id, this.signedValue());
           break;
         }
 
@@ -118,7 +118,7 @@ class FastDecoder {
           top.arrayBegin?.(id, ArrayKind.Unsigned, count);
           for (let i = 0; i < count; i++) {
             this.readVarint();
-            top.arrayUnsigned?.(id, i, this.big());
+            top.arrayUnsigned?.(id, i, this.unsignedValue());
           }
           top.arrayEnd?.(id);
           break;
@@ -129,7 +129,7 @@ class FastDecoder {
           top.arrayBegin?.(id, ArrayKind.Signed, count);
           for (let i = 0; i < count; i++) {
             this.readVarint();
-            top.arraySigned?.(id, i, zigzagDecode(this.big()));
+            top.arraySigned?.(id, i, this.signedValue());
           }
           top.arrayEnd?.(id);
           break;
@@ -217,6 +217,26 @@ class FastDecoder {
     return this.hi === 0
       ? BigInt(this.lo >>> 0)
       : (BigInt(this.hi >>> 0) << 32n) | BigInt(this.lo >>> 0);
+  }
+
+  /**
+   * The last varint as an unsigned value, number-first: a `number` when it fits
+   * exactly (`≤ 2^53-1` — all ids, u8..u32 and small u64s), a `bigint` only
+   * beyond that. Skips the per-value bigint allocation on the common path.
+   */
+  private unsignedValue(): number | bigint {
+    const hi = this.hi >>> 0; // unsigned: hi's bit 31 must not read as negative
+    return hi <= 0x1fffff ? hi * TWO32 + (this.lo >>> 0) : this.big();
+  }
+
+  /** The last zig-zag varint as a signed value, number-first (see {@link unsignedValue}). */
+  private signedValue(): number | bigint {
+    const hi = this.hi >>> 0;
+    if (hi <= 0x1fffff) {
+      const r = hi * TWO32 + (this.lo >>> 0); // raw zig-zag, ≤ 2^53-1
+      return r % 2 === 0 ? r / 2 : -(r + 1) / 2;
+    }
+    return zigzagDecode(this.big());
   }
 
   /** The last varint's value as a JS number — exact for ids/lengths/counts. */

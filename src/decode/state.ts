@@ -98,7 +98,7 @@ export class DecoderState {
         case S.ScalarU: {
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
-          const value = this.vBig();
+          const value = this.vUnsigned();
           this.resetVarint();
           this.top().unsigned?.(this.id, value);
           this.state = S.Header;
@@ -108,7 +108,7 @@ export class DecoderState {
         case S.ScalarS: {
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
-          const value = zigzagDecode(this.vBig());
+          const value = this.vSigned();
           this.resetVarint();
           this.top().signed?.(this.id, value);
           this.state = S.Header;
@@ -188,7 +188,7 @@ export class DecoderState {
         case S.ArrayUElem: {
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
-          const value = this.vBig();
+          const value = this.vUnsigned();
           this.resetVarint();
           this.top().arrayUnsigned?.(this.id, this.arrIndex, value);
           this.advanceArray();
@@ -198,7 +198,7 @@ export class DecoderState {
         case S.ArraySElem: {
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
-          const value = zigzagDecode(this.vBig());
+          const value = this.vSigned();
           this.resetVarint();
           this.top().arraySigned?.(this.id, this.arrIndex, value);
           this.advanceArray();
@@ -362,6 +362,28 @@ export class DecoderState {
     return this.vHi === 0
       ? BigInt(this.vLo >>> 0)
       : (BigInt(this.vHi >>> 0) << 32n) | BigInt(this.vLo >>> 0);
+  }
+
+  /**
+   * The accumulated varint as an unsigned value, number-first: a `number` when
+   * it fits exactly (`≤ 2^53-1`, which covers all ids, u8..u32 and small u64s),
+   * a `bigint` only beyond that. Avoids a bigint allocation on the common path.
+   */
+  private vUnsigned(): number | bigint {
+    // Unsigned: vHi's bit 31 must not read as negative. vHi ≤ 0x1fffff (2^21-1)
+    // ⇔ vHi*2^32 + lo ≤ 2^53-1.
+    const hi = this.vHi >>> 0;
+    return hi <= 0x1fffff ? hi * TWO32 + (this.vLo >>> 0) : this.vBig();
+  }
+
+  /** The accumulated zig-zag varint as a signed value, number-first (see {@link vUnsigned}). */
+  private vSigned(): number | bigint {
+    const hi = this.vHi >>> 0;
+    if (hi <= 0x1fffff) {
+      const r = hi * TWO32 + (this.vLo >>> 0); // raw zig-zag, ≤ 2^53-1
+      return r % 2 === 0 ? r / 2 : -(r + 1) / 2;
+    }
+    return zigzagDecode(this.vBig());
   }
 
   /** The accumulated varint as a JS number — exact for ids/lengths/counts. */

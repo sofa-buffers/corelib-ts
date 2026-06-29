@@ -20,11 +20,11 @@ export function cpuNow(): number {
 /** A decode sink that folds every value into a checksum so nothing is elided. */
 export class Checksum implements Visitor {
   acc = 0n;
-  unsigned(id: number, v: bigint): void {
-    this.acc += v ^ BigInt(id);
+  unsigned(id: number, v: number | bigint): void {
+    this.acc += (typeof v === "bigint" ? v : BigInt(v)) ^ BigInt(id);
   }
-  signed(id: number, v: bigint): void {
-    this.acc += v ^ BigInt(id);
+  signed(id: number, v: number | bigint): void {
+    this.acc += (typeof v === "bigint" ? v : BigInt(v)) ^ BigInt(id);
   }
   fp32(_id: number, v: number): void {
     this.acc += BigInt(Math.round(v));
@@ -38,11 +38,11 @@ export class Checksum implements Visitor {
   blob(_id: number, _total: number, _offset: number, chunk: Uint8Array): void {
     this.acc += BigInt(chunk.length);
   }
-  arrayUnsigned(_id: number, _i: number, v: bigint): void {
-    this.acc += v;
+  arrayUnsigned(_id: number, _i: number, v: number | bigint): void {
+    this.acc += typeof v === "bigint" ? v : BigInt(v);
   }
-  arraySigned(_id: number, _i: number, v: bigint): void {
-    this.acc += v;
+  arraySigned(_id: number, _i: number, v: number | bigint): void {
+    this.acc += typeof v === "bigint" ? v : BigInt(v);
   }
   arrayFp32(_id: number, _i: number, v: number): void {
     this.acc += BigInt(Math.round(v));
