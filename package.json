@@ -1,6 +1,6 @@
 {
   "name": "@sofabuffers/corelib",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Streaming, dependency-free TypeScript implementation of the SofaBuffers binary serialization format — usable from Node.js, browsers, Electron, and classic <script>.",
   "keywords": [
     "sofabuffers",
@@ -48,6 +48,7 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
