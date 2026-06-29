@@ -13,27 +13,47 @@ import { invalidMsgError } from "../errors.js";
 
 /** Number of bytes {@link encodeVarint} will write for `value` (unsigned). */
 export function varintSize(value: bigint): number {
-  let n = 1;
-  let v = value >> 7n;
-  while (v > 0n) {
+  let lo = Number(value & 0xffff_ffffn) >>> 0;
+  let hi = Number((value >> 32n) & 0xffff_ffffn) >>> 0;
+  let n = 0;
+  while (hi !== 0) {
     n++;
-    v >>= 7n;
+    const next = ((lo >>> 7) | (hi << 25)) >>> 0;
+    hi >>>= 7;
+    lo = next;
   }
-  return n;
+  while (lo > 0x7f) {
+    n++;
+    lo >>>= 7;
+  }
+  return n + 1;
 }
 
 /**
  * Write `value` (an unsigned `bigint`) as a varint into `out` at `pos`.
  * The caller must guarantee `out` has at least {@link VARINT_MAX_BYTES} bytes
  * of room from `pos`. Returns the position just past the last byte written.
+ *
+ * The 64-bit value is split into two 32-bit *number* halves once (the only two
+ * `bigint` operations), then the LEB128 groups are produced with number-only
+ * arithmetic — `lo`'s top bits are fed from `hi` as it drains. This avoids the
+ * ~20 short-lived `bigint` allocations a per-byte `v & 0x7fn; v >>= 7n` loop
+ * would make, which V8 profiling showed to be the encoder's dominant cost.
  */
 export function encodeVarint(value: bigint, out: Uint8Array, pos: number): number {
-  let v = value;
-  while (v > 0x7fn) {
-    out[pos++] = Number(v & 0x7fn) | 0x80;
-    v >>= 7n;
+  let lo = Number(value & 0xffff_ffffn) >>> 0;
+  let hi = Number((value >> 32n) & 0xffff_ffffn) >>> 0;
+  // While high bits remain, every emitted byte is a full 7-bit group + continuation.
+  while (hi !== 0) {
+    out[pos++] = (lo & 0x7f) | 0x80;
+    lo = ((lo >>> 7) | (hi << 25)) >>> 0; // shift the 64-bit value right by 7
+    hi >>>= 7;
   }
-  out[pos++] = Number(v);
+  while (lo > 0x7f) {
+    out[pos++] = (lo & 0x7f) | 0x80;
+    lo >>>= 7;
+  }
+  out[pos++] = lo;
   return pos;
 }
 
