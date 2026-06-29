@@ -45,6 +45,14 @@ const DEFAULT_CAPACITY = 256;
  */
 const SIGNED_FAST_MAX = 0x10_0000_0000_0000; // 2^52
 
+/**
+ * Encoder for the SofaBuffers wire format. Each `write*` method appends one
+ * field and maps one-to-one onto a wire type. Construct it in-memory (an
+ * auto-growing buffer, read back with {@link OStream.bytes}) or in streaming
+ * mode over a caller-provided buffer that drains to a {@link FlushSink} as it
+ * fills, so the message can outgrow the buffer. Invalid arguments and a full
+ * buffer with no sink throw {@link SofabError}.
+ */
 export class OStream {
   private buf: Uint8Array;
   private pos: number;

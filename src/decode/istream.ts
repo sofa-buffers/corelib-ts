@@ -66,6 +66,14 @@ export interface Visitor {
   sequenceEnd?(): void;
 }
 
+/**
+ * Push parser for the SofaBuffers wire format. Feed it bytes in chunks of any
+ * size with {@link IStream.feed} and it drives a {@link Visitor}, one call per
+ * decoded field, resuming cleanly across chunk boundaries. Call
+ * {@link IStream.end} after the final chunk to assert the message finished on a
+ * field boundary. When the whole message is already in one buffer, prefer the
+ * faster {@link decode}.
+ */
 export class IStream {
   private readonly state = new DecoderState();
 
@@ -88,9 +96,9 @@ export class IStream {
  * Decode a complete message held in one contiguous buffer, in a single call.
  *
  * This is the non-streaming convenience — and the fast path: with the whole
- * message in hand it advances one cursor over the buffer (see
- * {@link decodeContiguous}) instead of running the resumable per-byte state
- * machine, so it is markedly faster than feeding the same bytes through
+ * message in hand it advances one cursor over the buffer instead of running the
+ * resumable per-byte state machine, so it is markedly faster than feeding the
+ * same bytes through
  * {@link IStream}. Use {@link IStream} when the message arrives in chunks; use
  * this when you already have it whole. Malformed input — including truncation
  * or an unclosed sequence — throws {@link SofabError} (`INVALID_MSG`).

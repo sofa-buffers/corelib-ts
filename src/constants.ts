@@ -32,6 +32,7 @@ export const WireType = {
   /** Closes the current sequence. Encoded as the single byte `0x07`. */
   SequenceEnd: 7,
 } as const;
+/** A field's wire type: one of the {@link WireType} values. */
 export type WireType = (typeof WireType)[keyof typeof WireType];
 
 /** The three low bits of a fixlen length header: which fixed-length type. */
@@ -45,15 +46,21 @@ export const FixlenSubtype = {
   /** Arbitrary binary data. */
   Blob: 3,
 } as const;
+/** A fixed-length value's type: one of the {@link FixlenSubtype} values. */
 export type FixlenSubtype = (typeof FixlenSubtype)[keyof typeof FixlenSubtype];
 
 /** Which element kind an array field carries (reported to {@link Visitor.arrayBegin}). */
 export const ArrayKind = {
+  /** Unsigned-integer elements. */
   Unsigned: 0,
+  /** Signed-integer (zig-zag) elements. */
   Signed: 1,
+  /** IEEE-754 32-bit float elements. */
   Fp32: 2,
+  /** IEEE-754 64-bit double elements. */
   Fp64: 3,
 } as const;
+/** An array field's element kind: one of the {@link ArrayKind} values. */
 export type ArrayKind = (typeof ArrayKind)[keyof typeof ArrayKind];
 
 /** Largest permitted field id and fixlen length / array count: `INT32_MAX`. */
