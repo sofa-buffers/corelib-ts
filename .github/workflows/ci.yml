@@ -35,6 +35,43 @@ jobs:
       - name: Build (ESM + CJS + IIFE + types)
         run: npm run build
 
+  # Smoke-test the *built* bundle on every supported JS runtime. The library is
+  # dependency-free and uses only standard JS / Web APIs, so the shipped artifact
+  # must run unchanged on Node, Deno and Bun — this guards against an accidental
+  # Node-only API sneaking into src/. (The full vitest suite runs on Node above;
+  # re-running it per runtime would only duplicate that, and vitest-on-Deno is
+  # not well supported — a bundle smoke test is the right granularity here.)
+  cross-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+
+      - name: Build (produces the dist/ bundle the smoke test imports)
+        run: npm run build
+
+      - name: Smoke test on Node
+        run: node test/smoke.mjs
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Smoke test on Deno
+        run: deno run --allow-read test/smoke.mjs
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Smoke test on Bun
+        run: bun ./test/smoke.mjs
+
   coverage:
     runs-on: ubuntu-latest
     steps:
