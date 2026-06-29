@@ -1,20 +1,14 @@
 /**
- * Encode-side text and fixlen helpers.
+ * Encode-side text helper.
  *
- * A single shared {@link TextEncoder} turns strings into UTF-8 bytes; the fixlen
- * length header packs `(length << 3) | subtype` for the on-wire length word.
+ * A single shared {@link TextEncoder} turns strings into UTF-8 bytes. The fixlen
+ * length word `(length << 3) | subtype` is now packed inline by the encoder on
+ * its number fast path (see `OStream`), so no bigint helper is needed here.
  */
-
-import type { FixlenSubtype } from "../constants.js";
 
 const UTF8 = new TextEncoder();
 
 /** Encode `text` to UTF-8 bytes (no null terminator). */
 export function encodeUtf8(text: string): Uint8Array {
   return UTF8.encode(text);
-}
-
-/** Build the fixlen length word `(length << 3) | subtype` as a `bigint`. */
-export function fixlenHeader(length: number, subtype: FixlenSubtype): bigint {
-  return (BigInt(length) << 3n) | BigInt(subtype);
 }

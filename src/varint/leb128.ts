@@ -37,6 +37,34 @@ export function encodeVarint(value: bigint, out: Uint8Array, pos: number): numbe
   return pos;
 }
 
+/** Number of bytes {@link encodeVarintNum} will write for `value`. */
+export function varintSizeNum(value: number): number {
+  let n = 1;
+  while (value > 0x7f) {
+    n++;
+    value = Math.floor(value / 128);
+  }
+  return n;
+}
+
+/**
+ * Write `value` (a non-negative integer `number`, `≤ 2^53`) as a varint into
+ * `out` at `pos`. The number-only sibling of {@link encodeVarint}: it avoids
+ * `bigint` entirely, which is the encoder's hot path for ids, lengths, counts
+ * and the very common small scalar. The caller guarantees {@link VARINT_MAX_BYTES}
+ * bytes of room. Returns the position past the last byte written.
+ */
+export function encodeVarintNum(value: number, out: Uint8Array, pos: number): number {
+  // `% 128` (not `& 0x7f`) so values above 2^31 keep their bits — bitwise ops
+  // in JS would truncate to 32 bits.
+  while (value > 0x7f) {
+    out[pos++] = (value % 128) | 0x80;
+    value = Math.floor(value / 128);
+  }
+  out[pos++] = value;
+  return pos;
+}
+
 /** The result of {@link decodeVarint}: the value and the position after it. */
 export interface VarintResult {
   value: bigint;

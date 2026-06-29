@@ -26,6 +26,12 @@ export interface Vector {
   name: string;
   group: string;
   description: string;
+  /** Start offset passed to the encoder (defaults to 0). */
+  offset?: number;
+  /** Optional capability tags; a full-featured build ignores them and runs all. */
+  requires?: string[];
+  /** Optional field ids a receiver is expected to auto-skip while decoding. */
+  skip_ids?: number[];
   fields: Field[];
   serialized: { length: number; hex: string };
 }

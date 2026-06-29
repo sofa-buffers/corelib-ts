@@ -37,9 +37,7 @@ const enum S {
   ArrayFp,
 }
 
-const FIXLEN_MAX_BIG = BigInt(FIXLEN_MAX);
-const ARRAY_MAX_BIG = BigInt(ARRAY_MAX);
-const ID_MAX_BIG = BigInt(ID_MAX);
+const TWO32 = 0x1_0000_0000; // 2^32, for combining the 32-bit halves
 
 export class DecoderState {
   private state = S.Header;
@@ -48,11 +46,12 @@ export class DecoderState {
   // current field
   private id = 0;
 
-  // resumable varint accumulator
-  private vAcc = 0n;
-  private vShift = 0n;
+  // Resumable varint accumulator, as two unsigned 32-bit halves (vLo / vHi)
+  // plus the byte count so far. Number-only: a `bigint` is built once, at the
+  // end, and only for full 64-bit *values* (not ids, lengths or counts).
+  private vLo = 0;
+  private vHi = 0;
   private vBytes = 0;
-  private vValue = 0n;
   private vComplete = false;
 
   // fixlen / fp scratch
@@ -82,16 +81,16 @@ export class DecoderState {
         case S.Header: {
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
-          const header = this.vValue;
-          this.resetVarint();
-          const type = Number(header & 7n);
+          const type = this.vTag();
           if (type === WireType.SequenceEnd) {
+            this.resetVarint();
             this.endSequence();
             break;
           }
-          const idBig = header >> 3n;
-          if (idBig > ID_MAX_BIG) throw invalidMsgError(`field id ${idBig} out of range`);
-          this.id = Number(idBig);
+          const id = this.vUpper();
+          this.resetVarint();
+          if (id > ID_MAX) throw invalidMsgError(`field id ${id} out of range`);
+          this.id = id;
           this.dispatch(type);
           break;
         }
@@ -99,8 +98,9 @@ export class DecoderState {
         case S.ScalarU: {
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
-          this.top().unsigned?.(this.id, this.vValue);
+          const value = this.vBig();
           this.resetVarint();
+          this.top().unsigned?.(this.id, value);
           this.state = S.Header;
           break;
         }
@@ -108,8 +108,9 @@ export class DecoderState {
         case S.ScalarS: {
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
-          this.top().signed?.(this.id, zigzagDecode(this.vValue));
+          const value = zigzagDecode(this.vBig());
           this.resetVarint();
+          this.top().signed?.(this.id, value);
           this.state = S.Header;
           break;
         }
@@ -117,14 +118,13 @@ export class DecoderState {
         case S.FixlenLen: {
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
-          const word = this.vValue;
+          const sub = this.vTag();
+          const len = this.vUpper();
           this.resetVarint();
-          const sub = Number(word & 7n);
-          const lenBig = word >> 3n;
           if (sub > FixlenSubtype.Blob) throw invalidMsgError(`invalid fixlen subtype ${sub}`);
-          if (lenBig > FIXLEN_MAX_BIG) throw invalidMsgError("fixlen length out of range");
+          if (len > FIXLEN_MAX) throw invalidMsgError("fixlen length out of range");
           this.fixSub = sub as FixlenSubtype;
-          this.fixLen = Number(lenBig);
+          this.fixLen = len;
           this.fixOff = 0;
           if (sub === FixlenSubtype.Fp32 || sub === FixlenSubtype.Fp64) {
             const want = sub === FixlenSubtype.Fp32 ? 4 : 8;
@@ -169,10 +169,10 @@ export class DecoderState {
         case S.ArrayCount: {
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
-          const cBig = this.vValue;
+          const count = this.vNum();
           this.resetVarint();
-          if (cBig < 1n || cBig > ARRAY_MAX_BIG) throw invalidMsgError("array count out of range");
-          this.arrCount = Number(cBig);
+          if (count < 1 || count > ARRAY_MAX) throw invalidMsgError("array count out of range");
+          this.arrCount = count;
           this.arrIndex = 0;
           if (this.arrIsFixlen) {
             // element kind (fp32 vs fp64) is only known once the element-length
@@ -188,8 +188,9 @@ export class DecoderState {
         case S.ArrayUElem: {
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
-          this.top().arrayUnsigned?.(this.id, this.arrIndex, this.vValue);
+          const value = this.vBig();
           this.resetVarint();
+          this.top().arrayUnsigned?.(this.id, this.arrIndex, value);
           this.advanceArray();
           break;
         }
@@ -197,8 +198,9 @@ export class DecoderState {
         case S.ArraySElem: {
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
-          this.top().arraySigned?.(this.id, this.arrIndex, zigzagDecode(this.vValue));
+          const value = zigzagDecode(this.vBig());
           this.resetVarint();
+          this.top().arraySigned?.(this.id, this.arrIndex, value);
           this.advanceArray();
           break;
         }
@@ -206,10 +208,9 @@ export class DecoderState {
         case S.ArrayElemLen: {
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
-          const word = this.vValue;
+          const sub = this.vTag();
+          const size = this.vUpper();
           this.resetVarint();
-          const sub = Number(word & 7n);
-          const size = Number(word >> 3n);
           if (sub === FixlenSubtype.Fp32 && size === 4) {
             this.arrKind = ArrayKind.Fp32;
             this.need = 4;
@@ -315,29 +316,67 @@ export class DecoderState {
     return this.stack[this.stack.length - 1]!;
   }
 
-  /** Consume varint bytes from `input` at `i`; sets {@link vComplete}. */
+  /**
+   * Consume varint bytes from `input` at `i` into the {@link vLo} / {@link vHi}
+   * accumulator, resuming across chunk boundaries; sets {@link vComplete} when a
+   * terminator byte arrives. Number-only — no per-byte `bigint`.
+   */
   private varintStep(input: Uint8Array, i: number): number {
-    while (i < input.length) {
-      if (this.vBytes >= VARINT_MAX_BYTES) throw invalidMsgError("varint overflow");
+    let lo = this.vLo;
+    let hi = this.vHi;
+    let k = this.vBytes;
+    const n = input.length;
+    while (i < n) {
+      if (k >= VARINT_MAX_BYTES) throw invalidMsgError("varint overflow");
       const b = input[i++]!;
-      this.vAcc |= BigInt(b & 0x7f) << this.vShift;
-      this.vBytes++;
+      if (k < 4) lo |= (b & 0x7f) << (7 * k);
+      else if (k === 4) {
+        lo |= (b & 0x0f) << 28;
+        hi |= (b >> 4) & 0x07;
+      } else hi |= (b & 0x7f) << (7 * k - 32);
+      k++;
       if ((b & 0x80) === 0) {
-        this.vValue = this.vAcc;
+        this.vLo = lo;
+        this.vHi = hi;
+        this.vBytes = k;
         this.vComplete = true;
         return i;
       }
-      this.vShift += 7n;
     }
+    this.vLo = lo;
+    this.vHi = hi;
+    this.vBytes = k;
     this.vComplete = false;
     return i;
   }
 
   private resetVarint(): void {
-    this.vAcc = 0n;
-    this.vShift = 0n;
+    this.vLo = 0;
+    this.vHi = 0;
     this.vBytes = 0;
     this.vComplete = false;
+  }
+
+  /** The accumulated varint as a `bigint` (full 64-bit fidelity). */
+  private vBig(): bigint {
+    return this.vHi === 0
+      ? BigInt(this.vLo >>> 0)
+      : (BigInt(this.vHi >>> 0) << 32n) | BigInt(this.vLo >>> 0);
+  }
+
+  /** The accumulated varint as a JS number — exact for ids/lengths/counts. */
+  private vNum(): number {
+    return this.vHi * TWO32 + (this.vLo >>> 0);
+  }
+
+  /** The accumulated varint's low 3 tag bits (the wire type / fixlen subtype). */
+  private vTag(): number {
+    return this.vLo & 7;
+  }
+
+  /** The accumulated varint with its low 3 tag bits stripped (`value >> 3`). */
+  private vUpper(): number {
+    return (this.vHi >>> 0) * (TWO32 / 8) + (this.vLo >>> 3);
   }
 
   /** Accumulate `need` raw bytes into {@link scratch}. */

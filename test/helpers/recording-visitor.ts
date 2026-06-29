@@ -93,6 +93,124 @@ export type Event =
   | { kind: "sequenceBegin"; id: number }
   | { kind: "sequenceEnd" };
 
+/** A drain that silently consumes a whole skipped sub-tree, recording nothing. */
+const DRAIN: Visitor = { sequenceBegin: () => DRAIN };
+
+/**
+ * Like {@link RecordingVisitor}, but skips every field whose id is in `skip` at
+ * the current nesting level — modelling a receiver that ignores optional fields.
+ * A skipped *scalar/array* field is dropped (the decoder still consumes its
+ * bytes); a skipped *sequence* returns {@link DRAIN}, so its entire sub-tree, at
+ * any depth, is consumed and ignored. Nested levels share one `events` log and
+ * the same `skip` set, so the same id is skipped at every depth.
+ */
+export class SkipVisitor implements Visitor {
+  private array: { id: number; arrayKind: ArrayKind; values: (bigint | number)[] } | null = null;
+  private fix: { id: number; isString: boolean; buf: Uint8Array; got: number } | null = null;
+
+  constructor(
+    private readonly skip: Set<number>,
+    readonly events: Event[] = [],
+  ) {}
+
+  unsigned(id: number, value: bigint): void {
+    if (!this.skip.has(id)) this.events.push({ kind: "unsigned", id, value });
+  }
+  signed(id: number, value: bigint): void {
+    if (!this.skip.has(id)) this.events.push({ kind: "signed", id, value });
+  }
+  fp32(id: number, value: number): void {
+    if (!this.skip.has(id)) this.events.push({ kind: "fp32", id, value });
+  }
+  fp64(id: number, value: number): void {
+    if (!this.skip.has(id)) this.events.push({ kind: "fp64", id, value });
+  }
+  string(id: number, total: number, offset: number, chunk: Uint8Array): void {
+    if (!this.skip.has(id)) this.fixChunk(true, id, total, offset, chunk);
+  }
+  blob(id: number, total: number, offset: number, chunk: Uint8Array): void {
+    if (!this.skip.has(id)) this.fixChunk(false, id, total, offset, chunk);
+  }
+  arrayBegin(id: number, kind: ArrayKind): void {
+    if (!this.skip.has(id)) this.array = { id, arrayKind: kind, values: [] };
+  }
+  arrayUnsigned(id: number, _i: number, value: bigint): void {
+    if (!this.skip.has(id)) this.array!.values.push(value);
+  }
+  arraySigned(id: number, _i: number, value: bigint): void {
+    if (!this.skip.has(id)) this.array!.values.push(value);
+  }
+  arrayFp32(id: number, _i: number, value: number): void {
+    if (!this.skip.has(id)) this.array!.values.push(value);
+  }
+  arrayFp64(id: number, _i: number, value: number): void {
+    if (!this.skip.has(id)) this.array!.values.push(value);
+  }
+  arrayEnd(id: number): void {
+    if (this.skip.has(id)) return;
+    this.events.push({ kind: "array", id, arrayKind: this.array!.arrayKind, values: this.array!.values });
+    this.array = null;
+  }
+  sequenceBegin(id: number): Visitor {
+    if (this.skip.has(id)) return DRAIN; // consume the whole sub-tree, record nothing
+    this.events.push({ kind: "sequenceBegin", id });
+    return new SkipVisitor(this.skip, this.events);
+  }
+  sequenceEnd(): void {
+    this.events.push({ kind: "sequenceEnd" });
+  }
+
+  private fixChunk(isString: boolean, id: number, total: number, offset: number, chunk: Uint8Array): void {
+    if (this.fix === null || this.fix.id !== id || this.fix.isString !== isString) {
+      this.fix = { id, isString, buf: new Uint8Array(total), got: 0 };
+    }
+    this.fix.buf.set(chunk, offset);
+    this.fix.got += chunk.length;
+    if (this.fix.got >= total) {
+      if (isString) this.events.push({ kind: "string", id, text: new TextDecoder().decode(this.fix.buf) });
+      else this.events.push({ kind: "blob", id, bytes: this.fix.buf });
+      this.fix = null;
+    }
+  }
+}
+
+/**
+ * Independently compute the events a {@link SkipVisitor} should keep, by
+ * filtering a full event log: drop any field whose id is skipped, and drop a
+ * skipped sequence's `begin`/`end` markers together with everything between them
+ * (at any nesting depth).
+ */
+export function filterSkipped(events: Event[], skip: Set<number>): Event[] {
+  const out: Event[] = [];
+  let depth = 0;
+  let skipFrom = -1; // depth at which the active skipped sequence sits (-1 = none)
+  for (const ev of events) {
+    if (ev.kind === "sequenceBegin") {
+      if (skipFrom >= 0) {
+        depth++;
+        continue; // already inside a skipped sub-tree
+      }
+      if (skip.has(ev.id)) {
+        skipFrom = depth;
+        depth++;
+        continue; // start skipping this sub-tree (drop the begin)
+      }
+      out.push(ev);
+      depth++;
+    } else if (ev.kind === "sequenceEnd") {
+      depth--;
+      if (skipFrom >= 0) {
+        if (depth === skipFrom) skipFrom = -1; // matching end of the skipped sub-tree
+        continue;
+      }
+      out.push(ev);
+    } else {
+      if (skipFrom < 0 && !skip.has(ev.id)) out.push(ev);
+    }
+  }
+  return out;
+}
+
 /** Collects a flat event log; string/blob chunks are concatenated. */
 export class RecordingVisitor implements Visitor {
   readonly events: Event[] = [];

@@ -31,13 +31,19 @@ import {
   getKernel,
   type Kernel,
 } from "../backend/kernel.js";
-import { encodeVarint, varintSize } from "../varint/leb128.js";
+import { encodeVarint, encodeVarintNum, varintSize, varintSizeNum } from "../varint/leb128.js";
 import { inI64, inU64, packFp32, packFp64, toBigInt } from "../varint/num64.js";
 import { zigzagEncode } from "../varint/zigzag.js";
-import { encodeUtf8, fixlenHeader } from "./fixlen.js";
+import { encodeUtf8 } from "./fixlen.js";
 import type { FlushSink } from "./sink.js";
 
 const DEFAULT_CAPACITY = 256;
+
+/**
+ * Largest magnitude a signed scalar takes on the number fast path: its zig-zag
+ * image (`|v| * 2`) must stay an exact integer, i.e. `≤ 2^53`.
+ */
+const SIGNED_FAST_MAX = 0x10_0000_0000_0000; // 2^52
 
 export class OStream {
   private buf: Uint8Array;
@@ -115,6 +121,12 @@ export class OStream {
 
   /** Write an unsigned integer field. */
   writeUnsigned(id: number, value: number | bigint): void {
+    // Fast path: a small non-negative integer never touches bigint.
+    if (typeof value === "number" && value >= 0 && value <= Number.MAX_SAFE_INTEGER && Number.isInteger(value)) {
+      this.header(id, WireType.Unsigned);
+      this.putVarintNum(value);
+      return;
+    }
     const v = toBigInt(value);
     if (!inU64(v)) throw argumentError(`unsigned value ${v} out of 64-bit range`);
     this.header(id, WireType.Unsigned);
@@ -123,6 +135,12 @@ export class OStream {
 
   /** Write a signed integer field (zig-zag encoded). */
   writeSigned(id: number, value: number | bigint): void {
+    // Fast path: a small-magnitude integer zig-zags within number precision.
+    if (typeof value === "number" && value >= -SIGNED_FAST_MAX && value <= SIGNED_FAST_MAX && Number.isInteger(value)) {
+      this.header(id, WireType.Signed);
+      this.putVarintNum(value >= 0 ? value * 2 : -value * 2 - 1);
+      return;
+    }
     const v = toBigInt(value);
     if (!inI64(v)) throw argumentError(`signed value ${v} out of 64-bit range`);
     this.header(id, WireType.Signed);
@@ -132,7 +150,7 @@ export class OStream {
   /** Write a boolean field (encoded as the unsigned value 0 or 1). */
   writeBoolean(id: number, value: boolean): void {
     this.header(id, WireType.Unsigned);
-    this.putVarint(value ? 1n : 0n);
+    this.putVarintNum(value ? 1 : 0);
   }
 
   /** Write an IEEE-754 32-bit float field. */
@@ -205,7 +223,7 @@ export class OStream {
   /** Write an array of IEEE-754 32-bit floats. */
   writeFp32Array(id: number, values: ArrayLike<number>): void {
     this.arrayHead(id, WireType.ArrayFixlen, values.length);
-    this.putVarint(fixlenHeader(4, FixlenSubtype.Fp32));
+    this.putVarintNum(4 * 8 + FixlenSubtype.Fp32);
     if (this.canGrow) {
       this.ensure(values.length * 4);
       this.pos = this.kernel.packFp32Array(values, this.buf, this.pos);
@@ -220,7 +238,7 @@ export class OStream {
   /** Write an array of IEEE-754 64-bit doubles. */
   writeFp64Array(id: number, values: ArrayLike<number>): void {
     this.arrayHead(id, WireType.ArrayFixlen, values.length);
-    this.putVarint(fixlenHeader(8, FixlenSubtype.Fp64));
+    this.putVarintNum(8 * 8 + FixlenSubtype.Fp64);
     if (this.canGrow) {
       this.ensure(values.length * 8);
       this.pos = this.kernel.packFp64Array(values, this.buf, this.pos);
@@ -250,22 +268,29 @@ export class OStream {
 
   // --- internals ----------------------------------------------------------
 
-  /** Ensure exactly `value`'s varint size, then write it. */
+  /** Ensure exactly `value`'s varint size, then write it (bigint path). */
   private putVarint(value: bigint): void {
     this.ensure(varintSize(value));
     this.pos = encodeVarint(value, this.buf, this.pos);
+  }
+
+  /** Ensure exactly `value`'s varint size, then write it (number fast path). */
+  private putVarintNum(value: number): void {
+    this.ensure(varintSizeNum(value));
+    this.pos = encodeVarintNum(value, this.buf, this.pos);
   }
 
   private header(id: number, type: WireType): void {
     if (id < 0 || id > ID_MAX || !Number.isInteger(id)) {
       throw argumentError(`field id ${id} out of range 0..${ID_MAX}`);
     }
-    this.putVarint((BigInt(id) << 3n) | BigInt(type));
+    // (id << 3) | type as a number: id ≤ 2^31-1, so the word stays ≤ 2^34.
+    this.putVarintNum(id * 8 + type);
   }
 
   private fixlenHead(id: number, length: number, subtype: FixlenSubtype): void {
     this.header(id, WireType.Fixlen);
-    this.putVarint(fixlenHeader(length, subtype));
+    this.putVarintNum(length * 8 + subtype);
   }
 
   private arrayHead(id: number, type: WireType, count: number): void {
@@ -273,7 +298,7 @@ export class OStream {
       throw argumentError(`array count ${count} out of range 1..${ARRAY_MAX}`);
     }
     this.header(id, type);
-    this.putVarint(BigInt(count));
+    this.putVarintNum(count);
   }
 
   /** Copy `data` out, flushing/growing as needed (large payloads stay chunked). */
