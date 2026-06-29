@@ -15,6 +15,11 @@ import type { Kernel } from "./kernel.js";
 // Largest signed magnitude whose zig-zag (|v|*2) stays an exact integer.
 const SIGNED_FAST_MAX = 0x10_0000_0000_0000; // 2^52
 
+/**
+ * The default, pure-TypeScript {@link Kernel} — active until {@link setKernel}
+ * installs another. It implements the bulk encoder transforms with no native or
+ * WebAssembly dependency, so it works in every environment.
+ */
 export const jsKernel: Kernel = {
   name: "js",
 

@@ -11,6 +11,8 @@
  * code is amortised — never one call per element.
  */
 
+import { jsKernel } from "./js.js";
+
 /**
  * Bulk, capacity-guaranteed transforms used on the encoder's fast path.
  *
@@ -19,8 +21,6 @@
  * written. Headers, counts, flushing and validation stay in the stream classes;
  * a kernel only moves bytes.
  */
-import { jsKernel } from "./js.js";
-
 export interface Kernel {
   /** A short identifier, surfaced in diagnostics and the parity tests. */
   readonly name: string;

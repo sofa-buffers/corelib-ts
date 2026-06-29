@@ -17,6 +17,7 @@ export const SofabErrorCode = {
   /** The input being decoded is malformed. */
   InvalidMsg: "INVALID_MSG",
 } as const;
+/** A {@link SofabError}'s cause: one of the {@link SofabErrorCode} values. */
 export type SofabErrorCode =
   (typeof SofabErrorCode)[keyof typeof SofabErrorCode];
 
