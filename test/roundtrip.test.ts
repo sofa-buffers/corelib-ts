@@ -31,8 +31,10 @@ describe("scalar round-trips", () => {
       os.writeUnsigned(1, 0n);
       os.writeUnsigned(2, U64_MAX);
     });
+    // Number-first decode: values that fit are delivered as `number`, the
+    // 64-bit boundary (> 2^53) as `bigint`.
     expect(seen.events).toEqual([
-      { kind: "unsigned", id: 1, value: 0n },
+      { kind: "unsigned", id: 1, value: 0 },
       { kind: "unsigned", id: 2, value: U64_MAX },
     ]);
   });
@@ -46,7 +48,7 @@ describe("scalar round-trips", () => {
     expect(seen.events).toEqual([
       { kind: "signed", id: 1, value: I64_MIN },
       { kind: "signed", id: 2, value: I64_MAX },
-      { kind: "signed", id: 3, value: -1n },
+      { kind: "signed", id: 3, value: -1 },
     ]);
   });
 
@@ -56,8 +58,8 @@ describe("scalar round-trips", () => {
       os.writeBoolean(2, false);
     });
     expect(seen.events).toEqual([
-      { kind: "unsigned", id: 1, value: 1n },
-      { kind: "unsigned", id: 2, value: 0n },
+      { kind: "unsigned", id: 1, value: 1 },
+      { kind: "unsigned", id: 2, value: 0 },
     ]);
   });
 
@@ -98,12 +100,12 @@ describe("array round-trips", () => {
       os.writeUnsignedArray(1, [0n, U64_MAX]);
       os.writeSignedArray(2, [I64_MIN, 0n, I64_MAX]);
     });
-    expect(seen.events[0]).toEqual({ kind: "array", id: 1, arrayKind: ArrayKind.Unsigned, values: [0n, U64_MAX] });
+    expect(seen.events[0]).toEqual({ kind: "array", id: 1, arrayKind: ArrayKind.Unsigned, values: [0, U64_MAX] });
     expect(seen.events[1]).toEqual({
       kind: "array",
       id: 2,
       arrayKind: ArrayKind.Signed,
-      values: [I64_MIN, 0n, I64_MAX],
+      values: [I64_MIN, 0, I64_MAX],
     });
   });
 
@@ -142,15 +144,15 @@ describe("nested sequences", () => {
   it("routes nested fields to a child visitor returned from sequenceBegin", () => {
     // Outer collects id 1; the nested sequence's fields go to a fresh Inner.
     class Inner implements Visitor {
-      value = 0n;
-      unsigned(_id: number, v: bigint): void {
+      value: number | bigint = 0;
+      unsigned(_id: number, v: number | bigint): void {
         this.value = v;
       }
     }
     class Outer implements Visitor {
-      value = 0n;
+      value: number | bigint = 0;
       readonly inner = new Inner();
-      unsigned(_id: number, v: bigint): void {
+      unsigned(_id: number, v: number | bigint): void {
         this.value = v;
       }
       sequenceBegin(): Visitor {
@@ -169,7 +171,7 @@ describe("nested sequences", () => {
     is.feed(os.bytes(), outer);
     is.end();
 
-    expect(outer.value).toBe(11n);
-    expect(outer.inner.value).toBe(99n);
+    expect(outer.value).toBe(11);
+    expect(outer.inner.value).toBe(99);
   });
 });
