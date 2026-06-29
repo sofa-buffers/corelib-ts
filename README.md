@@ -125,20 +125,92 @@ const blobSink: Visitor = {
 
 ## API summary
 
-**Encoder — `OStream`**
+### Write operations — `OStream`
 
 - `new OStream()` — in-memory, auto-growing; `new OStream(buffer, offset?, flush?)` — stream into a caller buffer, draining to `flush` when full.
 - `writeUnsigned(id, number|bigint)`, `writeSigned(id, number|bigint)`, `writeBoolean(id, boolean)`, `writeFp32(id, number)`, `writeFp64(id, number)`, `writeString(id, string)`, `writeBlob(id, Uint8Array)`, `writeFixlen(id, bytes, subtype)`.
-- `writeUnsignedArray` / `writeSignedArray` / `writeFp32Array` / `writeFp64Array(id, values)`.
+- `writeUnsignedArray` / `writeSignedArray(id, ArrayLike<number|bigint>)`, `writeFp32Array` / `writeFp64Array(id, ArrayLike<number>)`.
 - `writeSequenceBegin(id)` / `writeSequenceEnd()`.
 - `flush()`, `setBuffer(buffer, offset?)` (install a fresh buffer mid-stream), `bytesUsed`, `bytes()`.
 
-**Decoder — `IStream` + `Visitor`**
+### Read operations — `IStream` + `Visitor`
 
-- `new IStream()`, `feed(chunk, visitor)`, `end()`; `decode(bytes, visitor)` for the one-shot case.
-- `Visitor` (every method optional — an unhandled field is skipped): `unsigned(id, bigint)`, `signed(id, bigint)`, `fp32(id, number)`, `fp64(id, number)`, `string(id, total, offset, chunk)`, `blob(...)`, `arrayBegin(id, kind, count)`, `arrayUnsigned(id, i, bigint)`, `arraySigned(...)`, `arrayFp32(id, i, number)`, `arrayFp64(...)`, `arrayEnd(id)`, `sequenceBegin(id): Visitor | void`, `sequenceEnd()`.
+The decoder is **push / visitor-based**, not a pull cursor: rather than calling a
+`readUnsigned()` that returns a value, you feed bytes and the decoder *calls back*
+one `Visitor` method per decoded field, handing you the value (or, for
+string / blob, a view of the payload). This is what generated message classes
+implement — typically a `switch` on `id`.
 
-**Constants & helpers:** `API_VERSION` (= 1), `ID_MAX`, `FIXLEN_MAX`, `ARRAY_MAX`, `WireType`, `FixlenSubtype`, `ArrayKind`; errors via `SofabError` (`.code: SofabErrorCode`); acceleration via `getKernel` / `setKernel`, `loadNativeKernel`, `loadWasmKernel`.
+- `new IStream()`, `feed(chunk, visitor)` (dispatch a chunk's fields), `end()` (assert a clean field-boundary finish); `decode(bytes, visitor)` is the one-shot, whole-buffer fast path.
+- `Visitor` — every method is **optional**, and an unhandled (or unimplemented) field is silently **skipped**:
+  - `unsigned(id, value: number | bigint)` / `signed(id, value: number | bigint)` — a decoded integer. *Number-first*: `value` is a plain `number` when it fits exactly (`|value| ≤ 2^53-1`, covering all ids and u8..u32) and only a `bigint` beyond that, so the common case never allocates a bigint.
+  - `fp32(id, value: number)` / `fp64(id, value: number)` — a decoded IEEE-754 float, always a JS `number`.
+  - `string(id, total, offset, chunk: Uint8Array)` / `blob(id, total, offset, chunk: Uint8Array)` — a piece of a string/blob payload. `total` is the field's full byte length, `offset` the position of `chunk` within it. `decode()` delivers the whole payload in a single call (`offset 0`); `IStream` may split it across calls. Decode the string yourself (e.g. `TextDecoder`); see **Memory handling** for the lifetime of `chunk`.
+  - `arrayBegin(id, kind: ArrayKind, count)` then one of `arrayUnsigned(id, index, value)` / `arraySigned(id, index, value)` (number-first like `unsigned`) / `arrayFp32(id, index, value: number)` / `arrayFp64(id, index, value: number)` **per element**, then `arrayEnd(id)`. The library hands you elements one at a time — it does not materialise a JS array.
+  - `sequenceBegin(id): Visitor | void` — start of a nested message; return a child `Visitor` to route the nested fields to it (its `sequenceEnd()` fires at the matching close), or return nothing to keep using the current visitor.
+  - `sequenceEnd(): void` — close of the nested sequence this visitor was handling.
+
+### Supported types
+
+| Field | Write | Read (Visitor) | TS type |
+|-------|-------|----------------|---------|
+| unsigned (u8..u64) | `writeUnsigned` | `unsigned` | `number \| bigint` — `bigint` only when `> 2^53-1`; full `uint64` range round-trips |
+| signed (i8..i64) | `writeSigned` | `signed` | `number \| bigint` — `bigint` only when `\|v\| > 2^53-1`; full `int64` range |
+| boolean | `writeBoolean` | `unsigned` (as `0`/`1`) | `boolean` in / `number` out — no separate wire type |
+| fp32 | `writeFp32` | `fp32` | `number` (little-endian IEEE-754) |
+| fp64 | `writeFp64` | `fp64` | `number` (little-endian IEEE-754) |
+| string | `writeString` | `string` | `string` in / UTF-8 `Uint8Array` chunk(s) out |
+| blob | `writeBlob` | `blob` | `Uint8Array` |
+| array | `write{Unsigned,Signed,Fp32,Fp64}Array` | `array{Unsigned,Signed,Fp32,Fp64}` | element-typed as above |
+
+There is **no `bigint` requirement** for 64-bit — pass a `number` and it is used
+directly when exact; pass a `bigint` to reach the full 64-bit range. Arrays carry
+exactly the four element kinds above (unsigned / signed varint, fp32, fp64): the
+fixed-length array path is restricted to `Fp32` / `Fp64` subtypes, so **string,
+blob and nested-sequence elements are not allowed inside an array** — model those
+as repeated fields or nested sequences instead. `writeFixlen(id, bytes, subtype)`
+is the escape hatch for emitting any `FixlenSubtype` from raw bytes.
+
+### Memory handling
+
+**Encoder — two buffer modes.**
+
+- **In-memory (`new OStream()`)** — the library **allocates** an internal buffer
+  (256 bytes) and **auto-grows** it (doubling, via a fresh `Uint8Array` + copy) as
+  you write; it never throws `BUFFER_FULL`. `bytes()` returns a `subarray` *view*
+  of the finished message — copy it (`.slice()`) if you need to outlive the next
+  write or a grow.
+- **Streaming (`new OStream(buffer, offset?, flush?)`)** — writes into the
+  **caller-provided** `Uint8Array`; it never grows. When the buffer fills it hands
+  the produced bytes to your `flush` `FlushSink` (as a `subarray` view, valid only
+  for the duration of the callback) and resets, so a message can far exceed the
+  buffer — without a `flush` sink, a full buffer throws `BUFFER_FULL`. `offset`
+  reserves room at the front for a lower-layer header. **Buffer swap:** call
+  `setBuffer(buffer, offset?)` (typically from inside the flush callback) to
+  install a fresh output buffer mid-stream; `flush()` first, as any unflushed
+  bytes in the old buffer are dropped.
+
+**Decoder — values allocated, payload bytes are zero-copy.**
+
+The decoder produces scalar values *for* you: integers arrive as `number`
+(bigint only when out of safe range), floats as `number` — so generated code
+gets ready-to-use values without managing destinations. Arrays are not
+materialised: you receive one callback per element.
+
+String and blob payloads, however, are **not copied**. The `chunk` handed to
+`string` / `blob` is a **zero-copy `subarray` view** aliasing the input buffer
+(for `decode`) or the chunk you fed (for `IStream`). It is valid **only during
+the callback** — if you need to retain it, copy it (`chunk.slice()`) or decode it
+on the spot (`new TextDecoder().decode(chunk)`). This avoids a copy on the hot
+path; the trade-off is that the bytes are borrowed, not owned.
+
+### Constants & helpers
+
+`API_VERSION` (= 1), `ID_MAX`, `FIXLEN_MAX`, `ARRAY_MAX`, `U64_MAX`, `I64_MIN`,
+`I64_MAX`, `WireType`, `FixlenSubtype`, `ArrayKind`; errors via `SofabError`
+(`.code: SofabErrorCode` — `ARGUMENT`, `USAGE`, `BUFFER_FULL`, `INVALID_MSG`);
+acceleration via `getKernel` / `setKernel`, `jsKernel`, `loadNativeKernel`,
+`loadWasmKernel`.
 
 ## Feature flags
 
