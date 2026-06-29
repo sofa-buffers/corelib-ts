@@ -14,6 +14,7 @@
  */
 
 import type { ArrayKind } from "../constants.js";
+import { decodeContiguous } from "./fast.js";
 import { DecoderState } from "./state.js";
 
 /**
@@ -80,11 +81,16 @@ export class IStream {
 }
 
 /**
- * Decode a complete message in one call: feeds `bytes` to a fresh {@link IStream}
- * and asserts clean completion. Convenience for the non-streaming case.
+ * Decode a complete message held in one contiguous buffer, in a single call.
+ *
+ * This is the non-streaming convenience — and the fast path: with the whole
+ * message in hand it advances one cursor over the buffer (see
+ * {@link decodeContiguous}) instead of running the resumable per-byte state
+ * machine, so it is markedly faster than feeding the same bytes through
+ * {@link IStream}. Use {@link IStream} when the message arrives in chunks; use
+ * this when you already have it whole. Malformed input — including truncation
+ * or an unclosed sequence — throws {@link SofabError} (`INVALID_MSG`).
  */
 export function decode(bytes: Uint8Array, visitor: Visitor): void {
-  const is = new IStream();
-  is.feed(bytes, visitor);
-  is.end();
+  decodeContiguous(bytes, visitor);
 }
