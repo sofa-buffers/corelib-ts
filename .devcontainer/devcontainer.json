@@ -1,11 +1,13 @@
 {
-  "name": "sofabuffers-corelib-ts",
+  "name": "ts-devcontainer",
   "build": {
     "dockerfile": "Dockerfile",
     "args": { "NODE_VERSION": "24" }
   },
   "workspaceFolder": "/workspace",
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "runArgs": ["--env-file", "${localWorkspaceFolder}/.devcontainer/.env"],
+  "mounts": ["source=claude-config,target=/root/.claude,type=volume"],
   "remoteEnv": {
     "NODE_ENV": "development"
   },
