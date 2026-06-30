@@ -8,9 +8,13 @@
  * ({@link setKernel}) so an optional native or WASM build can accelerate them
  * without any API change.
  *
+ * Every public symbol is available two ways: as a flat named import, or under
+ * the aggregate `sofab` namespace (`import * as sofab` is the §6 idiom, and a
+ * ready-made `sofab` object is exported for `import { sofab }` / UMD use).
+ *
  * @example Encode then decode
  * ```ts
- * import { OStream, decode, type Visitor } from "@sofabuffers/corelib";
+ * import { OStream, decode, type Visitor } from "SofaBuffers";
  *
  * const os = new OStream();
  * os.writeUnsigned(1, 42);
@@ -22,32 +26,17 @@
  * };
  * decode(os.bytes(), sink);
  * ```
+ *
+ * @example The `sofab` namespace
+ * ```ts
+ * import * as sofab from "SofaBuffers";
+ * const os = new sofab.OStream();
+ * ```
  */
 
-export {
-  API_VERSION,
-  ArrayKind,
-  FixlenSubtype,
-  WireType,
-  ID_MAX,
-  FIXLEN_MAX,
-  ARRAY_MAX,
-  U64_MAX,
-  I64_MIN,
-  I64_MAX,
-} from "./constants.js";
+// Flat named exports — the primary surface.
+export * from "./public.js";
 
-export { SofabError, SofabErrorCode } from "./errors.js";
-
-export { OStream } from "./encode/ostream.js";
-export type { FlushSink } from "./encode/sink.js";
-
-export { IStream, decode } from "./decode/istream.js";
-export type { Visitor } from "./decode/istream.js";
-
-export { getKernel, setKernel } from "./backend/kernel.js";
-export type { Kernel } from "./backend/kernel.js";
-export { jsKernel } from "./backend/js.js";
-export { loadNativeKernel } from "./backend/native.js";
-export { loadWasmKernel } from "./backend/wasm.js";
-export type { WasmKernelFactory } from "./backend/wasm.js";
+// The same surface aggregated under the `sofab` namespace (§6), for both
+// `import * as sofab from "..."` and `import { sofab } from "..."`.
+export * as sofab from "./public.js";

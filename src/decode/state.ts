@@ -15,6 +15,7 @@ import {
   FIXLEN_MAX,
   FixlenSubtype,
   ID_MAX,
+  MAX_DEPTH,
   VARINT_MAX_BYTES,
   WireType,
 } from "../constants.js";
@@ -171,10 +172,19 @@ export class DecoderState {
           if (!this.vComplete) return;
           const count = this.vNum();
           this.resetVarint();
-          if (count < 1 || count > ARRAY_MAX) throw invalidMsgError("array count out of range");
+          if (count > ARRAY_MAX) throw invalidMsgError("array count out of range");
           this.arrCount = count;
           this.arrIndex = 0;
-          if (this.arrIsFixlen) {
+          if (count === 0) {
+            // §4.7/§4.8: a zero-count array is empty — no element-length word
+            // and no payload follow (even for fixlen). The fixlen element kind
+            // is unknowable for an empty array, so report it as Fp32 (the wire
+            // is identical for an empty fp32/fp64 array).
+            const kind = this.arrIsFixlen ? ArrayKind.Fp32 : this.arrKind;
+            this.top().arrayBegin?.(this.id, kind, 0);
+            this.top().arrayEnd?.(this.id);
+            this.state = S.Header;
+          } else if (this.arrIsFixlen) {
             // element kind (fp32 vs fp64) is only known once the element-length
             // word arrives, so defer arrayBegin until then.
             this.state = S.ArrayElemLen;
@@ -281,6 +291,12 @@ export class DecoderState {
         this.state = S.ArrayCount;
         break;
       case WireType.SequenceStart: {
+        // §4.9/§6.2: reject nesting deeper than MAX_DEPTH. The stack always
+        // holds the root visitor plus one entry per open sequence, so the
+        // current depth is stack.length - 1.
+        if (this.stack.length - 1 >= MAX_DEPTH) {
+          throw invalidMsgError(`nesting exceeds MAX_DEPTH (${MAX_DEPTH})`);
+        }
         const child = this.top().sequenceBegin?.(this.id);
         this.stack.push(child ?? this.top());
         this.state = S.Header;

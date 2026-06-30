@@ -19,6 +19,7 @@ import {
   FIXLEN_MAX,
   FixlenSubtype,
   ID_MAX,
+  MAX_DEPTH,
   VARINT_MAX_BYTES,
   WireType,
 } from "../constants.js";
@@ -231,6 +232,9 @@ export class OStream {
   /** Write an array of IEEE-754 32-bit floats. */
   writeFp32Array(id: number, values: ArrayLike<number>): void {
     this.arrayHead(id, WireType.ArrayFixlen, values.length);
+    // A zero-count fixlen array carries no fixlen_word and no payload (§4.8):
+    // the field is exactly [ header ][ count = 0 ].
+    if (values.length === 0) return;
     this.putVarintNum(4 * 8 + FixlenSubtype.Fp32);
     if (this.canGrow) {
       this.ensure(values.length * 4);
@@ -246,6 +250,9 @@ export class OStream {
   /** Write an array of IEEE-754 64-bit doubles. */
   writeFp64Array(id: number, values: ArrayLike<number>): void {
     this.arrayHead(id, WireType.ArrayFixlen, values.length);
+    // A zero-count fixlen array carries no fixlen_word and no payload (§4.8):
+    // the field is exactly [ header ][ count = 0 ].
+    if (values.length === 0) return;
     this.putVarintNum(8 * 8 + FixlenSubtype.Fp64);
     if (this.canGrow) {
       this.ensure(values.length * 8);
@@ -262,6 +269,10 @@ export class OStream {
 
   /** Open a nested sequence (a fresh id scope). */
   writeSequenceBegin(id: number): void {
+    // §4.9/§6.2: refuse to open more than MAX_DEPTH nested sequences.
+    if (this.depth >= MAX_DEPTH) {
+      throw usageError(`nesting exceeds MAX_DEPTH (${MAX_DEPTH})`);
+    }
     this.header(id, WireType.SequenceStart);
     this.depth++;
   }
@@ -302,8 +313,10 @@ export class OStream {
   }
 
   private arrayHead(id: number, type: WireType, count: number): void {
-    if (count < 1 || count > ARRAY_MAX) {
-      throw argumentError(`array count ${count} out of range 1..${ARRAY_MAX}`);
+    // §4.7/§4.8: element_count range is 0..ARRAY_MAX; a zero-count array is a
+    // valid, fully-specified empty array on the wire.
+    if (count < 0 || count > ARRAY_MAX) {
+      throw argumentError(`array count ${count} out of range 0..${ARRAY_MAX}`);
     }
     this.header(id, type);
     this.putVarintNum(count);
