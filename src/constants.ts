@@ -79,3 +79,11 @@ export const I64_MAX = 0x7fff_ffff_ffff_ffffn;
 
 /** A varint encodes at most this many bytes for a 64-bit value. */
 export const VARINT_MAX_BYTES = 10;
+
+/**
+ * Maximum nested-sequence depth (§4.9 / §6.2). An encoder must not open more
+ * than this many nested sequences, and a decoder must reject a message that
+ * nests deeper with an `InvalidMessage` error rather than risk unbounded
+ * recursion / stack growth.
+ */
+export const MAX_DEPTH = 255;

@@ -31,6 +31,7 @@ import {
   FIXLEN_MAX,
   FixlenSubtype,
   ID_MAX,
+  MAX_DEPTH,
   WireType,
 } from "../constants.js";
 import { invalidMsgError } from "../errors.js";
@@ -137,6 +138,14 @@ class FastDecoder {
 
         case WireType.ArrayFixlen: {
           const count = this.arrayCount();
+          if (count === 0) {
+            // §4.8: a zero-count fixlen array carries no element-length word and
+            // no payload. The element kind is unknowable, so report Fp32 (the
+            // wire is identical for an empty fp32/fp64 array).
+            top.arrayBegin?.(id, ArrayKind.Fp32, 0);
+            top.arrayEnd?.(id);
+            break;
+          }
           this.readVarint();
           const sub = this.lo & 7;
           const size = this.upper();
@@ -163,6 +172,11 @@ class FastDecoder {
         }
 
         case WireType.SequenceStart: {
+          // §4.9/§6.2: reject nesting deeper than MAX_DEPTH. The stack holds the
+          // root plus one entry per open sequence, so depth is stack.length - 1.
+          if (stack.length - 1 >= MAX_DEPTH) {
+            throw invalidMsgError(`nesting exceeds MAX_DEPTH (${MAX_DEPTH})`);
+          }
           const child = top.sequenceBegin?.(id);
           top = child ?? top;
           stack.push(top);
@@ -179,11 +193,11 @@ class FastDecoder {
 
   // --- field helpers ------------------------------------------------------
 
-  /** Read and validate an array count word (1..ARRAY_MAX). */
+  /** Read and validate an array count word (0..ARRAY_MAX; §4.7/§4.8). */
   private arrayCount(): number {
     this.readVarint();
     const count = this.num();
-    if (count < 1 || count > ARRAY_MAX) throw invalidMsgError("array count out of range");
+    if (count > ARRAY_MAX) throw invalidMsgError("array count out of range");
     return count;
   }
 
