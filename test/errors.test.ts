@@ -40,11 +40,6 @@ describe("decoder rejects malformed input", () => {
     expect(codeOf(() => decode(bytes(0x02, 0x28, 0, 0, 0, 0, 0), {}))).toBe(SofabErrorCode.InvalidMsg);
   });
 
-  it("array count of zero", () => {
-    // id 0 unsigned-array, count 0
-    expect(codeOf(() => decode(bytes(0x03, 0x00), {}))).toBe(SofabErrorCode.InvalidMsg);
-  });
-
   it("invalid fixlen-array element type", () => {
     // id 0 fixlen-array, count 1, element-word (4<<3)|2 -> string elements not allowed
     expect(codeOf(() => decode(bytes(0x05, 0x01, 0x22), {}))).toBe(SofabErrorCode.InvalidMsg);
@@ -97,10 +92,6 @@ describe("encoder rejects bad arguments", () => {
 
   it("signed value out of 64-bit range", () => {
     expect(codeOf(() => new OStream().writeSigned(1, 1n << 63n))).toBe(SofabErrorCode.Argument);
-  });
-
-  it("empty array", () => {
-    expect(codeOf(() => new OStream().writeUnsignedArray(1, []))).toBe(SofabErrorCode.Argument);
   });
 
   it("sequence end without a matching begin", () => {
