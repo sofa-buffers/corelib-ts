@@ -175,19 +175,19 @@ export class DecoderState {
           if (count > ARRAY_MAX) throw invalidMsgError("array count out of range");
           this.arrCount = count;
           this.arrIndex = 0;
-          if (count === 0) {
-            // §4.7/§4.8: a zero-count array is empty — no element-length word
-            // and no payload follow (even for fixlen). The fixlen element kind
-            // is unknowable for an empty array, so report it as Fp32 (the wire
-            // is identical for an empty fp32/fp64 array).
-            const kind = this.arrIsFixlen ? ArrayKind.Fp32 : this.arrKind;
-            this.top().arrayBegin?.(this.id, kind, 0);
+          if (this.arrIsFixlen) {
+            // §4.8: a fixlen array always carries its element-length word — even
+            // when empty — so the true element kind (fp32 vs fp64) stays known.
+            // The element kind is only knowable once that word arrives, so defer
+            // arrayBegin until then; a zero-count array reads the word then ends
+            // with no payload (handled in S.ArrayElemLen).
+            this.state = S.ArrayElemLen;
+          } else if (count === 0) {
+            // §4.7: a zero-count integer array is empty — no payload follows and
+            // no element-length word exists (element width is API-only).
+            this.top().arrayBegin?.(this.id, this.arrKind, 0);
             this.top().arrayEnd?.(this.id);
             this.state = S.Header;
-          } else if (this.arrIsFixlen) {
-            // element kind (fp32 vs fp64) is only known once the element-length
-            // word arrives, so defer arrayBegin until then.
-            this.state = S.ArrayElemLen;
           } else {
             this.top().arrayBegin?.(this.id, this.arrKind, this.arrCount);
             this.state = this.arrKind === ArrayKind.Unsigned ? S.ArrayUElem : S.ArraySElem;
@@ -231,8 +231,15 @@ export class DecoderState {
             throw invalidMsgError("invalid fixlen array element type");
           }
           this.top().arrayBegin?.(this.id, this.arrKind, this.arrCount);
-          this.have = 0;
-          this.state = S.ArrayFp;
+          if (this.arrCount === 0) {
+            // §4.8: an empty fixlen array is [ header ][ count = 0 ][ fixlen_word ]
+            // with no payload — the word above yielded the true element kind.
+            this.top().arrayEnd?.(this.id);
+            this.state = S.Header;
+          } else {
+            this.have = 0;
+            this.state = S.ArrayFp;
+          }
           break;
         }
 
