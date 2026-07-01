@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the version is below `1.0.0`, breaking changes bump the **minor** version.
 
+## [Unreleased]
+
+### Changed
+
+- **BREAKING (wire format):** a fixlen array (`fp32`/`fp64`) now always carries
+  its `fixlen_word` — even when empty (`element_count == 0`). Previously an empty
+  fixlen array was `[header][count=0]` with no `fixlen_word`, making an empty
+  `fp32` array byte-identical to an empty `fp64` one (`05 00`); a decoder could
+  not tell them apart. An empty fixlen array is now
+  `[header][count=0][fixlen_word]` with no payload (`05 00 20` for `fp32`,
+  `05 00 41` for `fp64`), so the element subtype stays recoverable. Integer
+  arrays (`u8`…`u64`, `i8`…`i64`) are unchanged — they never carry a
+  `fixlen_word` — so an empty integer array stays `[header][count=0]`. Mirrors
+  CORELIB_PLAN §4.8 / MESSAGE_SPEC §3 and corelib-c-cpp#45.
+
 ## [0.2.0] - 2026-06-29
 
 A performance release: the encode and decode hot paths no longer churn

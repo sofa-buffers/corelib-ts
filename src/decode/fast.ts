@@ -138,14 +138,9 @@ class FastDecoder {
 
         case WireType.ArrayFixlen: {
           const count = this.arrayCount();
-          if (count === 0) {
-            // §4.8: a zero-count fixlen array carries no element-length word and
-            // no payload. The element kind is unknowable, so report Fp32 (the
-            // wire is identical for an empty fp32/fp64 array).
-            top.arrayBegin?.(id, ArrayKind.Fp32, 0);
-            top.arrayEnd?.(id);
-            break;
-          }
+          // §4.8: a fixlen array always carries its element-length word — even
+          // when empty — so the true element kind (fp32 vs fp64) stays known.
+          // When count == 0 the payload loops below simply run zero times.
           this.readVarint();
           const sub = this.lo & 7;
           const size = this.upper();

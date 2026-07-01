@@ -232,9 +232,10 @@ export class OStream {
   /** Write an array of IEEE-754 32-bit floats. */
   writeFp32Array(id: number, values: ArrayLike<number>): void {
     this.arrayHead(id, WireType.ArrayFixlen, values.length);
-    // A zero-count fixlen array carries no fixlen_word and no payload (§4.8):
-    // the field is exactly [ header ][ count = 0 ].
-    if (values.length === 0) return;
+    // A fixlen array always carries its fixlen_word — even when empty (§4.8) —
+    // so an empty fp32 array stays distinct from an empty fp64 one. The payload
+    // loop below simply runs zero times: the field is [ header ][ count = 0 ]
+    // [ fixlen_word ] with no elements.
     this.putVarintNum(4 * 8 + FixlenSubtype.Fp32);
     if (this.canGrow) {
       this.ensure(values.length * 4);
@@ -250,9 +251,10 @@ export class OStream {
   /** Write an array of IEEE-754 64-bit doubles. */
   writeFp64Array(id: number, values: ArrayLike<number>): void {
     this.arrayHead(id, WireType.ArrayFixlen, values.length);
-    // A zero-count fixlen array carries no fixlen_word and no payload (§4.8):
-    // the field is exactly [ header ][ count = 0 ].
-    if (values.length === 0) return;
+    // A fixlen array always carries its fixlen_word — even when empty (§4.8) —
+    // so an empty fp64 array stays distinct from an empty fp32 one. The payload
+    // loop below simply runs zero times: the field is [ header ][ count = 0 ]
+    // [ fixlen_word ] with no elements.
     this.putVarintNum(8 * 8 + FixlenSubtype.Fp64);
     if (this.canGrow) {
       this.ensure(values.length * 8);
