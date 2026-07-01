@@ -148,3 +148,59 @@ describe("OStream input flexibility", () => {
     ]);
   });
 });
+
+describe("OStream reset", () => {
+  const write = (os: OStream, id: number): void => {
+    os.writeUnsigned(id, id * 1000);
+    os.writeString(id + 1, "pooled");
+  };
+
+  it("rewinds so one pooled encoder reproduces fresh encodes", () => {
+    const pooled = new OStream();
+
+    write(pooled, 1);
+    const fresh1 = new OStream();
+    write(fresh1, 1);
+    expect(pooled.bytes()).toEqual(fresh1.bytes());
+
+    pooled.reset();
+    expect(pooled.bytesUsed).toBe(0);
+
+    write(pooled, 5);
+    const fresh2 = new OStream();
+    write(fresh2, 5);
+    expect(pooled.bytes()).toEqual(fresh2.bytes());
+  });
+
+  it("clears nesting depth left by an aborted encode", () => {
+    const os = new OStream();
+    // Abort mid-message with an unbalanced sequence, leaving depth > 0.
+    os.writeUnsigned(1, 7);
+    os.writeSequenceBegin(2);
+    os.reset();
+
+    // A clean encode afterwards must match a fresh encoder — the leftover
+    // depth and bytes from the aborted attempt are gone.
+    os.writeUnsigned(1, 7);
+    os.writeSequenceBegin(2);
+    os.writeSigned(1, -9);
+    os.writeSequenceEnd();
+
+    const fresh = new OStream();
+    fresh.writeUnsigned(1, 7);
+    fresh.writeSequenceBegin(2);
+    fresh.writeSigned(1, -9);
+    fresh.writeSequenceEnd();
+
+    expect(os.bytes()).toEqual(fresh.bytes());
+  });
+
+  it("preserves a reserved front offset across reset", () => {
+    const os = new OStream(new Uint8Array(64), 4);
+    os.writeUnsigned(1, 7);
+    os.reset();
+    expect(os.bytesUsed).toBe(0);
+    os.writeUnsigned(1, 7);
+    expect(os.bytes().byteOffset).toBe(4); // still writing past the reserve
+  });
+});
