@@ -126,6 +126,16 @@ export class OStream {
     this.pos = offset;
   }
 
+  /**
+   * Rewind the encoder to empty, reusing the existing buffer. Lets a caller pool
+   * one OStream across many messages instead of allocating a fresh buffer per
+   * encode. Any view previously returned by {@link bytes} is invalidated.
+   */
+  reset(): void {
+    this.pos = this.start;
+    this.depth = 0;
+  }
+
   // --- scalars ------------------------------------------------------------
 
   /** Write an unsigned integer field. */
