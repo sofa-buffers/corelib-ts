@@ -37,10 +37,10 @@ unit tests here use the exact byte vectors from the
 C++, Rust, C#, Java, Go and Python implementations.
 
 Requires **Node.js 18+** (or any modern browser / Electron / Deno / Bun).
-Install from npm:
+The npm package name is `@sofa-buffers/corelib`. Install from npm:
 
 ```bash
-npm install SofaBuffers
+npm install @sofa-buffers/corelib
 ```
 
 Ships ESM, CommonJS, a browser global (`SofaBuffers`) and full type declarations.
@@ -61,7 +61,7 @@ Ships ESM, CommonJS, a browser global (`SofaBuffers`) and full type declarations
 ## Usage
 
 ```ts
-import { OStream, decode, type Visitor } from "SofaBuffers";
+import { OStream, decode, type Visitor } from "@sofa-buffers/corelib";
 
 // ---- encode ----
 const os = new OStream();
@@ -93,7 +93,7 @@ available via `SofabError.code` (`ARGUMENT`, `USAGE`, `BUFFER_FULL`,
 whenever it fills, so the buffer never has to be message-sized:
 
 ```ts
-import { OStream, type FlushSink } from "SofaBuffers";
+import { OStream, type FlushSink } from "@sofa-buffers/corelib";
 
 const out: number[] = [];
 const sink: FlushSink = (chunk) => out.push(...chunk); // or socket / file / stream
@@ -108,7 +108,7 @@ os.flush();                                            // push the tail
 transport hands you — a packet, or a single byte — and finish with `end()`:
 
 ```ts
-import { IStream } from "SofaBuffers";
+import { IStream } from "@sofa-buffers/corelib";
 
 const is = new IStream();
 for await (const chunk of socket) is.feed(chunk, visitor);
@@ -289,7 +289,7 @@ default `jsKernel` is pure TypeScript and always active. An optional native
 with **no change to the public API**:
 
 ```ts
-import { setKernel, loadNativeKernel, loadWasmKernel } from "SofaBuffers";
+import { setKernel, loadNativeKernel, loadWasmKernel } from "@sofa-buffers/corelib";
 
 // Node / Electron: load the optional @sofabuffers/corelib-native addon if present
 await loadNativeKernel();         // returns false (and keeps the JS kernel) if absent
