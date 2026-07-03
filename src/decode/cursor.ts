@@ -306,11 +306,13 @@ export class Cursor {
 
   // --- varint reading (shared verbatim with ./fast) -----------------------
 
-  /** The last varint's full value as a `bigint` (64-bit fidelity). */
+  /**
+   * The last varint's full value as a `bigint` (64-bit fidelity). Only ever
+   * called from {@link unsignedValue} / {@link signedValue} on the `hi` overflow
+   * path (`this.hi >>> 0 > 0x1fffff`), so `hi` is always non-zero here.
+   */
   private big(): bigint {
-    return this.hi === 0
-      ? BigInt(this.lo >>> 0)
-      : (BigInt(this.hi >>> 0) << 32n) | BigInt(this.lo >>> 0);
+    return (BigInt(this.hi >>> 0) << 32n) | BigInt(this.lo >>> 0);
   }
 
   /**
