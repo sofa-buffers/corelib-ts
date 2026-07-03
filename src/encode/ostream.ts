@@ -35,7 +35,7 @@ import {
 import { encodeVarint, encodeVarintNum, varintSize, varintSizeNum } from "../varint/leb128.js";
 import { inI64, inU64, packFp32, packFp64, toBigInt } from "../varint/num64.js";
 import { zigzagEncode } from "../varint/zigzag.js";
-import { encodeUtf8 } from "./fixlen.js";
+import { encodeUtf8, utf8Length, utf8Write } from "./fixlen.js";
 import type { FlushSink } from "./sink.js";
 
 const DEFAULT_CAPACITY = 256;
@@ -188,6 +188,22 @@ export class OStream {
 
   /** Write a UTF-8 string field. */
   writeString(id: number, text: string): void {
+    // Fast path (in-memory, growable buffer): scan the UTF-8 byte length, write
+    // the fixlen header, then encode the characters straight into the output
+    // buffer. This skips `TextEncoder.encode`'s per-call setup + throwaway array
+    // + second copy — the encoder's dominant cost on string-heavy messages.
+    if (this.canGrow) {
+      const byteLen = utf8Length(text);
+      if (byteLen > FIXLEN_MAX) {
+        throw argumentError(`fixlen length ${byteLen} exceeds ${FIXLEN_MAX}`);
+      }
+      this.fixlenHead(id, byteLen, FixlenSubtype.String);
+      this.ensure(byteLen);
+      this.pos = utf8Write(text, this.buf, this.pos);
+      return;
+    }
+    // Streaming path: the payload may outgrow a fixed caller buffer, so keep the
+    // chunk-draining `writeRaw` route (needs the bytes materialised up front).
     this.writeFixlen(id, encodeUtf8(text), FixlenSubtype.String);
   }
 

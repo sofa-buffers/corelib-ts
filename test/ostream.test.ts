@@ -149,6 +149,61 @@ describe("OStream input flexibility", () => {
   });
 });
 
+describe("OStream writeString UTF-8", () => {
+  // The in-memory (growable) writeString scans the UTF-8 length and writes the
+  // characters straight into the buffer; the streaming (fixed-buffer) path still
+  // materialises via TextEncoder. Both must emit byte-identical fields for every
+  // input — including 4-byte code points and unpaired surrogates (which WHATWG,
+  // and therefore TextEncoder, replaces with U+FFFD).
+  const cases = [
+    "",
+    "a",
+    "Hello, World!",
+    "äöüÄÖÜß",
+    "äöü€",
+    "😀😁🎉", // 4-byte code points (surrogate pairs)
+    "𝕳𝖊𝖑𝖑𝖔",
+    "日本語テスト",
+    "café naïve",
+    "\uD800", // lone high surrogate -> U+FFFD
+    "\uDC00", // lone low surrogate -> U+FFFD
+    "a\uD800b", // lone high surrogate in the middle
+    "a\uDC00b", // lone low surrogate in the middle
+    "\uD800\uD800", // two high surrogates (first is unpaired)
+    "\uDFFF\uD83D", // low then high (both unpaired)
+    "x".repeat(500) + "€", // longer, with a multibyte tail
+  ];
+
+  it("in-memory fast path matches the TextEncoder streaming path", () => {
+    for (const s of cases) {
+      const fast = new OStream();
+      fast.writeString(0, s);
+
+      const streamed = new OStream(new Uint8Array(8192), 0);
+      streamed.writeString(0, s);
+
+      expect(fast.bytes()).toEqual(streamed.bytes());
+    }
+  });
+
+  it("round-trips every string through the decoder", () => {
+    const dec = new TextDecoder();
+    for (const s of cases) {
+      const os = new OStream();
+      os.writeString(0, s);
+      let got: string | undefined;
+      decode(os.bytes(), {
+        string: (_id, _total, _offset, chunk) => {
+          got = dec.decode(chunk);
+        },
+      });
+      // Compare against TextEncoder's own normalisation (unpaired surrogates
+      // become U+FFFD), which is what a correct encoder must have written.
+      expect(got).toBe(dec.decode(new TextEncoder().encode(s)));
+    }
+  });
+});
+
 describe("OStream reset", () => {
   const write = (os: OStream, id: number): void => {
     os.writeUnsigned(id, id * 1000);
