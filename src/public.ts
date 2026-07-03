@@ -24,6 +24,7 @@ export type { FlushSink } from "./encode/sink.js";
 
 export { IStream, decode } from "./decode/istream.js";
 export type { Visitor } from "./decode/istream.js";
+export { Cursor } from "./decode/cursor.js";
 
 export { getKernel, setKernel } from "./backend/kernel.js";
 export type { Kernel } from "./backend/kernel.js";
