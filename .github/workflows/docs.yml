@@ -31,7 +31,15 @@ jobs:
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:
+          # Scope the artifact name per run-attempt. A re-run's
+          # upload-pages-artifact does not remove the previous attempt's
+          # artifact, so a shared "github-pages" name leaves deploy-pages with
+          # two identically-named artifacts and it fails. A per-attempt name
+          # keeps each attempt's artifact isolated.
+          name: github-pages-${{ github.run_attempt }}
           path: docs
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
+        with:
+          artifact_name: github-pages-${{ github.run_attempt }}
