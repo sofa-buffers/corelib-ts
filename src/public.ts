@@ -19,6 +19,7 @@ export {
 
 export { SofabError, SofabErrorCode } from "./errors.js";
 
+export { Long } from "./long.js";
 export { OStream } from "./encode/ostream.js";
 export type { FlushSink } from "./encode/sink.js";
 
