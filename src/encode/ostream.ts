@@ -32,7 +32,8 @@ import {
   getKernel,
   type Kernel,
 } from "../backend/kernel.js";
-import { encodeVarint, encodeVarintNum, varintSize, varintSizeNum } from "../varint/leb128.js";
+import { Long } from "../long.js";
+import { encodeVarint, encodeVarintLoHi, encodeVarintNum, varintSize, varintSizeNum } from "../varint/leb128.js";
 import { inI64, inU64, packFp32, packFp64, toBigInt } from "../varint/num64.js";
 import { zigzagEncode } from "../varint/zigzag.js";
 import { encodeUtf8, utf8Length, utf8Write } from "./fixlen.js";
@@ -253,6 +254,44 @@ export class OStream {
         this.pos = encodeVarint(zigzagEncode(v), this.buf, this.pos);
       }
     }
+  }
+
+  /**
+   * Write an unsigned 64-bit array from {@link Long}[] — the `bigint`-free path.
+   * Produces the identical wire to {@link writeUnsignedArray}; reads each Long's
+   * 32-bit halves directly, so no `bigint` is created per element.
+   */
+  writeUnsignedArrayLong(id: number, values: readonly Long[]): void {
+    this.arrayHead(id, WireType.ArrayUnsigned, values.length);
+    this.ensure(values.length * VARINT_MAX_BYTES);
+    let pos = this.pos;
+    const buf = this.buf;
+    for (let i = 0; i < values.length; i++) {
+      const v = values[i]!;
+      pos = encodeVarintLoHi(v.low, v.high, buf, pos);
+    }
+    this.pos = pos;
+  }
+
+  /**
+   * Write a signed 64-bit array (zig-zag) from {@link Long}[] — the `bigint`-free
+   * path. Zig-zag `(n << 1) ^ (n >> 63)` is computed on the lo/hi pair.
+   */
+  writeSignedArrayLong(id: number, values: readonly Long[]): void {
+    this.arrayHead(id, WireType.ArraySigned, values.length);
+    this.ensure(values.length * VARINT_MAX_BYTES);
+    let pos = this.pos;
+    const buf = this.buf;
+    for (let i = 0; i < values.length; i++) {
+      const v = values[i]!;
+      const lo = v.low;
+      const hi = v.high;
+      const sgn = (-(hi >>> 31)) >>> 0; // all ones when negative, else zero
+      const zLo = (((lo << 1) >>> 0) ^ sgn) >>> 0;
+      const zHi = ((((hi << 1) | (lo >>> 31)) >>> 0) ^ sgn) >>> 0;
+      pos = encodeVarintLoHi(zLo, zHi, buf, pos);
+    }
+    this.pos = pos;
   }
 
   /** Write an array of IEEE-754 32-bit floats. */

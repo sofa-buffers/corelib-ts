@@ -57,6 +57,30 @@ export function encodeVarint(value: bigint, out: Uint8Array, pos: number): numbe
   return pos;
 }
 
+/**
+ * Write a 64-bit value already split into two unsigned 32-bit halves as a
+ * varint — the `bigint`-free sibling of {@link encodeVarint}. Callers holding a
+ * `bigint` split it once (or hold a {@link Long}) and then stay on the number
+ * path here, avoiding the per-value `bigint` churn that dominates the 64-bit
+ * array encoders (and which JavaScriptCore optimizes far worse than V8).
+ * `lo`/`hi` are coerced to uint32.
+ */
+export function encodeVarintLoHi(lo: number, hi: number, out: Uint8Array, pos: number): number {
+  lo >>>= 0;
+  hi >>>= 0;
+  while (hi !== 0) {
+    out[pos++] = (lo & 0x7f) | 0x80;
+    lo = ((lo >>> 7) | (hi << 25)) >>> 0;
+    hi >>>= 7;
+  }
+  while (lo > 0x7f) {
+    out[pos++] = (lo & 0x7f) | 0x80;
+    lo >>>= 7;
+  }
+  out[pos++] = lo;
+  return pos;
+}
+
 /** Number of bytes {@link encodeVarintNum} will write for `value`. */
 export function varintSizeNum(value: number): number {
   let n = 1;

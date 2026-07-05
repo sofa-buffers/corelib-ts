@@ -31,6 +31,7 @@ import {
   WireType,
 } from "../constants.js";
 import { invalidMsgError } from "../errors.js";
+import { Long } from "../long.js";
 import { zigzagDecode } from "../varint/zigzag.js";
 
 const TWO32 = 0x1_0000_0000; // 2^32, for combining the 32-bit halves
@@ -154,6 +155,35 @@ export class Cursor {
     for (let i = 0; i < count; i++) {
       this.readVarint();
       out[i] = this.signedValue();
+    }
+    return out;
+  }
+
+  /**
+   * Read an unsigned 64-bit array into {@link Long}[] — the `bigint`-free path.
+   * Each element keeps the raw lo/hi halves; call {@link Long.toBigInt} to
+   * materialise only the values the caller actually needs.
+   */
+  readUnsignedArrayLong(): Long[] {
+    const count = this.arrayCount();
+    const out = new Array<Long>(count);
+    for (let i = 0; i < count; i++) {
+      this.readVarint();
+      out[i] = new Long(this.lo, this.hi);
+    }
+    return out;
+  }
+
+  /** Read a signed 64-bit array (zig-zag) into {@link Long}[] — the `bigint`-free path. */
+  readSignedArrayLong(): Long[] {
+    const count = this.arrayCount();
+    const out = new Array<Long>(count);
+    for (let i = 0; i < count; i++) {
+      this.readVarint();
+      const lo = this.lo >>> 0;
+      const hi = this.hi >>> 0;
+      const mask = (-(lo & 1)) >>> 0; // all ones when the zig-zag lsb is set
+      out[i] = new Long((((lo >>> 1) | (hi << 31)) >>> 0) ^ mask, ((hi >>> 1) >>> 0) ^ mask);
     }
     return out;
   }
