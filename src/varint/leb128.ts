@@ -75,8 +75,22 @@ export function varintSizeNum(value: number): number {
  * bytes of room. Returns the position past the last byte written.
  */
 export function encodeVarintNum(value: number, out: Uint8Array, pos: number): number {
-  // `% 128` (not `& 0x7f`) so values above 2^31 keep their bits — bitwise ops
-  // in JS would truncate to 32 bits.
+  // Fast path: below 2^32 every 7-bit group survives bitwise extraction (ToUint32
+  // is exact there, and `>>>` keeps it unsigned), so we stay on cheap integer ops.
+  // This covers ids, lengths, counts, u8..u32 and their zig-zags — the vast
+  // majority of calls. It matters because JavaScriptCore does not inline this
+  // helper and its `% 128` / `Math.floor(/128)` float path is a top-3 hotspot
+  // there; V8 optimizes both away, so the change is JSC-facing but harmless on V8.
+  if (value < 0x1_0000_0000) {
+    let v = value;
+    while (v > 0x7f) {
+      out[pos++] = (v & 0x7f) | 0x80;
+      v >>>= 7;
+    }
+    out[pos++] = v;
+    return pos;
+  }
+  // Slow path: 2^32 .. 2^53, where bitwise ops would truncate to 32 bits.
   while (value > 0x7f) {
     out[pos++] = (value % 128) | 0x80;
     value = Math.floor(value / 128);
