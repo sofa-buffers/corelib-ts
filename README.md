@@ -20,14 +20,15 @@ A **dependency-free**, **streaming** TypeScript implementation of the SofaBuffer
 (*Sofab*) serialization format. It is the **runtime stream core** (equivalent to
 the C `corelib`'s `istream` / `ostream`), written in portable TypeScript that
 runs anywhere JavaScript does — **Node.js, browsers, Electron, Deno, Bun** and a
-classic `<script>` tag — with no native dependency.
+classic `<script>` tag — with no native dependency. It is a single, standalone
+codec: the same source runs on V8 (Node) and JavaScriptCore (Bun) unchanged.
 
 Like protobuf's `CodedInputStream` / `CodedOutputStream`, this library is meant
-to be driven by **generated code**: a schema-driven generator emits one class per
-message plus marshal / unmarshal methods that call the primitives here. The
-decoder uses the **visitor pattern**, so a generated message is typically a
-single `switch` over the field id, and a nested message simply returns its child
-object from `sequenceBegin`.
+to be driven by **generated code**: a schema-driven generator (`sofabgen`) emits
+one class per message plus marshal / unmarshal methods that call the primitives
+here. The library offers **two decode models**: a resumable **push / visitor**
+decoder for streaming, and a monomorphic **pull cursor** (`Cursor`) that
+generated per-message code drives with a single `switch` over the field id.
 
 The wire format is specified, language-neutrally, in the
 [SofaBuffers documentation](https://github.com/sofa-buffers/documentation). The
@@ -36,46 +37,67 @@ unit tests here use the exact byte vectors from the
 (`test_vectors.json`) to guarantee byte-for-byte interoperability with the C,
 C++, Rust, C#, Java, Go and Python implementations.
 
-Requires **Node.js 18+** (or any modern browser / Electron / Deno / Bun).
+**Requirements.** Node.js **18+** (`engines.node >= 18`, CI runs 18 / 20 / 24),
+or any modern browser / Electron / Deno / Bun. Built with TypeScript 5.7;
+targets ES2020 (`bigint` is required).
+
+**Dependencies.** None. The published package has **zero runtime dependencies**
+and uses only standard JS / Web APIs (`Uint8Array`, `DataView`, `TextEncoder` /
+`TextDecoder`) — nothing from `node:` on the hot path.
+
 The npm package name is `@sofa-buffers/corelib`. Install from npm:
 
 ```bash
 npm install @sofa-buffers/corelib
 ```
 
-Ships ESM, CommonJS, a browser global (`SofaBuffers`) and full type declarations.
+Ships **ESM** (`.js`), **CommonJS** (`.cjs`), a **browser IIFE global**
+(`SofaBuffers`, for `<script>` / unpkg / jsDelivr) and full type declarations.
 
 ## Why this design
 
 | Goal | How |
 |------|-----|
-| Runs everywhere | Pure TypeScript over `Uint8Array` / `DataView` / `TextEncoder` — no Node built-ins on the hot path, so the same build works in browsers, Electron and servers. |
+| Runs everywhere | Pure TypeScript over `Uint8Array` / `DataView` / `TextEncoder` — no Node built-ins on the hot path, so the same build works in browsers, Electron and servers, on V8 and JavaScriptCore alike. |
 | Streaming **out** | `OStream` writes into a small caller buffer and invokes a `FlushSink` whenever it fills, so a message can exceed the buffer — and even RAM. |
-| Streaming **in** | `IStream` is a byte-at-a-time state machine fed arbitrary chunks; large string / blob payloads are delivered in pieces to your `Visitor`. |
-| Full 64-bit fidelity | Unsigned / signed scalars are `bigint`, so the entire `uint64` / `int64` range round-trips exactly (`writeUnsigned` also accepts `number`). |
-| Generated-code friendly | Every `Visitor` method is optional, so generated (and hand-written) sinks override only the fields they need and ignore the rest. Nested messages compose: `sequenceBegin` returns the child visitor. |
+| Streaming **in** | `IStream` is a resumable state machine fed arbitrary chunks; large string / blob payloads are delivered in pieces to your `Visitor`. |
+| Fast whole-buffer decode | When the whole message is already in one buffer, `decode()` (push) and `Cursor` (pull) advance one cursor instead of the per-byte state machine. |
+| Full 64-bit fidelity | Unsigned / signed scalars round-trip the entire `uint64` / `int64` range: values are `number` when exact and `bigint` beyond `2^53-1` (`Long` offers a `bigint`-free path for the array hot loops). |
+| Generated-code friendly | The pull `Cursor` gives generated code a monomorphic `readHeader()` + typed `read*` loop; the push `Visitor` has all-optional methods, so a sink overrides only the fields it needs. |
 | Reserve-offset | `new OStream(buf, offset)` leaves room at the front of the buffer for a lower-layer protocol header (saves a copy). |
 | Explicit endianness | IEEE-754 values are written / read little-endian via `DataView`, so behaviour is identical on every engine. |
-| Pluggable acceleration | Hot paths run through a swappable `Kernel`; an optional native (N-API) or WebAssembly build can replace it with no API change. |
+| Pluggable acceleration | The encoder's bulk array paths run through a swappable `Kernel`; the default is pure TypeScript, and an optional native (N-API) or WebAssembly kernel can be installed with no API change. |
 
 ## Usage
 
-```ts
-import { OStream, decode, type Visitor } from "@sofa-buffers/corelib";
+### Simple encode
 
-// ---- encode ----
-const os = new OStream();
+```ts
+import { OStream } from "@sofa-buffers/corelib";
+
+const os = new OStream();          // in-memory, auto-growing buffer
 os.writeUnsigned(1, 42);
 os.writeSigned(2, -7);
 os.writeString(3, "hi");
-const bytes = os.bytes(); // Uint8Array
+const bytes = os.bytes();          // Uint8Array view of the finished message
+```
 
-// ---- decode (push to your visitor) ----
+Encoder and decoder report problems by throwing `SofabError`; the cause is on
+`SofabError.code` (`ARGUMENT`, `USAGE`, `BUFFER_FULL`, `INVALID_MSG`).
+
+### Simple decode (push / visitor)
+
+`decode()` walks a whole buffer and calls one `Visitor` method per field. Every
+`Visitor` method is optional; unhandled fields are silently skipped.
+
+```ts
+import { decode, type Visitor } from "@sofa-buffers/corelib";
+
 class My implements Visitor {
-  a = 0n;
-  b = 0n;
-  unsigned(id: number, v: bigint) { if (id === 1) this.a = v; }
-  signed(id: number, v: bigint)   { if (id === 2) this.b = v; }
+  a = 0;
+  b = 0;
+  unsigned(id: number, v: number | bigint) { if (id === 1) this.a = Number(v); }
+  signed(id: number, v: number | bigint)   { if (id === 2) this.b = Number(v); }
   // fp32(), fp64(), string(), blob(), arrayBegin(), sequenceBegin(), ... as needed
 }
 
@@ -83,14 +105,10 @@ const sink = new My();
 decode(bytes, sink);
 ```
 
-Encoder and decoder report problems through `SofabError`; the specific cause is
-available via `SofabError.code` (`ARGUMENT`, `USAGE`, `BUFFER_FULL`,
-`INVALID_MSG`).
+### OStream — streaming a message larger than the buffer
 
-### Streaming a message larger than the buffer
-
-`OStream` writes into a small caller buffer and drains it to a `FlushSink`
-whenever it fills, so the buffer never has to be message-sized:
+`OStream` in streaming mode writes into a small caller buffer and drains it to a
+`FlushSink` whenever it fills, so the buffer never has to be message-sized:
 
 ```ts
 import { OStream, type FlushSink } from "@sofa-buffers/corelib";
@@ -102,161 +120,223 @@ for (let i = 0; i < 1000; i++) os.writeUnsigned(i, BigInt(i));
 os.flush();                                            // push the tail
 ```
 
-### Reading a payload fed in chunks
+### IStream — reading a payload fed in chunks
 
 `IStream` resumes across chunk boundaries, so you can feed it whatever the
 transport hands you — a packet, or a single byte — and finish with `end()`:
 
 ```ts
-import { IStream } from "@sofa-buffers/corelib";
+import { IStream, type Visitor } from "@sofa-buffers/corelib";
 
 const is = new IStream();
 for await (const chunk of socket) is.feed(chunk, visitor);
-is.end(); // asserts the message ended cleanly
+is.end(); // asserts the message ended cleanly on a field boundary
 
 // String / blob payloads arrive as one or more chunks, each tagged with the
-// field `total` length and the byte `offset`, so they need never be held whole:
-const blobSink: Visitor = {
+// field's `total` length and the byte `offset`, so they need never be held whole:
+const visitor: Visitor = {
   blob(id, total, offset, chunk) {
-    /* append chunk at offset; the field is `total` bytes */
+    /* append `chunk` at `offset`; the field is `total` bytes */
   },
 };
 ```
 
+### Cursor — pull decode (the generated-code path)
+
+`Cursor` inverts control: your code drives the loop. This is the shape generated
+message classes use — one `switch` over `cursor.id`, reading straight into typed
+fields, with `skip()` keeping the cursor in sync on unknown ids:
+
+```ts
+import { Cursor } from "@sofa-buffers/corelib";
+
+const c = new Cursor(bytes);
+let x = 0, y = 0;
+while (c.readHeader()) {
+  switch (c.id) {
+    case 1: x = Number(c.readUnsigned()); break;
+    case 2: y = Number(c.readSigned());   break;
+    default: c.skip(c.wire);              break; // forward-compatible
+  }
+}
+```
+
+### Generated object code
+
+`sofabgen` compiles a schema to one class per message whose `encode` / `decodeFrom`
+methods call the runtime primitives above. A nested message just recurses into the
+child type's `decodeFrom`; `readHeader()` returns `false` at the sequence's close:
+
+```ts
+import { Cursor, OStream } from "@sofa-buffers/corelib";
+
+// Hand-written stand-in for sofabgen output.
+class Point {
+  x = 0;
+  y = 0;
+
+  encode(os: OStream): void {
+    os.writeSigned(1, this.x);
+    os.writeSigned(2, this.y);
+  }
+
+  static decodeFrom(c: Cursor): Point {
+    const p = new Point();
+    while (c.readHeader()) {
+      switch (c.id) {
+        case 1: p.x = Number(c.readSigned()); break;
+        case 2: p.y = Number(c.readSigned()); break;
+        // case 3: p.child = Child.decodeFrom(c); break;  // nested sequence
+        default: c.skip(c.wire); break;
+      }
+    }
+    return p;
+  }
+}
+
+const os = new OStream();
+Object.assign(new Point(), { x: 3, y: -4 }).encode(os);
+const back = Point.decodeFrom(new Cursor(os.bytes()));
+```
+
 ## API summary
 
-### Write operations — `OStream`
+### Encoding — `OStream`
 
-- `new OStream()` — in-memory, auto-growing; `new OStream(buffer, offset?, flush?)` — stream into a caller buffer, draining to `flush` when full.
-- `writeUnsigned(id, number|bigint)`, `writeSigned(id, number|bigint)`, `writeBoolean(id, boolean)`, `writeFp32(id, number)`, `writeFp64(id, number)`, `writeString(id, string)`, `writeBlob(id, Uint8Array)`, `writeFixlen(id, bytes, subtype)`.
-- `writeUnsignedArray` / `writeSignedArray(id, ArrayLike<number|bigint>)`, `writeFp32Array` / `writeFp64Array(id, ArrayLike<number>)`.
-- `writeSequenceBegin(id)` / `writeSequenceEnd()`.
-- `flush()`, `setBuffer(buffer, offset?)` (install a fresh buffer mid-stream), `bytesUsed`, `bytes()`.
+One `write*` method per wire type, each appending a single field:
+`writeUnsigned` / `writeSigned` (accept `number` **or** `bigint`), `writeBoolean`,
+`writeFp32` / `writeFp64`, `writeString`, `writeBlob`, and `writeFixlen(id, bytes,
+subtype)` as the raw escape hatch. Typed arrays go through
+`write{Unsigned,Signed,Fp32,Fp64}Array`; nested messages are bracketed by
+`writeSequenceBegin(id)` / `writeSequenceEnd()`. For the 64-bit array hot path,
+`writeUnsignedArrayLong` / `writeSignedArrayLong` take `Long[]` and never allocate
+a `bigint`. There is **no sticky-error model**: an out-of-range id/value, a full
+buffer with no sink, or an unbalanced sequence **throws** `SofabError` on the spot.
 
-### Read operations — `IStream` + `Visitor`
+Two buffer modes: `new OStream()` is in-memory and auto-growing; `new
+OStream(buffer, offset?, flush?)` streams into a caller buffer, draining to
+`flush` when it fills. `bytesUsed`, `bytes()`, `flush()`, `setBuffer()` and
+`reset()` round out the surface (see **Memory handling**).
 
-The decoder is **push / visitor-based**, not a pull cursor: rather than calling a
-`readUnsigned()` that returns a value, you feed bytes and the decoder *calls back*
-one `Visitor` method per decoded field, handing you the value (or, for
-string / blob, a view of the payload). This is what generated message classes
-implement — typically a `switch` on `id`.
+### Decoding — two models
 
-- `new IStream()`, `feed(chunk, visitor)` (dispatch a chunk's fields), `end()` (assert a clean field-boundary finish); `decode(bytes, visitor)` is the one-shot, whole-buffer fast path.
-- `Visitor` — every method is **optional**, and an unhandled (or unimplemented) field is silently **skipped**:
-  - `unsigned(id, value: number | bigint)` / `signed(id, value: number | bigint)` — a decoded integer. *Number-first*: `value` is a plain `number` when it fits exactly (`|value| ≤ 2^53-1`, covering all ids and u8..u32) and only a `bigint` beyond that, so the common case never allocates a bigint.
-  - `fp32(id, value: number)` / `fp64(id, value: number)` — a decoded IEEE-754 float, always a JS `number`.
-  - `string(id, total, offset, chunk: Uint8Array)` / `blob(id, total, offset, chunk: Uint8Array)` — a piece of a string/blob payload. `total` is the field's full byte length, `offset` the position of `chunk` within it. `decode()` delivers the whole payload in a single call (`offset 0`); `IStream` may split it across calls. Decode the string yourself (e.g. `TextDecoder`); see **Memory handling** for the lifetime of `chunk`.
-  - `arrayBegin(id, kind: ArrayKind, count)` then one of `arrayUnsigned(id, index, value)` / `arraySigned(id, index, value)` (number-first like `unsigned`) / `arrayFp32(id, index, value: number)` / `arrayFp64(id, index, value: number)` **per element**, then `arrayEnd(id)`. The library hands you elements one at a time — it does not materialise a JS array.
-  - `sequenceBegin(id): Visitor | void` — start of a nested message; return a child `Visitor` to route the nested fields to it (its `sequenceEnd()` fires at the matching close), or return nothing to keep using the current visitor.
-  - `sequenceEnd(): void` — close of the nested sequence this visitor was handling.
+**Push / visitor** (`IStream` + `Visitor`, and the one-shot `decode()`). You feed
+bytes and the decoder *calls back* one `Visitor` method per field: `unsigned` /
+`signed` (**number-first** — a plain `number` when `|value| ≤ 2^53-1`, a `bigint`
+only beyond that), `fp32` / `fp64` (always `number`), `string` / `blob` (a
+`(id, total, offset, chunk)` slice of the payload), array elements delivered one
+at a time between `arrayBegin` / `arrayEnd` (never materialised as a JS array),
+and `sequenceBegin(id): Visitor | void` which may return a child visitor to route
+a nested message. Every method is optional and an unhandled field is skipped.
+Use `IStream.feed()` / `end()` for chunked input; `decode()` is the faster
+whole-buffer path.
 
-### Supported types
+**Pull / cursor** (`Cursor`). Over a contiguous buffer, your code drives the loop:
+`readHeader()` advances to the next field (setting `.id` / `.wire`, returning
+`false` at end-of-buffer or the matching sequence close), then a typed reader
+consumes the value — `readUnsigned` / `readSigned` (number-first),
+`readFp32` / `readFp64`, `readString` (decoded to a JS `string`), `readBlob`
+(zero-copy view), the `read*Array` family (materialised as JS arrays, or `Long[]`
+via `readUnsignedArrayLong` / `readSignedArrayLong`), and `skip(wire)` for an
+unknown field (skipping a `SequenceStart` skips the whole nested subtree). This is
+the monomorphic path generated per-message decoders use.
 
-| Field | Write | Read (Visitor) | TS type |
-|-------|-------|----------------|---------|
-| unsigned (u8..u64) | `writeUnsigned` | `unsigned` | `number \| bigint` — `bigint` only when `> 2^53-1`; full `uint64` range round-trips |
-| signed (i8..i64) | `writeSigned` | `signed` | `number \| bigint` — `bigint` only when `\|v\| > 2^53-1`; full `int64` range |
-| boolean | `writeBoolean` | `unsigned` (as `0`/`1`) | `boolean` in / `number` out — no separate wire type |
-| fp32 | `writeFp32` | `fp32` | `number` (little-endian IEEE-754) |
-| fp64 | `writeFp64` | `fp64` | `number` (little-endian IEEE-754) |
-| string | `writeString` | `string` | `string` in / UTF-8 `Uint8Array` chunk(s) out |
-| blob | `writeBlob` | `blob` | `Uint8Array` |
-| array | `write{Unsigned,Signed,Fp32,Fp64}Array` | `array{Unsigned,Signed,Fp32,Fp64}` | element-typed as above |
-
-There is **no `bigint` requirement** for 64-bit — pass a `number` and it is used
-directly when exact; pass a `bigint` to reach the full 64-bit range. Arrays carry
-exactly the four element kinds above (unsigned / signed varint, fp32, fp64): the
-fixed-length array path is restricted to `Fp32` / `Fp64` subtypes, so **string,
-blob and nested-sequence elements are not allowed inside an array** — model those
-as repeated fields or nested sequences instead. `writeFixlen(id, bytes, subtype)`
-is the escape hatch for emitting any `FixlenSubtype` from raw bytes.
+Arrays carry exactly four element kinds — unsigned / signed varint, fp32, fp64
+(the fixlen-array path is restricted to `Fp32` / `Fp64`), so **string, blob and
+nested-sequence elements are not allowed inside an array**; model those as
+repeated fields or nested sequences. Booleans are encoded as the unsigned values
+`0` / `1` (the wire has no separate boolean type), so they decode back through the
+`unsigned` callback / `readUnsigned`.
 
 ### Memory handling
 
-**Encoder — two buffer modes.**
+**Input buffer — payload bytes are zero-copy.** Scalars are produced *for* you
+(integers as `number`, or `bigint` past the safe range; floats as `number`), so
+there is nothing to own there. String and blob **payloads are not copied**: the
+`chunk` passed to the visitor `string` / `blob`, and the view returned by
+`Cursor.readBlob`, is a `subarray` aliasing the input (for `decode` / `Cursor`) or
+the chunk you fed (for `IStream`). A visitor chunk is valid **only during that
+callback**; a `Cursor` view is valid as long as the source buffer lives. Copy
+(`chunk.slice()`) or decode on the spot (`new TextDecoder().decode(chunk)`) to
+retain it. (`Cursor.readString` decodes for you, so it owns its result.)
 
-- **In-memory (`new OStream()`)** — the library **allocates** an internal buffer
-  (256 bytes) and **auto-grows** it (doubling, via a fresh `Uint8Array` + copy) as
-  you write; it never throws `BUFFER_FULL`. `bytes()` returns a `subarray` *view*
-  of the finished message — copy it (`.slice()`) if you need to outlive the next
-  write or a grow.
-- **Streaming (`new OStream(buffer, offset?, flush?)`)** — writes into the
-  **caller-provided** `Uint8Array`; it never grows. When the buffer fills it hands
-  the produced bytes to your `flush` `FlushSink` (as a `subarray` view, valid only
-  for the duration of the callback) and resets, so a message can far exceed the
-  buffer — without a `flush` sink, a full buffer throws `BUFFER_FULL`. `offset`
-  reserves room at the front for a lower-layer header. **Buffer swap:** call
-  `setBuffer(buffer, offset?)` (typically from inside the flush callback) to
-  install a fresh output buffer mid-stream; `flush()` first, as any unflushed
-  bytes in the old buffer are dropped.
+**Output buffer — allocate-and-grow or caller-owned.** In-memory
+(`new OStream()`): the library allocates an internal buffer (256 bytes) and
+auto-grows it (doubling, via a fresh `Uint8Array` + copy); it never throws
+`BUFFER_FULL`. `bytes()` returns a `subarray` **view** of the finished message —
+copy it (`.slice()`) if it must outlive the next write or a grow. Streaming
+(`new OStream(buffer, offset?, flush?)`): writes into the **caller-provided**
+buffer and never grows; when it fills it hands the produced bytes to your `flush`
+sink (as a `subarray` view valid only for the callback) and resets — without a
+sink, a full buffer throws `BUFFER_FULL`. `offset` reserves room at the front for
+a lower-layer header. `setBuffer(buffer, offset?)` installs a fresh buffer
+mid-stream (`flush()` first — any unflushed bytes are dropped); `reset()` rewinds
+to empty for pooling one `OStream` across many messages.
 
-**Decoder — values allocated, payload bytes are zero-copy.**
+**Message object.** The `Visitor` / generated object is entirely caller-owned; the
+library only calls methods on it and never retains a reference past the decode.
 
-The decoder produces scalar values *for* you: integers arrive as `number`
-(bigint only when out of safe range), floats as `number` — so generated code
-gets ready-to-use values without managing destinations. Arrays are not
-materialised: you receive one callback per element.
+### Acceleration seam (`Kernel`)
 
-String and blob payloads, however, are **not copied**. The `chunk` handed to
-`string` / `blob` is a **zero-copy `subarray` view** aliasing the input buffer
-(for `decode`) or the chunk you fed (for `IStream`). It is valid **only during
-the callback** — if you need to retain it, copy it (`chunk.slice()`) or decode it
-on the spot (`new TextDecoder().decode(chunk)`). This avoids a copy on the hot
-path; the trade-off is that the bytes are borrowed, not owned.
+The encoder's four bulk array transforms (`encodeUnsignedVarints`,
+`encodeSignedVarints`, `packFp32Array`, `packFp64Array`) run through a swappable
+`Kernel`. The default `jsKernel` is pure TypeScript and always active — **no
+native or WebAssembly build ships in this package**. The seam is the stable
+extension point: `loadNativeKernel()` tries to `require` an optional
+`@sofabuffers/corelib-native` N-API addon (returns `false`, keeping the JS kernel,
+if it or Node is absent), `loadWasmKernel(source, factory)` instantiates a WASM
+module you supply, and `setKernel()` installs any object implementing the
+interface — all with **no change to the public API**. The boundary is deliberately
+*bulk* (a whole array per call, into pre-sized capacity) so the cost of crossing
+into native code is amortised, never paid per element.
 
 ### Constants & helpers
 
-`API_VERSION` (= 1), `ID_MAX`, `FIXLEN_MAX`, `ARRAY_MAX`, `U64_MAX`, `I64_MIN`,
-`I64_MAX`, `WireType`, `FixlenSubtype`, `ArrayKind`; errors via `SofabError`
-(`.code: SofabErrorCode` — `ARGUMENT`, `USAGE`, `BUFFER_FULL`, `INVALID_MSG`);
-acceleration via `getKernel` / `setKernel`, `jsKernel`, `loadNativeKernel`,
-`loadWasmKernel`.
+`API_VERSION` (= 1), `ID_MAX`, `FIXLEN_MAX`, `ARRAY_MAX`, `MAX_DEPTH`, `U64_MAX`,
+`I64_MIN`, `I64_MAX`; the `WireType`, `FixlenSubtype` and `ArrayKind` enum-like
+objects; the `Long` 64-bit helper; errors via `SofabError` (`.code:
+SofabErrorCode` — `ARGUMENT`, `USAGE`, `BUFFER_FULL`, `INVALID_MSG`); and the
+kernel seam (`getKernel` / `setKernel`, `jsKernel`, `loadNativeKernel`,
+`loadWasmKernel`). Every symbol is available both as a flat named export and
+under the aggregate `sofab` namespace (`import * as sofab from "..."`).
 
 ## Feature flags
 
-The TypeScript build always ships the **full format** — there are no compile-time
-toggles like the C library's `SOFAB_DISABLE_*` switches, because the browser /
-Node / Electron targets are not code-size constrained.
-
-| Capability | Default |
-|------------|---------|
-| unsigned / signed varints | always on |
-| `fp32` / `fp64` | always on |
-| string / blob | always on |
-| arrays (integer + fixlen) | always on |
-| nested sequences | always on |
-| scalar value width | 64-bit (`bigint`), matching the C default — identical wire image |
-
-Booleans are encoded as the unsigned values `0` / `1` (the wire has no separate
-boolean type), and IEEE-754 floats are always little-endian.
+**No build toggles — always the full format.** Unlike the C library's
+compile-time `SOFAB_DISABLE_*` switches, the TypeScript build always ships every
+wire type (unsigned / signed varints, `fp32` / `fp64`, string / blob, integer &
+fixlen arrays, nested sequences) at full 64-bit width, because the browser / Node /
+Electron targets are not code-size constrained. The wire image is byte-identical
+to the C default.
 
 ## Build & test
 
 ```bash
 npm ci
 npm run typecheck      # tsc --noEmit (strict)
-npm test               # vitest: vectors, chunked feeding, errors, round-trips
-npm run coverage       # vitest --coverage (v8): text + html + lcov
+npm test               # vitest run: vectors, chunked feeding, cursor, errors, round-trips
+npm run coverage       # vitest run --coverage (v8): text + html + lcov
 npm run build          # tsup -> ESM + CJS + IIFE + .d.ts in dist/
+npm run smoke          # run the built bundle's cross-runtime smoke test on Node
 ```
 
 Requires Node.js 18+. The `.devcontainer/` here builds a ready-to-use image
 (`./.devcontainer/start.sh`) with Node and tooling preinstalled.
 
-Tests live in `test/` as focused suites:
+Tests live in `test/` as focused suites — including `vectors.test.ts` (encode +
+decode every shared `test_vectors.json` vector, byte-exact vs. the C reference),
+`istream.chunked.test.ts` (every vector fed one byte at a time), `cursor.test.ts`
+(the pull-decode path parity + error branches), `errors.test.ts`,
+`ostream.test.ts`, `roundtrip.test.ts`, `skip*.test.ts`, `varint.test.ts`,
+`long.test.ts`, `kernel.test.ts` and `visitor-defaults.test.ts`. `test/smoke.mjs`
+is a framework-free smoke test of the built bundle.
 
-- `vectors.test.ts` — encode + decode every shared `test_vectors.json` vector, byte-exact vs. the C reference
-- `istream.chunked.test.ts` — every vector fed one byte (and seven bytes) at a time
-- `errors.test.ts` — every malformed-input rejection branch + encoder argument validation
-- `ostream.test.ts` — flush-sink streaming smaller than the buffer, reserve-offset, typed-array inputs
-- `roundtrip.test.ts` — value preservation across the type system, 64-bit boundaries, nested sequences
-- `varint.test.ts` — LEB128 / zig-zag boundaries
-- `visitor-defaults.test.ts` — a no-op visitor silently drops every field kind
-- `kernel.test.ts` — the acceleration seam: kernel swap parity + native fallback
-
-The CI workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) builds,
-type-checks and tests on Node 18/20/24, measures coverage, and publishes the
-coverage / branches badge JSON consumed above to the `badges` branch.
+The CI workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
+type-checks, tests and builds on Node 18 / 20 / 24, smoke-tests the built bundle
+on Node, Deno and Bun, measures coverage, and publishes the coverage / branches
+badge JSON consumed above to the `badges` branch. A separate
+[`docs.yml`](.github/workflows/docs.yml) builds the TypeDoc API reference and
+deploys it to GitHub Pages (the **Docs** badge).
 
 ## Benchmarks
 
@@ -264,53 +344,24 @@ Two standalone tools mirror the C / C++ / Rust / C# / Java / Python benchmarks s
 the implementations can be compared directly:
 
 ```bash
-# perf -- per-op cost: a CPU-speed-independent figure (cycles/op where the
-#         runtime exposes a cycle counter) plus throughput MB/s.
+# perf -- per-op cost: encodes/decodes one mixed message, reporting a code-cost
+#         figure plus throughput MB/s. MB = 1e6 bytes.
 npm run perf
 
-# bench -- a throughput table in MB/s for encode/decode of a 1000-element u64
-#          array and a small "typical" mixed message. MB = 1e6 bytes.
+# bench -- a throughput table (MB/s) for encode/decode of a 1000-element u64
+#          array and a small "typical" mixed message.
 npm run bench
+
+# bench:callgrind -- machine-independent instructions/op under Valgrind.
+npm run bench:callgrind
 ```
 
 `perf` and `bench` encode the identical message (same field ids, types and
-values) as their counterparts and print the same report layout. JavaScript
-engines expose no portable hardware cycle counter, so — like the .NET and JVM
-tools — `perf` reports `cycles/op` as unavailable and uses **CPU time/op**
-(process CPU time, clock-independent) as the code-cost proxy. For a fully
-machine-independent figure, `bench/run_callgrind.sh` counts **instructions/op**
-under Valgrind, mirroring the Python tool.
-
-## Native acceleration
-
-The encoder's bulk array paths run through a swappable `Kernel` interface. The
-default `jsKernel` is pure TypeScript and always active. An optional native
-(N-API) or WebAssembly build can implement the same interface and be installed
-with **no change to the public API**:
-
-```ts
-import { setKernel, loadNativeKernel, loadWasmKernel } from "@sofa-buffers/corelib";
-
-// Node / Electron: load the optional @sofabuffers/corelib-native addon if present
-await loadNativeKernel();         // returns false (and keeps the JS kernel) if absent
-
-// Anywhere (incl. browsers): instantiate a WASM kernel
-await loadWasmKernel(wasmBytes, (exports) => makeKernel(exports));
-
-// Or install your own:
-setKernel(myKernel);
-```
-
-The boundary is deliberately *bulk* (a whole array per call, into guaranteed
-capacity), so the cost of crossing into native code is amortised rather than paid
-per element. The pure-JS kernel remains the fallback everywhere.
-
-## Layering vs. the C library
-
-| C file | TypeScript | Status |
-|--------|------------|--------|
-| `sofab.h` (types / constants) | `SofabError`, `WireType`, `FixlenSubtype`, `ArrayKind`, constants | ported |
-| `ostream.c` | `OStream` (+ `FlushSink`) | ported |
-| `istream.c` | `IStream` + `Visitor` | ported (push / visitor model, with a child-returning `sequenceBegin` for nesting) |
-| `object.c` (descriptor transcoder) | — | not ported. The idiomatic TypeScript equivalent is generated message classes — a schema-driven generator emitting `Visitor` / encode glue; the streaming core above already covers serialize / deserialize. |
-
+values) as their counterparts in the other ports and print the same report
+layout. JavaScript engines expose no portable hardware cycle counter, so — like
+the .NET and JVM tools — `perf` reports `cycles/op` as unavailable and uses **CPU
+time/op** (process CPU time, clock-independent) as the code-cost proxy. For a
+fully machine-independent figure, `bench/run_callgrind.sh` counts
+**instructions/op** under Valgrind, mirroring the Python tool. Because this is one
+codec running on two engines, running the same tools under Node (V8) and Bun
+(JavaScriptCore) gives directly comparable numbers for each.
