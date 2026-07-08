@@ -6,8 +6,15 @@
     "moduleResolution": "Bundler",
     "moduleDetection": "force",
     "resolveJsonModule": true,
+    // TS 6's dts build (rollup-plugin-dts) no longer auto-includes @types/node,
+    // so the optional native loader's `process`/`node:module` refs need it named.
+    "types": ["node"],
     "verbatimModuleSyntax": true,
     "isolatedModules": true,
+
+    // tsup's dts build (rollup-plugin-dts) injects the now-deprecated `baseUrl`;
+    // required until TS 7 to keep the declaration build from erroring (TS5101).
+    "ignoreDeprecations": "6.0",
 
     "strict": true,
     "noUncheckedIndexedAccess": true,
