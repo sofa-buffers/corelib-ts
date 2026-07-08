@@ -28,7 +28,7 @@ monomorphic pull cursor (`Cursor`) driven by a single `switch` over the field id
 
 ### Requirements
 
-Node.js 18+ (CI runs 18 / 20 / 24), or any modern browser / Electron / Deno /
+Node.js 20+ (CI runs 20 / 24), or any modern browser / Electron / Deno /
 Bun. Built with TypeScript 5.7; targets ES2020 (`bigint` required).
 
 ### Dependencies
@@ -216,7 +216,7 @@ npm run smoke          # cross-runtime smoke test of the built bundle
 Tests live in `test/` as focused suites, including `vectors.test.ts` (encode +
 decode every shared conformance vector), `istream.chunked.test.ts` (every vector
 fed one byte at a time), `cursor.test.ts`, `errors.test.ts`, `ostream.test.ts`,
-`roundtrip.test.ts` and more. CI type-checks, tests and builds on Node 18 / 20 /
+`roundtrip.test.ts` and more. CI type-checks, tests and builds on Node 20 /
 24, smoke-tests the bundle on Node, Deno and Bun, and publishes coverage badges;
 a separate `docs.yml` deploys the TypeDoc API reference to GitHub Pages.
 
