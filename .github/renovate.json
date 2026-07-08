@@ -2,5 +2,14 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "packageRules": [
+    {
+      "description": "Hold TypeScript on 6.x. TypeScript 7 is the native (Go) compiler port and ships only the `tsc` CLI, not the programmatic compiler API that our build/docs toolchain needs: tsup's .d.ts generation crashes on it, and no TypeScript-7-compatible typedoc exists yet (even typedoc 1.0.0-dev.* crashes at runtime). `npm run build` and `npm run docs` therefore break under TS 7. Lift this ceiling once tsup's DTS path and typedoc support the native compiler. See PR #34.",
+      "matchPackageNames": [
+        "typescript"
+      ],
+      "allowedVersions": "<7"
+    }
   ]
 }
