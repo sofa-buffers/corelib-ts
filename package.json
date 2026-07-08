@@ -65,7 +65,7 @@
     "prepublishOnly": "npm run typecheck && npm run test && npm run build"
   },
   "devDependencies": {
-    "@types/node": "^20.19.43",
+    "@types/node": "^24.0.0",
     "@vitest/coverage-v8": "^2.1.8",
     "tsup": "^8.3.5",
     "tsx": "^4.19.2",
