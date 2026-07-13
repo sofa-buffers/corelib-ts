@@ -138,6 +138,69 @@ describe("Cursor arrays", () => {
   });
 });
 
+describe("Cursor sequence depth (§7 outcome; corelib-ts#42)", () => {
+  const SEQ_START = 6;
+  const SEQ_END = 7;
+
+  // Drive the cursor the way generated decode does: loop readHeader and skip each
+  // value (skip discards a whole nested sequence). Exercises the skip() depth path.
+  function driveSkipping(buf: Uint8Array): void {
+    const c = new Cursor(buf);
+    while (c.readHeader()) c.skip(c.wire);
+  }
+
+  // Drive it by *recursing* on a SequenceStart (like generated decodeFrom), so the
+  // nested readHeader loop — and its own depth/EOF handling — is exercised, not skip.
+  function driveRecursive(buf: Uint8Array): void {
+    const c = new Cursor(buf);
+    const loop = (): void => {
+      while (c.readHeader()) {
+        if (c.wire === SEQ_START) loop();
+        else c.skip(c.wire);
+      }
+    };
+    loop();
+  }
+
+  it("rejects a top-level stray sequence-end as INVALID", () => {
+    // A lone SequenceEnd at the root closes no open sequence — dangling → INVALID.
+    expect(codeOf(() => driveSkipping(bytes(header(0, SEQ_END))))).toBe(
+      SofabErrorCode.InvalidMsg,
+    );
+  });
+
+  it("rejects a stray sequence-end after a balanced sequence", () => {
+    expect(
+      codeOf(() =>
+        driveSkipping(
+          bytes(header(10, SEQ_START), header(0, SEQ_END), header(0, SEQ_END)),
+        ),
+      ),
+    ).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  it("reports an unclosed sequence at end-of-buffer as INCOMPLETE (recursion path)", () => {
+    expect(codeOf(() => driveRecursive(bytes(header(10, SEQ_START))))).toBe(
+      SofabErrorCode.Incomplete,
+    );
+  });
+
+  it("reports an unclosed sequence at end-of-buffer as INCOMPLETE (skip path)", () => {
+    expect(codeOf(() => driveSkipping(bytes(header(10, SEQ_START))))).toBe(
+      SofabErrorCode.Incomplete,
+    );
+  });
+
+  it("accepts a balanced empty nested sequence", () => {
+    expect(() =>
+      driveRecursive(bytes(header(10, SEQ_START), header(0, SEQ_END))),
+    ).not.toThrow();
+    expect(() =>
+      driveSkipping(bytes(header(10, SEQ_START), header(0, SEQ_END))),
+    ).not.toThrow();
+  });
+});
+
 describe("Cursor nested sequences", () => {
   it("recurses: readHeader ends (consuming the close) at the sequence end", () => {
     // { u1=11, seq(2){ u1=99 } }

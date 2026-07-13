@@ -62,6 +62,13 @@ export class Cursor {
   private lo = 0;
   private hi = 0;
 
+  // Number of nested sequences currently open (0 = root). Incremented when
+  // readHeader accepts a SequenceStart, decremented when it consumes the matching
+  // SequenceEnd (or when skip() discards a whole nested sequence). Lets the pull
+  // parser tell a root-level dangling sequence-end (INVALID) and an unclosed
+  // sequence at end-of-buffer (INCOMPLETE) apart from a clean boundary.
+  private depth = 0;
+
   constructor(buf: Uint8Array) {
     this.buf = buf;
     this.n = buf.length;
@@ -89,12 +96,30 @@ export class Cursor {
    * whose id is out of range throws {@link SofabError} (`INVALID_MSG`).
    */
   readHeader(): boolean {
-    if (this.p >= this.n) return false;
+    if (this.p >= this.n) {
+      // End of buffer. At the root (depth 0) this is a clean, complete boundary;
+      // inside an open sequence it is a truncated, unclosed sequence → INCOMPLETE
+      // (§7), matching the fast path (fast.ts) which throws on `stack.length > 1`.
+      if (this.depth > 0) {
+        throw incompleteError("truncated message: unbalanced sequence");
+      }
+      return false;
+    }
     this.readVarint();
     const wire = this.lo & 7;
-    if (wire === WireType.SequenceEnd) return false;
+    if (wire === WireType.SequenceEnd) {
+      // A sequence-end closes the current nested scope. At the root (depth 0)
+      // there is no open sequence to close, so it is a dangling marker → INVALID
+      // (mirrors fast.ts `stack.length <= 1` → "unbalanced sequence end").
+      if (this.depth === 0) {
+        throw invalidMsgError("unbalanced sequence end");
+      }
+      this.depth--;
+      return false;
+    }
     const id = this.upper();
     if (id > ID_MAX) throw invalidMsgError(`field id ${id} out of range`);
+    if (wire === WireType.SequenceStart) this.depth++;
     this.id = id;
     this.wire = wire;
     return true;
@@ -214,7 +239,11 @@ export class Cursor {
    */
   skip(wire: number): void {
     if (wire === WireType.SequenceStart) {
+      // readHeader already counted this SequenceStart (depth++); skipSequence
+      // consumes its whole balanced body incl. the matching end without going
+      // through readHeader, so balance the count here.
       this.skipSequence();
+      this.depth--;
       return;
     }
     this.skipValue(wire);
