@@ -32,9 +32,14 @@ import {
   ID_MAX,
   WireType,
 } from "../constants.js";
-import { incompleteError, invalidMsgError } from "../errors.js";
+import {
+  incompleteError,
+  invalidMsgError,
+  limitExceededError,
+} from "../errors.js";
 import { Long } from "../long.js";
 import { zigzagDecode } from "../varint/zigzag.js";
+import type { DecodeLimits } from "./limits.js";
 
 const TWO32 = 0x1_0000_0000; // 2^32, for combining the 32-bit halves
 const _utf8 = new TextDecoder();
@@ -46,6 +51,10 @@ const _utf8 = new TextDecoder();
  * {@link id} and call the matching `read*` (which consumes that field's value and
  * advances the cursor); recurse into a child type's decoder on a nested sequence;
  * fall through to {@link skip} for an unknown id. See {@link readHeader}.
+ *
+ * Pass {@link DecodeLimits} to cap array counts and string / blob lengths; an
+ * over-limit field throws {@link SofabError} (`LIMIT_EXCEEDED`) at its header,
+ * before it is materialized. Omit for no caps (the default).
  */
 export class Cursor {
   /** Field id of the header last accepted by {@link readHeader}. */
@@ -58,6 +67,12 @@ export class Cursor {
   private readonly n: number;
   private p = 0;
 
+  // Opt-in decode limits (corelib-ts#38). An unset limit is Infinity — no cap,
+  // today's behavior. Enforced at the count / length header, before allocation.
+  private readonly maxArrayCount: number;
+  private readonly maxStringLen: number;
+  private readonly maxBlobLen: number;
+
   // Last varint, as two unsigned 32-bit halves (see readVarint).
   private lo = 0;
   private hi = 0;
@@ -69,10 +84,13 @@ export class Cursor {
   // sequence at end-of-buffer (INCOMPLETE) apart from a clean boundary.
   private depth = 0;
 
-  constructor(buf: Uint8Array) {
+  constructor(buf: Uint8Array, limits?: DecodeLimits) {
     this.buf = buf;
     this.n = buf.length;
     this.view = new DataView(buf.buffer, buf.byteOffset, buf.length);
+    this.maxArrayCount = limits?.maxArrayCount ?? Infinity;
+    this.maxStringLen = limits?.maxStringLen ?? Infinity;
+    this.maxBlobLen = limits?.maxBlobLen ?? Infinity;
   }
 
   /**
@@ -306,6 +324,19 @@ export class Cursor {
     this.readVarint();
     const count = this.num();
     if (count > ARRAY_MAX) throw invalidMsgError("array count out of range");
+    if (count > this.maxArrayCount) {
+      throw limitExceededError(
+        `array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`,
+      );
+    }
+    // Part A hardening (corelib-ts#38): a dynamic array needs at least one wire
+    // byte per element (a varint element, or an fp element ≥ its size), so a
+    // count larger than the bytes left in the buffer cannot be real — reject it
+    // as truncation *before* sizing `new Array(count)`, so a hostile count can
+    // never drive an allocation larger than the input. A tighter fixlen bound
+    // (count * elemSize) is applied once the element word is read, in
+    // {@link arrayFixlenHeader}.
+    if (count > this.n - this.p) throw incompleteError("truncated array");
     return count;
   }
 
@@ -325,6 +356,19 @@ export class Cursor {
     const len = this.upper();
     if (sub !== wantSub) throw invalidMsgError(`invalid fixlen subtype ${sub}`);
     if (len > FIXLEN_MAX) throw invalidMsgError("fixlen length out of range");
+    // Opt-in length cap (corelib-ts#38), enforced at the header before the
+    // payload is taken. wantSub tells string from blob, so the right limit
+    // applies to each.
+    const limit =
+      wantSub === FixlenSubtype.String ? this.maxStringLen : this.maxBlobLen;
+    if (len > limit) {
+      const what = wantSub === FixlenSubtype.String ? "string" : "blob";
+      const name =
+        wantSub === FixlenSubtype.String ? "maxStringLen" : "maxBlobLen";
+      throw limitExceededError(
+        `${what} length ${len} exceeds ${name} ${limit}`,
+      );
+    }
     return len;
   }
 
@@ -338,6 +382,12 @@ export class Cursor {
     const size = this.upper();
     if (sub !== wantSub || size !== wantSize) {
       throw invalidMsgError("invalid fixlen array element type");
+    }
+    // Part A hardening (corelib-ts#38): now the element size is known, a fixlen
+    // array needs count * size payload bytes; a count claiming more than the
+    // buffer holds is truncation — reject before sizing `new Array(count)`.
+    if (count > (this.n - this.p) / wantSize) {
+      throw incompleteError("truncated fixlen array");
     }
     return count;
   }

@@ -10,6 +10,21 @@ While the version is below `1.0.0`, breaking changes bump the **minor** version.
 
 ### Added
 
+- **Opt-in decode limits (corelib-ts#38).** A new optional `DecodeLimits`
+  options object — `{ maxArrayCount?, maxStringLen?, maxBlobLen? }` — is accepted
+  by every decode entry point: `decode(bytes, visitor, limits?)`, the `IStream`
+  constructor, and the `Cursor` constructor. When set, an array count or string /
+  blob byte length that exceeds the cap is rejected at the field's header —
+  before the array is sized or any payload is decoded / streamed to the visitor —
+  with the new `SofabErrorCode.LimitExceeded` (`"LIMIT_EXCEEDED"`). The decoder
+  never clamps or truncates. `LimitExceeded` is deliberately distinct from
+  `InvalidMsg`: exceeding a receiver-configured limit is *policy*, not wire
+  malformation — the identical bytes decode fine under a looser limit. **Default:
+  no limits (today's behavior); the corelib invents no default cap** — the values
+  come from the sofabgen config, baked into generated code (generator#102). Also
+  hardens `Cursor` so a wire array `count` larger than the bytes remaining is
+  rejected as `Incomplete` before `new Array(count)` is sized, so a hostile count
+  can never drive an allocation larger than the input.
 - **Finish-less three-valued decode outcome (MESSAGE_SPEC §7).** Truncation — a
   decode that ends *inside* a field — is now a distinct outcome from a malformed
   message. New `SofabErrorCode.Incomplete` (`"INCOMPLETE"`) and a `DecodeStatus`

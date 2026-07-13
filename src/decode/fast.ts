@@ -36,15 +36,24 @@ import {
   MAX_DEPTH,
   WireType,
 } from "../constants.js";
-import { incompleteError, invalidMsgError } from "../errors.js";
+import {
+  incompleteError,
+  invalidMsgError,
+  limitExceededError,
+} from "../errors.js";
 import { zigzagDecode } from "../varint/zigzag.js";
+import type { DecodeLimits } from "./limits.js";
 import type { Visitor } from "./istream.js";
 
 const TWO32 = 0x1_0000_0000; // 2^32, for combining the 32-bit halves
 
 /** Decode a complete message held in one contiguous buffer. */
-export function decodeContiguous(buf: Uint8Array, root: Visitor): void {
-  new FastDecoder(buf).run(root);
+export function decodeContiguous(
+  buf: Uint8Array,
+  root: Visitor,
+  limits?: DecodeLimits,
+): void {
+  new FastDecoder(buf, limits).run(root);
 }
 
 class FastDecoder {
@@ -57,10 +66,18 @@ class FastDecoder {
   private lo = 0;
   private hi = 0;
 
-  constructor(buf: Uint8Array) {
+  // Opt-in decode limits (corelib-ts#38); an unset limit is Infinity (no cap).
+  private readonly maxArrayCount: number;
+  private readonly maxStringLen: number;
+  private readonly maxBlobLen: number;
+
+  constructor(buf: Uint8Array, limits?: DecodeLimits) {
     this.buf = buf;
     this.n = buf.length;
     this.view = new DataView(buf.buffer, buf.byteOffset, buf.length);
+    this.maxArrayCount = limits?.maxArrayCount ?? Infinity;
+    this.maxStringLen = limits?.maxStringLen ?? Infinity;
+    this.maxBlobLen = limits?.maxBlobLen ?? Infinity;
   }
 
   run(root: Visitor): void {
@@ -101,6 +118,12 @@ class FastDecoder {
           const len = this.upper();
           if (sub > FixlenSubtype.Blob) throw invalidMsgError(`invalid fixlen subtype ${sub}`);
           if (len > FIXLEN_MAX) throw invalidMsgError("fixlen length out of range");
+          if (sub === FixlenSubtype.String && len > this.maxStringLen) {
+            throw limitExceededError(`string length ${len} exceeds maxStringLen ${this.maxStringLen}`);
+          }
+          if (sub === FixlenSubtype.Blob && len > this.maxBlobLen) {
+            throw limitExceededError(`blob length ${len} exceeds maxBlobLen ${this.maxBlobLen}`);
+          }
           if (sub === FixlenSubtype.Fp32 || sub === FixlenSubtype.Fp64) {
             const want = sub === FixlenSubtype.Fp32 ? 4 : 8;
             if (len !== want) throw invalidMsgError("fixlen float length mismatch");
@@ -195,6 +218,9 @@ class FastDecoder {
     this.readVarint();
     const count = this.num();
     if (count > ARRAY_MAX) throw invalidMsgError("array count out of range");
+    if (count > this.maxArrayCount) {
+      throw limitExceededError(`array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`);
+    }
     return count;
   }
 

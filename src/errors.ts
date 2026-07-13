@@ -9,7 +9,10 @@
  * {@link SofabErrorCode.InvalidMsg} for input that is malformed regardless of
  * what follows (`INVALID`), and {@link SofabErrorCode.Incomplete} for input that
  * merely ends inside a field (`INCOMPLETE`) — a truncation that more bytes could
- * complete, and so is *not* the same as a malformed message.
+ * complete, and so is *not* the same as a malformed message. A third code,
+ * {@link SofabErrorCode.LimitExceeded}, is orthogonal to both: it reports a
+ * receiver-configured decode limit being hit — *policy*, not a property of the
+ * bytes — so it is kept distinct from `InvalidMsg`.
  */
 
 /**
@@ -34,6 +37,17 @@ export const SofabErrorCode = {
    * message — more bytes could complete it, and the caller owns end-of-input.
    */
   Incomplete: "INCOMPLETE",
+  /**
+   * A receiver-configured decode limit was exceeded — a dynamic array, string or
+   * blob on the wire claims more elements / bytes than the caller's
+   * {@link DecodeLimits} (`maxArrayCount` / `maxStringLen` / `maxBlobLen`)
+   * allows. Deliberately distinct from {@link SofabErrorCode.InvalidMsg}:
+   * exceeding a limit is *policy*, not wire malformation — the identical bytes
+   * decode fine under a looser limit — so differential fuzzing must not read it
+   * as a conformance divergence. The decoder never clamps or truncates; it
+   * rejects, before the offending field is materialized.
+   */
+  LimitExceeded: "LIMIT_EXCEEDED",
 } as const;
 /** A {@link SofabError}'s cause: one of the {@link SofabErrorCode} values. */
 export type SofabErrorCode =
@@ -80,4 +94,13 @@ export function invalidMsgError(message: string): SofabError {
  */
 export function incompleteError(message: string): SofabError {
   return new SofabError(SofabErrorCode.Incomplete, message);
+}
+
+/**
+ * @internal A receiver-configured decode limit ({@link DecodeLimits}) was
+ * exceeded. Carries {@link SofabErrorCode.LimitExceeded}, never `InvalidMsg`:
+ * it is a policy rejection, not a statement that the bytes are malformed.
+ */
+export function limitExceededError(message: string): SofabError {
+  return new SofabError(SofabErrorCode.LimitExceeded, message);
 }
