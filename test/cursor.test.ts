@@ -138,6 +138,69 @@ describe("Cursor arrays", () => {
   });
 });
 
+describe("Cursor sequence depth (§7 outcome; corelib-ts#42)", () => {
+  const SEQ_START = 6;
+  const SEQ_END = 7;
+
+  // Drive the cursor the way generated decode does: loop readHeader and skip each
+  // value (skip discards a whole nested sequence). Exercises the skip() depth path.
+  function driveSkipping(buf: Uint8Array): void {
+    const c = new Cursor(buf);
+    while (c.readHeader()) c.skip(c.wire);
+  }
+
+  // Drive it by *recursing* on a SequenceStart (like generated decodeFrom), so the
+  // nested readHeader loop — and its own depth/EOF handling — is exercised, not skip.
+  function driveRecursive(buf: Uint8Array): void {
+    const c = new Cursor(buf);
+    const loop = (): void => {
+      while (c.readHeader()) {
+        if (c.wire === SEQ_START) loop();
+        else c.skip(c.wire);
+      }
+    };
+    loop();
+  }
+
+  it("rejects a top-level stray sequence-end as INVALID", () => {
+    // A lone SequenceEnd at the root closes no open sequence — dangling → INVALID.
+    expect(codeOf(() => driveSkipping(bytes(header(0, SEQ_END))))).toBe(
+      SofabErrorCode.InvalidMsg,
+    );
+  });
+
+  it("rejects a stray sequence-end after a balanced sequence", () => {
+    expect(
+      codeOf(() =>
+        driveSkipping(
+          bytes(header(10, SEQ_START), header(0, SEQ_END), header(0, SEQ_END)),
+        ),
+      ),
+    ).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  it("reports an unclosed sequence at end-of-buffer as INCOMPLETE (recursion path)", () => {
+    expect(codeOf(() => driveRecursive(bytes(header(10, SEQ_START))))).toBe(
+      SofabErrorCode.Incomplete,
+    );
+  });
+
+  it("reports an unclosed sequence at end-of-buffer as INCOMPLETE (skip path)", () => {
+    expect(codeOf(() => driveSkipping(bytes(header(10, SEQ_START))))).toBe(
+      SofabErrorCode.Incomplete,
+    );
+  });
+
+  it("accepts a balanced empty nested sequence", () => {
+    expect(() =>
+      driveRecursive(bytes(header(10, SEQ_START), header(0, SEQ_END))),
+    ).not.toThrow();
+    expect(() =>
+      driveSkipping(bytes(header(10, SEQ_START), header(0, SEQ_END))),
+    ).not.toThrow();
+  });
+});
+
 describe("Cursor nested sequences", () => {
   it("recurses: readHeader ends (consuming the close) at the sequence end", () => {
     // { u1=11, seq(2){ u1=99 } }
@@ -202,9 +265,11 @@ describe("Cursor skip", () => {
 
 // --- error / edge paths -------------------------------------------------------
 //
-// Every branch below throws the same SofabError(INVALID_MSG) as the push
-// (fast/istream) decode path. We hand-craft malformed buffers and assert the
-// matching Cursor reader rejects them, matching the existing error-code style.
+// Each branch below reports the same three-valued outcome as the push
+// (fast/istream) decode path (MESSAGE_SPEC §7): a *malformed* buffer throws
+// SofabError(INVALID_MSG), while a buffer that ends *inside* a field (a
+// truncation) throws SofabError(INCOMPLETE). We hand-craft each and assert the
+// matching Cursor reader surfaces the right code.
 
 const ID_MAX = 0x7fff_ffff;
 const FIXLEN_MAX = 0x7fff_ffff;
@@ -234,7 +299,7 @@ describe("Cursor header errors", () => {
     ).toBe(SofabErrorCode.InvalidMsg);
   });
 
-  it("rejects a nested sequence that never closes (unbalanced)", () => {
+  it("reports INCOMPLETE for a nested sequence that never closes", () => {
     const buf = bytes(header(3, 6 /* SequenceStart */)); // opened, never ended
     expect(
       codeOf(() => {
@@ -242,7 +307,7 @@ describe("Cursor header errors", () => {
         c.readHeader();
         c.skip(6);
       }),
-    ).toBe(SofabErrorCode.InvalidMsg);
+    ).toBe(SofabErrorCode.Incomplete);
   });
 });
 
@@ -269,7 +334,7 @@ describe("Cursor fixlen scalar errors", () => {
     ).toBe(SofabErrorCode.InvalidMsg);
   });
 
-  it("rejects a truncated fp32 payload", () => {
+  it("reports INCOMPLETE for a truncated fp32 payload", () => {
     const buf = bytes(header(1, 2), fixlenSub(4, 0), [1, 2]); // only 2 of 4 bytes
     expect(
       codeOf(() => {
@@ -277,10 +342,10 @@ describe("Cursor fixlen scalar errors", () => {
         c.readHeader();
         c.readFp32();
       }),
-    ).toBe(SofabErrorCode.InvalidMsg);
+    ).toBe(SofabErrorCode.Incomplete);
   });
 
-  it("rejects a truncated fp64 payload", () => {
+  it("reports INCOMPLETE for a truncated fp64 payload", () => {
     const buf = bytes(header(1, 2), fixlenSub(8, 1 /* Fp64 */), [1, 2, 3]);
     expect(
       codeOf(() => {
@@ -288,7 +353,7 @@ describe("Cursor fixlen scalar errors", () => {
         c.readHeader();
         c.readFp64();
       }),
-    ).toBe(SofabErrorCode.InvalidMsg);
+    ).toBe(SofabErrorCode.Incomplete);
   });
 
   it("rejects a string field whose subtype is not string", () => {
@@ -313,7 +378,7 @@ describe("Cursor fixlen scalar errors", () => {
     ).toBe(SofabErrorCode.InvalidMsg);
   });
 
-  it("rejects a truncated string/blob payload", () => {
+  it("reports INCOMPLETE for a truncated string/blob payload", () => {
     const buf = bytes(header(1, 2), fixlenSub(10, 2 /* String, len 10 */), [
       1, 2, 3,
     ]);
@@ -323,7 +388,7 @@ describe("Cursor fixlen scalar errors", () => {
         c.readHeader();
         c.readString();
       }),
-    ).toBe(SofabErrorCode.InvalidMsg);
+    ).toBe(SofabErrorCode.Incomplete);
   });
 
   it("rejects a fixlen field with an out-of-range length when skipped", () => {
@@ -395,7 +460,7 @@ describe("Cursor varint errors", () => {
     expect(got).toEqual(byLength);
   });
 
-  it("rejects a varint truncated at each byte position", () => {
+  it("reports INCOMPLETE for a varint truncated at each byte position", () => {
     // Byte 1: a header but no value bytes at all.
     expect(
       codeOf(() => {
@@ -403,7 +468,7 @@ describe("Cursor varint errors", () => {
         c.readHeader();
         c.readUnsigned();
       }),
-    ).toBe(SofabErrorCode.InvalidMsg);
+    ).toBe(SofabErrorCode.Incomplete);
 
     // Bytes 2..10: a value varint of length k with its final byte chopped off,
     // leaving k-1 continuation bytes that run off the end of the buffer.
@@ -416,7 +481,7 @@ describe("Cursor varint errors", () => {
           c.readHeader();
           c.readUnsigned();
         }),
-      ).toBe(SofabErrorCode.InvalidMsg);
+      ).toBe(SofabErrorCode.Incomplete);
     }
   });
 

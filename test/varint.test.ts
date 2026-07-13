@@ -22,14 +22,15 @@ describe("varint round-trip", () => {
     }
   });
 
-  it("rejects a truncated varint", () => {
+  it("reports INCOMPLETE for a truncated varint", () => {
     const buf = Uint8Array.from([0x80, 0x80]); // continuation with no terminator
     try {
       decodeVarint(buf, 0);
       throw new Error("expected throw");
     } catch (e) {
       expect(e).toBeInstanceOf(SofabError);
-      expect((e as SofabError).code).toBe(SofabErrorCode.InvalidMsg);
+      // Ends mid-varint: more bytes could complete it, so INCOMPLETE not INVALID.
+      expect((e as SofabError).code).toBe(SofabErrorCode.Incomplete);
     }
   });
 

@@ -1,11 +1,20 @@
 /**
- * Error handling: every malformed-input branch of the decoder rejects with
- * `INVALID_MSG`, and the encoder rejects bad arguments / overflow with the
- * matching {@link SofabErrorCode}.
+ * Error handling: every *malformed*-input branch of the decoder rejects with
+ * `INVALID_MSG`, input that ends *inside* a field is reported as `INCOMPLETE`
+ * (MESSAGE_SPEC §7, never promoted to an error by a finish step), and the
+ * encoder rejects bad arguments / overflow with the matching
+ * {@link SofabErrorCode}.
  */
 
 import { describe, expect, it } from "vitest";
-import { IStream, OStream, SofabError, SofabErrorCode, decode } from "../src/index.js";
+import {
+  DecodeStatus,
+  IStream,
+  OStream,
+  SofabError,
+  SofabErrorCode,
+  decode,
+} from "../src/index.js";
 import { ID_MAX } from "../src/constants.js";
 import { encodeVarint } from "../src/varint/leb128.js";
 
@@ -55,24 +64,49 @@ describe("decoder rejects malformed input", () => {
     expect(codeOf(() => decode(buf.subarray(0, n), {}))).toBe(SofabErrorCode.InvalidMsg);
   });
 
-  it("truncated mid-varint at end()", () => {
-    expect(
-      codeOf(() => {
-        const is = new IStream();
-        is.feed(bytes(0x80), {}); // continuation bit set, no terminator
-        is.end();
-      }),
-    ).toBe(SofabErrorCode.InvalidMsg);
+});
+
+// The finish-less three-valued outcome (MESSAGE_SPEC §7): input that ends inside
+// a field is INCOMPLETE (more bytes could complete it), NOT the malformed
+// INVALID. end()/feed() never promote an incomplete decode to an error.
+describe("decoder distinguishes INCOMPLETE from INVALID", () => {
+  it("one-shot decode of a lone dangling 0x80 is INCOMPLETE, not malformed", () => {
+    // 0x80: a header varint with the continuation bit set and no terminator.
+    expect(codeOf(() => decode(bytes(0x80), {}))).toBe(SofabErrorCode.Incomplete);
   });
 
-  it("unbalanced open sequence at end()", () => {
-    expect(
-      codeOf(() => {
-        const is = new IStream();
-        is.feed(bytes(0x0e), {}); // id 1 sequence start, never closed
-        is.end();
-      }),
-    ).toBe(SofabErrorCode.InvalidMsg);
+  it("one-shot decode of a truncated payload is INCOMPLETE", () => {
+    // id 0 fixlen string, declared length 4, only 2 payload bytes present.
+    expect(codeOf(() => decode(bytes(0x02, 0x22, 0x41, 0x42), {}))).toBe(
+      SofabErrorCode.Incomplete,
+    );
+  });
+
+  it("streaming end() reports INCOMPLETE for a lone dangling 0x80 (no throw)", () => {
+    const is = new IStream();
+    is.feed(bytes(0x80), {}); // continuation bit set, no terminator
+    expect(is.end()).toBe(DecodeStatus.Incomplete);
+  });
+
+  it("streaming end() reports INCOMPLETE for an unbalanced open sequence", () => {
+    const is = new IStream();
+    is.feed(bytes(0x0e), {}); // id 1 sequence start, never closed
+    expect(is.end()).toBe(DecodeStatus.Incomplete);
+  });
+
+  it("streaming end() reports COMPLETE for a message that ends on a boundary", () => {
+    const os = new OStream();
+    os.writeUnsigned(1, 7);
+    const is = new IStream();
+    is.feed(os.bytes(), {});
+    expect(is.end()).toBe(DecodeStatus.Complete);
+  });
+
+  it("a >64-bit varint is INVALID even though it too runs off the end", () => {
+    // header id 0 unsigned, then 10 continuation bytes with no terminator: this
+    // overflows 64 bits before it is ever truncated, so it is malformed.
+    const buf = Uint8Array.from([0x00, ...new Array(10).fill(0x80)]);
+    expect(codeOf(() => decode(buf, {}))).toBe(SofabErrorCode.InvalidMsg);
   });
 });
 

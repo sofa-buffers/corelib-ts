@@ -12,6 +12,7 @@
 import {
   ARRAY_MAX,
   ArrayKind,
+  DecodeStatus,
   FIXLEN_MAX,
   FixlenSubtype,
   ID_MAX,
@@ -260,14 +261,20 @@ export class DecoderState {
     }
   }
 
-  /** Assert the stream ended cleanly at a field boundary; throws otherwise. */
-  finish(): void {
-    if (this.state !== S.Header || this.vBytes !== 0) {
-      throw invalidMsgError("truncated message: ended mid-field");
-    }
-    if (this.stack.length > 1) {
-      throw invalidMsgError("truncated message: unbalanced sequence");
-    }
+  /**
+   * Report the terminal decode outcome (MESSAGE_SPEC §7) *without* promoting it
+   * to an error. Returns {@link DecodeStatus.Complete} when the stream ended
+   * exactly at a field boundary, or {@link DecodeStatus.Incomplete} when it
+   * ended inside a field (a partial varint, an unfinished payload / array, or a
+   * still-open nested sequence). This is a pure accessor — the finish-less spec
+   * has no finalize step, and a trailing `Incomplete` is a truncation the caller
+   * decides how to treat, not an error this machine raises. A genuinely
+   * malformed message has already thrown from {@link push}.
+   */
+  finish(): DecodeStatus {
+    const atBoundary =
+      this.state === S.Header && this.vBytes === 0 && this.stack.length <= 1;
+    return atBoundary ? DecodeStatus.Complete : DecodeStatus.Incomplete;
   }
 
   // --- helpers ------------------------------------------------------------

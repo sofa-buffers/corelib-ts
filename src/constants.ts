@@ -87,3 +87,32 @@ export const VARINT_MAX_BYTES = 10;
  * recursion / stack growth.
  */
 export const MAX_DEPTH = 255;
+
+/**
+ * The terminal outcome of a decode (MESSAGE_SPEC §7), reported identically for
+ * one-shot and streaming decode with **no** finish / finalize / end promotion
+ * step:
+ *
+ * - `Complete` — the bytes ended exactly at a field boundary: a valid message.
+ * - `Incomplete` — the bytes ended *inside* a field (an unterminated varint, a
+ *   payload shorter than its declared length, an array that runs off the end, or
+ *   a nested sequence never closed). **Not an error** — more bytes could
+ *   complete it, and the caller owns end-of-input.
+ * - `Invalid` — the bytes are malformed regardless of what follows.
+ *
+ * {@link IStream.end} returns `Complete` or `Incomplete` (an `Invalid` message
+ * has already thrown from {@link IStream.feed}); the one-shot {@link decode} /
+ * {@link Cursor} path signals `Incomplete` and `Invalid` by throwing a
+ * {@link SofabError} whose `code` is {@link SofabErrorCode.Incomplete} or
+ * {@link SofabErrorCode.InvalidMsg}, and `Complete` by returning normally.
+ */
+export const DecodeStatus = {
+  /** The bytes ended exactly at a field boundary — a valid message. */
+  Complete: "COMPLETE",
+  /** The bytes ended inside a field; more bytes could complete it (not an error). */
+  Incomplete: "INCOMPLETE",
+  /** The bytes are malformed regardless of what follows. */
+  Invalid: "INVALID",
+} as const;
+/** A decode's terminal outcome: one of the {@link DecodeStatus} values. */
+export type DecodeStatus = (typeof DecodeStatus)[keyof typeof DecodeStatus];

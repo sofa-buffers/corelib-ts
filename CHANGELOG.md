@@ -8,8 +8,27 @@ While the version is below `1.0.0`, breaking changes bump the **minor** version.
 
 ## [Unreleased]
 
+### Added
+
+- **Finish-less three-valued decode outcome (MESSAGE_SPEC §7).** Truncation — a
+  decode that ends *inside* a field — is now a distinct outcome from a malformed
+  message. New `SofabErrorCode.Incomplete` (`"INCOMPLETE"`) and a `DecodeStatus`
+  enum (`Complete` / `Incomplete` / `Invalid`) are exported. Every one-shot
+  truncation site (`decode()`, `Cursor`) that used to throw `INVALID_MSG` — an
+  unterminated varint, a payload / array shorter than its declared length, or a
+  nested sequence left open at end-of-buffer — now throws `INCOMPLETE` instead;
+  genuinely malformed input (varint over 64 bits, bad subtype/length/count, id
+  over max, dangling sequence-end, over-`MAX_DEPTH` nesting) still throws
+  `INVALID_MSG`. Mirrors corelib-go#42.
+
 ### Changed
 
+- **BREAKING (decode API):** there is no finish/finalize step. `IStream.end()`
+  no longer throws to promote an incomplete stream to an error; it is now a pure
+  accessor returning `DecodeStatus.Complete` when the stream ended on a field
+  boundary or `DecodeStatus.Incomplete` when it ended inside one. A malformed
+  message still throws from `IStream.feed()`. Callers that relied on `end()`
+  throwing on truncation must check its return value instead.
 - **BREAKING (wire format):** a fixlen array (`fp32`/`fp64`) now always carries
   its `fixlen_word` — even when empty (`element_count == 0`). Previously an empty
   fixlen array was `[header][count=0]` with no `fixlen_word`, making an empty

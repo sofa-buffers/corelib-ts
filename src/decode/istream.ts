@@ -11,9 +11,16 @@
  * visitor, and the decoder routes the nested fields to it until the matching
  * end. Generated message classes use this directly — a class implements
  * `Visitor`, and a nested-message field returns the child instance.
+ *
+ * There is no finish / finalize step (MESSAGE_SPEC §7): {@link IStream.feed}
+ * throws only for a *malformed* message ({@link SofabErrorCode.InvalidMsg}); a
+ * message that merely ends inside a field is reported — never thrown — by
+ * {@link IStream.end}, which returns {@link DecodeStatus.Incomplete} rather than
+ * {@link DecodeStatus.Complete}. The caller owns end-of-input and decides
+ * whether a trailing `Incomplete` is a truncation error.
  */
 
-import type { ArrayKind } from "../constants.js";
+import type { ArrayKind, DecodeStatus } from "../constants.js";
 import { decodeContiguous } from "./fast.js";
 import { DecoderState } from "./state.js";
 
@@ -70,25 +77,37 @@ export interface Visitor {
  * Push parser for the SofaBuffers wire format. Feed it bytes in chunks of any
  * size with {@link IStream.feed} and it drives a {@link Visitor}, one call per
  * decoded field, resuming cleanly across chunk boundaries. Call
- * {@link IStream.end} after the final chunk to assert the message finished on a
- * field boundary. When the whole message is already in one buffer, prefer the
- * faster {@link decode}.
+ * {@link IStream.end} after the final chunk to read whether the message finished
+ * on a field boundary. When the whole message is already in one buffer, prefer
+ * the faster {@link decode}.
  */
 export class IStream {
   private readonly state = new DecoderState();
 
-  /** Feed a chunk of bytes, dispatching decoded fields to `visitor`. */
+  /**
+   * Feed a chunk of bytes, dispatching decoded fields to `visitor`. Throws
+   * {@link SofabError} (`INVALID_MSG`) only if the bytes are *malformed*;
+   * running out of bytes mid-field is not an error — it simply suspends until
+   * the next chunk (see {@link end}).
+   */
   feed(chunk: Uint8Array, visitor: Visitor): void {
     this.state.push(chunk, visitor);
   }
 
   /**
-   * Assert the stream ended cleanly at a field boundary (no truncated field or
-   * unbalanced sequence). Call after the final {@link feed} of a complete
-   * message; throws {@link SofabError} (`INVALID_MSG`) if incomplete.
+   * Report whether the stream ended exactly at a field boundary. Call after the
+   * final {@link feed}: returns {@link DecodeStatus.Complete} at a clean field
+   * boundary, or {@link DecodeStatus.Incomplete} if the last chunk ended inside
+   * a field (a partial varint, an unfinished payload / array, or a still-open
+   * nested sequence).
+   *
+   * Per the finish-less spec (MESSAGE_SPEC §7) this is a pure accessor: it never
+   * throws and never promotes an incomplete decode to an error — the caller owns
+   * end-of-input and decides whether a trailing `Incomplete` is a truncation
+   * error. (A *malformed* message has already thrown from {@link feed}.)
    */
-  end(): void {
-    this.state.finish();
+  end(): DecodeStatus {
+    return this.state.finish();
   }
 }
 
@@ -100,8 +119,13 @@ export class IStream {
  * resumable per-byte state machine, so it is markedly faster than feeding the
  * same bytes through
  * {@link IStream}. Use {@link IStream} when the message arrives in chunks; use
- * this when you already have it whole. Malformed input — including truncation
- * or an unclosed sequence — throws {@link SofabError} (`INVALID_MSG`).
+ * this when you already have it whole.
+ *
+ * The whole buffer *is* the end of input, so the two failure outcomes both
+ * throw a {@link SofabError} the caller tells apart by `code` (MESSAGE_SPEC §7):
+ * malformed input throws `INVALID_MSG`, while input that ends inside a field —
+ * truncation or an unclosed sequence — throws `INCOMPLETE`. A complete message
+ * returns normally.
  */
 export function decode(bytes: Uint8Array, visitor: Visitor): void {
   decodeContiguous(bytes, visitor);
