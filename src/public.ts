@@ -26,6 +26,7 @@ export type { FlushSink } from "./encode/sink.js";
 
 export { IStream, decode } from "./decode/istream.js";
 export type { Visitor } from "./decode/istream.js";
+export type { DecodeLimits } from "./decode/limits.js";
 export { Cursor } from "./decode/cursor.js";
 
 export { getKernel, setKernel } from "./backend/kernel.js";

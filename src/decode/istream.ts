@@ -22,6 +22,7 @@
 
 import type { ArrayKind, DecodeStatus } from "../constants.js";
 import { decodeContiguous } from "./fast.js";
+import type { DecodeLimits } from "./limits.js";
 import { DecoderState } from "./state.js";
 
 /**
@@ -82,7 +83,17 @@ export interface Visitor {
  * the faster {@link decode}.
  */
 export class IStream {
-  private readonly state = new DecoderState();
+  private readonly state: DecoderState;
+
+  /**
+   * @param limits Optional opt-in decode caps ({@link DecodeLimits}). An
+   * over-limit array count or string / blob length throws {@link SofabError}
+   * (`LIMIT_EXCEEDED`) from {@link feed}, at the offending field's header and
+   * before any of its payload is streamed to the visitor. Omit for no caps.
+   */
+  constructor(limits?: DecodeLimits) {
+    this.state = new DecoderState(limits);
+  }
 
   /**
    * Feed a chunk of bytes, dispatching decoded fields to `visitor`. Throws
@@ -126,7 +137,15 @@ export class IStream {
  * malformed input throws `INVALID_MSG`, while input that ends inside a field —
  * truncation or an unclosed sequence — throws `INCOMPLETE`. A complete message
  * returns normally.
+ *
+ * Pass `limits` ({@link DecodeLimits}) to cap array counts and string / blob
+ * lengths; an over-limit field throws `LIMIT_EXCEEDED` at its header, before it
+ * is materialized. Omit for no caps (the default).
  */
-export function decode(bytes: Uint8Array, visitor: Visitor): void {
-  decodeContiguous(bytes, visitor);
+export function decode(
+  bytes: Uint8Array,
+  visitor: Visitor,
+  limits?: DecodeLimits,
+): void {
+  decodeContiguous(bytes, visitor, limits);
 }

@@ -20,9 +20,10 @@ import {
   VARINT_MAX_BYTES,
   WireType,
 } from "../constants.js";
-import { invalidMsgError } from "../errors.js";
+import { invalidMsgError, limitExceededError } from "../errors.js";
 import { unpackFp32, unpackFp64 } from "../varint/num64.js";
 import { zigzagDecode } from "../varint/zigzag.js";
+import type { DecodeLimits } from "./limits.js";
 import type { Visitor } from "./istream.js";
 
 const enum S {
@@ -71,6 +72,19 @@ export class DecoderState {
   private arrIsFixlen = false;
   private arrCount = 0;
   private arrIndex = 0;
+
+  // Opt-in decode limits (corelib-ts#38); an unset limit is Infinity (no cap).
+  // Enforced at the count / length header, before any payload is streamed to
+  // the visitor, so an over-limit string/blob is never fed chunk-by-chunk.
+  private readonly maxArrayCount: number;
+  private readonly maxStringLen: number;
+  private readonly maxBlobLen: number;
+
+  constructor(limits?: DecodeLimits) {
+    this.maxArrayCount = limits?.maxArrayCount ?? Infinity;
+    this.maxStringLen = limits?.maxStringLen ?? Infinity;
+    this.maxBlobLen = limits?.maxBlobLen ?? Infinity;
+  }
 
   /** Feed `input` to the machine, dispatching to `root` and its sub-visitors. */
   push(input: Uint8Array, root: Visitor): void {
@@ -125,6 +139,12 @@ export class DecoderState {
           this.resetVarint();
           if (sub > FixlenSubtype.Blob) throw invalidMsgError(`invalid fixlen subtype ${sub}`);
           if (len > FIXLEN_MAX) throw invalidMsgError("fixlen length out of range");
+          if (sub === FixlenSubtype.String && len > this.maxStringLen) {
+            throw limitExceededError(`string length ${len} exceeds maxStringLen ${this.maxStringLen}`);
+          }
+          if (sub === FixlenSubtype.Blob && len > this.maxBlobLen) {
+            throw limitExceededError(`blob length ${len} exceeds maxBlobLen ${this.maxBlobLen}`);
+          }
           this.fixSub = sub as FixlenSubtype;
           this.fixLen = len;
           this.fixOff = 0;
@@ -174,6 +194,9 @@ export class DecoderState {
           const count = this.vNum();
           this.resetVarint();
           if (count > ARRAY_MAX) throw invalidMsgError("array count out of range");
+          if (count > this.maxArrayCount) {
+            throw limitExceededError(`array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`);
+          }
           this.arrCount = count;
           this.arrIndex = 0;
           if (this.arrIsFixlen) {

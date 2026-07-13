@@ -210,6 +210,29 @@ Who owns the bytes:
   buffer lives. Scalars are delivered by value. Copy (`.slice()`) or decode
   (`Cursor.readString` decodes for you) to retain a payload.
 
+### Decode limits
+
+For a schema whose `count` / `maxlen` bounds are omitted, the decoder otherwise
+accepts whatever count / length the received message claims. Pass an optional
+`DecodeLimits` object to cap that and protect a receiver from a hostile oversized
+field:
+
+```ts
+const limits = { maxArrayCount: 65536, maxStringLen: 1 << 20, maxBlobLen: 1 << 20 };
+decode(bytes, visitor, limits);       // one-shot push
+new Cursor(bytes, limits);            // pull
+new IStream(limits);                  // streaming
+```
+
+An over-limit array count or string / blob length is rejected at the field's
+header — **before** the array is sized or any payload is decoded or streamed to
+the visitor — by throwing `SofabError` with code
+`SofabErrorCode.LimitExceeded`. The decoder never clamps or truncates. Each limit
+is independent, and an omitted one means **no cap** (the default is today's
+unlimited behavior — the corelib invents no default). `LimitExceeded` is distinct
+from `INVALID_MSG`: exceeding a receiver-configured limit is policy, not a
+malformed message. Generated code supplies these values from the sofabgen config.
+
 ## Feature flags
 
 None — the build always ships every wire type.
