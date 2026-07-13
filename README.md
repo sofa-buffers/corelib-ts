@@ -67,7 +67,13 @@ The codec has four use cases — serialize a message that fits in one buffer,
 serialize one too large for the buffer (streamed out in chunks), deserialize a
 whole message, and deserialize one arriving in chunks — plus the generated-code
 path that wraps them. Problems are reported by throwing `SofabError`; the cause is
-on `SofabError.code` (`ARGUMENT`, `USAGE`, `BUFFER_FULL`, `INVALID_MSG`).
+on `SofabError.code` (`ARGUMENT`, `USAGE`, `BUFFER_FULL`, `INVALID_MSG`,
+`INCOMPLETE`). The decoder splits its two failure kinds (MESSAGE_SPEC §7):
+`INVALID_MSG` is a message malformed regardless of what follows, while
+`INCOMPLETE` means the bytes merely ended *inside* a field — a truncation more
+bytes could complete, which is not an error the caller must treat as one. There
+is no finish/finalize step: a streaming decode reports `INCOMPLETE` from `end()`
+(see below), never by promoting it to a throw.
 
 ### Serialize
 
@@ -120,11 +126,12 @@ decode(bytes, new My());
 ### Deserialize stream
 
 `IStream` resumes across chunk boundaries, so feed it whatever the transport hands
-you — from any source — and finish with `end()`. String / blob payloads arrive as
-one or more chunks tagged with the field's `total` length and byte `offset`:
+you — from any source — and read the outcome from `end()`. String / blob payloads
+arrive as one or more chunks tagged with the field's `total` length and byte
+`offset`:
 
 ```ts
-import { IStream, type Visitor } from "@sofa-buffers/corelib";
+import { IStream, DecodeStatus, type Visitor } from "@sofa-buffers/corelib";
 
 const visitor: Visitor = {
   blob(id, total, offset, chunk) {
@@ -134,7 +141,12 @@ const visitor: Visitor = {
 
 const is = new IStream();
 for await (const chunk of source) is.feed(chunk, visitor); // any async byte source
-is.end(); // asserts the message ended cleanly on a field boundary
+// end() is a pure accessor — it never throws and never promotes an incomplete
+// decode to an error (MESSAGE_SPEC §7). The caller owns end-of-input.
+if (is.end() !== DecodeStatus.Complete) {
+  // stream ended inside a field (INCOMPLETE) — wait for more bytes, or treat
+  // the truncation as an error if this really was the end of input.
+}
 ```
 
 ### Code generator

@@ -20,9 +20,11 @@
  *
  * String / blob payloads are handed to the visitor as a single zero-copy
  * `subarray` view (one call, offset 0) rather than streamed in pieces. The
- * decoder validates exactly what the streaming path does and throws the same
- * {@link SofabError} (`INVALID_MSG`) on malformed input, including truncation
- * and unbalanced sequences detected at the end of the buffer.
+ * decoder validates exactly what the streaming path does and reports the same
+ * three-valued outcome (MESSAGE_SPEC §7): it throws a {@link SofabError} with
+ * code `INVALID_MSG` on malformed input, and `INCOMPLETE` when the buffer ends
+ * inside a field — a truncated varint / payload / array, or an unclosed
+ * sequence detected at the end of the buffer.
  */
 
 import {
@@ -34,7 +36,7 @@ import {
   MAX_DEPTH,
   WireType,
 } from "../constants.js";
-import { invalidMsgError } from "../errors.js";
+import { incompleteError, invalidMsgError } from "../errors.js";
 import { zigzagDecode } from "../varint/zigzag.js";
 import type { Visitor } from "./istream.js";
 
@@ -183,7 +185,7 @@ class FastDecoder {
       }
     }
 
-    if (stack.length > 1) throw invalidMsgError("truncated message: unbalanced sequence");
+    if (stack.length > 1) throw incompleteError("truncated message: unbalanced sequence");
   }
 
   // --- field helpers ------------------------------------------------------
@@ -200,21 +202,21 @@ class FastDecoder {
   private take(len: number): Uint8Array {
     const start = this.p;
     const end = start + len;
-    if (end > this.n) throw invalidMsgError("truncated fixlen payload");
+    if (end > this.n) throw incompleteError("truncated fixlen payload");
     this.p = end;
     return this.buf.subarray(start, end);
   }
 
   private readFp32(): number {
     const p = this.p;
-    if (p + 4 > this.n) throw invalidMsgError("truncated fp32");
+    if (p + 4 > this.n) throw incompleteError("truncated fp32");
     this.p = p + 4;
     return this.view.getFloat32(p, true);
   }
 
   private readFp64(): number {
     const p = this.p;
-    if (p + 8 > this.n) throw invalidMsgError("truncated fp64");
+    if (p + 8 > this.n) throw incompleteError("truncated fp64");
     this.p = p + 8;
     return this.view.getFloat64(p, true);
   }
@@ -272,55 +274,55 @@ class FastDecoder {
     let lo: number;
     let hi = 0;
 
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     lo = b & 0x7f;
     if (b < 0x80) return this.set(lo, 0, p);
 
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     lo |= (b & 0x7f) << 7;
     if (b < 0x80) return this.set(lo, 0, p);
 
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     lo |= (b & 0x7f) << 14;
     if (b < 0x80) return this.set(lo, 0, p);
 
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     lo |= (b & 0x7f) << 21;
     if (b < 0x80) return this.set(lo, 0, p);
 
     // 5th byte straddles the 32-bit boundary: 4 bits to lo, 3 bits to hi.
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     lo |= (b & 0x0f) << 28;
     hi = (b >> 4) & 0x07;
     if (b < 0x80) return this.set(lo, hi, p);
 
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     hi |= (b & 0x7f) << 3;
     if (b < 0x80) return this.set(lo, hi, p);
 
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     hi |= (b & 0x7f) << 10;
     if (b < 0x80) return this.set(lo, hi, p);
 
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     hi |= (b & 0x7f) << 17;
     if (b < 0x80) return this.set(lo, hi, p);
 
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     hi |= (b & 0x7f) << 24;
     if (b < 0x80) return this.set(lo, hi, p);
 
     // 10th byte: only bit 63 remains; any continuation here is a >64-bit overflow.
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     hi |= (b & 0x7f) << 31;
     if (b < 0x80) return this.set(lo, hi, p);

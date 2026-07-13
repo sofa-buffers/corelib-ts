@@ -19,8 +19,10 @@
  * accumulated into two 32-bit JS *numbers* (`lo`/`hi`) and a `bigint` is
  * materialised only for a 64-bit *value* that does not fit in `2^53-1` (never for
  * ids, lengths or counts). String / blob payloads are returned as a single
- * zero-copy `subarray` view. Malformed input throws the same
- * {@link SofabError} (`INVALID_MSG`) as the push path.
+ * zero-copy `subarray` view. It reports the same three-valued outcome as the
+ * push path (MESSAGE_SPEC §7): malformed input throws a {@link SofabError} with
+ * code `INVALID_MSG`, and a read that runs off the end of the buffer mid-field
+ * throws `INCOMPLETE`.
  */
 
 import {
@@ -30,7 +32,7 @@ import {
   ID_MAX,
   WireType,
 } from "../constants.js";
-import { invalidMsgError } from "../errors.js";
+import { incompleteError, invalidMsgError } from "../errors.js";
 import { Long } from "../long.js";
 import { zigzagDecode } from "../varint/zigzag.js";
 
@@ -254,7 +256,7 @@ export class Cursor {
   private skipSequence(): void {
     let depth = 1;
     while (depth > 0) {
-      if (this.p >= this.n) throw invalidMsgError("truncated message: unbalanced sequence");
+      if (this.p >= this.n) throw incompleteError("truncated message: unbalanced sequence");
       this.readVarint();
       const wire = this.lo & 7;
       if (wire === WireType.SequenceEnd) {
@@ -315,21 +317,21 @@ export class Cursor {
   private take(len: number): Uint8Array {
     const start = this.p;
     const end = start + len;
-    if (end > this.n) throw invalidMsgError("truncated fixlen payload");
+    if (end > this.n) throw incompleteError("truncated fixlen payload");
     this.p = end;
     return this.buf.subarray(start, end);
   }
 
   private rawFp32(): number {
     const p = this.p;
-    if (p + 4 > this.n) throw invalidMsgError("truncated fp32");
+    if (p + 4 > this.n) throw incompleteError("truncated fp32");
     this.p = p + 4;
     return this.view.getFloat32(p, true);
   }
 
   private rawFp64(): number {
     const p = this.p;
-    if (p + 8 > this.n) throw invalidMsgError("truncated fp64");
+    if (p + 8 > this.n) throw incompleteError("truncated fp64");
     this.p = p + 8;
     return this.view.getFloat64(p, true);
   }
@@ -387,55 +389,55 @@ export class Cursor {
     let lo: number;
     let hi = 0;
 
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     lo = b & 0x7f;
     if (b < 0x80) return this.set(lo, 0, p);
 
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     lo |= (b & 0x7f) << 7;
     if (b < 0x80) return this.set(lo, 0, p);
 
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     lo |= (b & 0x7f) << 14;
     if (b < 0x80) return this.set(lo, 0, p);
 
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     lo |= (b & 0x7f) << 21;
     if (b < 0x80) return this.set(lo, 0, p);
 
     // 5th byte straddles the 32-bit boundary: 4 bits to lo, 3 bits to hi.
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     lo |= (b & 0x0f) << 28;
     hi = (b >> 4) & 0x07;
     if (b < 0x80) return this.set(lo, hi, p);
 
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     hi |= (b & 0x7f) << 3;
     if (b < 0x80) return this.set(lo, hi, p);
 
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     hi |= (b & 0x7f) << 10;
     if (b < 0x80) return this.set(lo, hi, p);
 
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     hi |= (b & 0x7f) << 17;
     if (b < 0x80) return this.set(lo, hi, p);
 
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     hi |= (b & 0x7f) << 24;
     if (b < 0x80) return this.set(lo, hi, p);
 
     // 10th byte: only bit 63 remains; any continuation here is a >64-bit overflow.
-    if (p >= n) throw invalidMsgError("truncated varint");
+    if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
     hi |= (b & 0x7f) << 31;
     if (b < 0x80) return this.set(lo, hi, p);

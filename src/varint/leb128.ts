@@ -9,7 +9,7 @@
  */
 
 import { VARINT_MAX_BYTES } from "../constants.js";
-import { invalidMsgError } from "../errors.js";
+import { incompleteError, invalidMsgError } from "../errors.js";
 
 /** Number of bytes {@link encodeVarint} will write for `value` (unsigned). */
 export function varintSize(value: bigint): number {
@@ -130,16 +130,18 @@ export interface VarintResult {
 }
 
 /**
- * Read a varint from `buf` starting at `pos`, with all bytes assumed present.
- * Throws {@link SofabError} (`INVALID_MSG`) on overflow past 64 bits or if the
- * buffer ends mid-varint.
+ * Read a varint from `buf` starting at `pos`. Reports the same two decode
+ * failures the streaming path does (MESSAGE_SPEC §7): throws a
+ * {@link SofabError} with code `INVALID_MSG` on overflow past 64 bits (malformed
+ * regardless of what follows), and `INCOMPLETE` if the buffer ends mid-varint
+ * (an unterminated varint that more bytes could complete).
  */
 export function decodeVarint(buf: Uint8Array, pos: number): VarintResult {
   let value = 0n;
   let shift = 0n;
   let bytes = 0;
   for (;;) {
-    if (pos >= buf.length) throw invalidMsgError("truncated varint");
+    if (pos >= buf.length) throw incompleteError("truncated varint");
     if (bytes >= VARINT_MAX_BYTES) throw invalidMsgError("varint overflow");
     const byte = buf[pos++]!;
     value |= BigInt(byte & 0x7f) << shift;

@@ -6,6 +6,7 @@
 export {
   API_VERSION,
   ArrayKind,
+  DecodeStatus,
   FixlenSubtype,
   WireType,
   ID_MAX,
