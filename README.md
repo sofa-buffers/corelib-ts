@@ -29,7 +29,7 @@ monomorphic pull cursor (`Cursor`) driven by a single `switch` over the field id
 ### Requirements
 
 Node.js 20+ (CI runs 20 / 24), or any modern browser / Electron / Deno /
-Bun. Built with TypeScript 5.7; targets ES2020 (`bigint` required).
+Bun. Built with TypeScript 6.x; targets ES2020 (`bigint` required).
 
 ### Dependencies
 
