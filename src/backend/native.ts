@@ -4,7 +4,7 @@
  * This module performs **no** work at import time and statically imports
  * nothing native, so pulling it into a browser or bundled build is harmless.
  * Call {@link loadNativeKernel} explicitly (only meaningful on Node.js /
- * Electron) to try to load the optional `@sofabuffers/corelib-native` addon and
+ * Electron) to try to load the optional `@sofa-buffers/corelib-native` addon and
  * install it as the active {@link Kernel}. If the addon is absent or the host
  * is not Node, it returns `false` and the pure-JS kernel stays active.
  */
@@ -12,7 +12,7 @@
 import { setKernel, type Kernel } from "./kernel.js";
 
 /** The package id of the optional native addon (an `optionalDependency`). */
-export const NATIVE_PACKAGE = "@sofabuffers/corelib-native";
+export const NATIVE_PACKAGE = "@sofa-buffers/corelib-native";
 
 function isNode(): boolean {
   return (
