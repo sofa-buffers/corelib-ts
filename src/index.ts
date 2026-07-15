@@ -14,7 +14,7 @@
  *
  * @example Encode then decode
  * ```ts
- * import { OStream, decode, type Visitor } from "SofaBuffers";
+ * import { OStream, decode, type Visitor } from "@sofa-buffers/corelib";
  *
  * const os = new OStream();
  * os.writeUnsigned(1, 42);
@@ -29,7 +29,7 @@
  *
  * @example The `sofab` namespace
  * ```ts
- * import * as sofab from "SofaBuffers";
+ * import * as sofab from "@sofa-buffers/corelib";
  * const os = new sofab.OStream();
  * ```
  */
