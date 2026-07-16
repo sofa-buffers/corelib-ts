@@ -410,6 +410,110 @@ describe("Cursor fixlen scalar errors", () => {
   });
 });
 
+// The unknown-field skip path must validate a fixlen word at its header exactly
+// like the known-field path, so a *malformed* word (reserved subtype, wrong-width
+// float, bad array element type) is INVALID even when the payload is also
+// truncated — INVALID takes precedence over INCOMPLETE (MESSAGE_SPEC §5.2/§4.6).
+describe("Cursor skip fixlen validation (§5.2 precedence; corelib-ts#49)", () => {
+  it("rejects a reserved fixlen subtype (0x4..0x7) in a skipped field, truncated", () => {
+    // subtype 4 is reserved; declared length 15, no payload follows.
+    const buf = bytes(header(2021, 2 /* Fixlen */), fixlenSub(15, 4 /* reserved */));
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.skip(2);
+      }),
+    ).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  it("rejects a wrong-width fp64 in a skipped field, truncated", () => {
+    // subtype 1 (fp64) with declared length 15 (≠ 8), then truncated.
+    const buf = bytes(header(2021, 2 /* Fixlen */), fixlenSub(15, 1 /* Fp64 */));
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.skip(2);
+      }),
+    ).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  it("rejects a wrong-width fp32 in a skipped field", () => {
+    const buf = bytes(header(2021, 2), fixlenSub(8, 0 /* Fp32, len ≠ 4 */));
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.skip(2);
+      }),
+    ).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  it("rejects a fixlen array (ArrayFixlen) with a bad element word in a skipped field, truncated", () => {
+    // count 12019, element word subtype 7 (reserved) — INVALID before the (absent)
+    // payload can report INCOMPLETE.
+    const buf = bytes(
+      header(11, 5 /* ArrayFixlen */),
+      uvarint(12019n),
+      fixlenSub(0, 7 /* reserved element subtype */),
+    );
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.skip(5);
+      }),
+    ).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  it("rejects a fixlen array element with a string subtype in a skipped field", () => {
+    // subtype 2 (string) with size 1 is not a valid array element type.
+    const buf = bytes(
+      header(11, 5 /* ArrayFixlen */),
+      uvarint(3n),
+      fixlenSub(1, 2 /* String, not fp32/fp64 */),
+    );
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.skip(5);
+      }),
+    ).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  // Control (issue #49): a *well-formed* skipped field that merely truncates
+  // stays INCOMPLETE — the fix must not over-reject.
+  it("still reports INCOMPLETE for a well-formed but truncated skipped string", () => {
+    // subtype 2 (string) length 2, only 1 payload byte present.
+    const buf = bytes(header(2021, 2), fixlenSub(2, 2 /* String */), [0x41]);
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.skip(2);
+      }),
+    ).toBe(SofabErrorCode.Incomplete);
+  });
+
+  it("still reports INCOMPLETE for a well-formed but truncated skipped fp64 array", () => {
+    // one fp64 element (size 8) declared, no payload bytes → truncated.
+    const buf = bytes(
+      header(11, 5 /* ArrayFixlen */),
+      uvarint(1n),
+      fixlenSub(8, 1 /* Fp64 */),
+    );
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.skip(5);
+      }),
+    ).toBe(SofabErrorCode.Incomplete);
+  });
+});
+
 describe("Cursor array errors", () => {
   it("rejects an array count past ARRAY_MAX", () => {
     const buf = bytes(header(1, 3 /* ArrayUnsigned */), uvarint(BigInt(ARRAY_MAX) + 1n));

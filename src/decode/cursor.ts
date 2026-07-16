@@ -277,8 +277,23 @@ export class Cursor {
         return;
       case WireType.Fixlen: {
         this.readVarint();
+        const sub = this.lo & 7;
         const len = this.upper();
-        if (len > FIXLEN_MAX) throw invalidMsgError("fixlen length out of range");
+        // §4.6/§5.2: validate the fixlen word at the header, before the payload,
+        // so a malformed word — a reserved subtype (0x4..0x7), or an fp32/fp64
+        // whose declared length ≠ 4/8 — is INVALID even when the payload is also
+        // truncated (INVALID takes precedence over INCOMPLETE). Mirrors the
+        // known-field path ({@link fixlenHeader}) and fast.ts. A skip never
+        // materializes the value, so string/blob keep only the len ≤ FIXLEN_MAX
+        // bound — no opt-in length limit is enforced here (corelib-ts#49).
+        if (sub > FixlenSubtype.Blob) throw invalidMsgError(`invalid fixlen subtype ${sub}`);
+        if (sub === FixlenSubtype.Fp32 || sub === FixlenSubtype.Fp64) {
+          if (len !== (sub === FixlenSubtype.Fp32 ? 4 : 8)) {
+            throw invalidMsgError("fixlen float length mismatch");
+          }
+        } else if (len > FIXLEN_MAX) {
+          throw invalidMsgError("fixlen length out of range");
+        }
         this.take(len);
         return;
       }
@@ -289,9 +304,29 @@ export class Cursor {
         return;
       }
       case WireType.ArrayFixlen: {
-        const count = this.arrayCount();
+        // Read count and the element word, then validate the element type at the
+        // header before taking the payload — a fixlen array carries only fp32
+        // (size 4) or fp64 (size 8) elements (§4.8), so any other element word is
+        // INVALID even when the payload is truncated (§5.2 precedence). This
+        // deliberately does NOT use {@link arrayCount}'s count ≤ remaining-bytes
+        // guard: that guard exists to bound allocation on the read paths, but the
+        // skip path allocates nothing, and applying it here would report a
+        // malformed-element array as INCOMPLETE instead of INVALID (corelib-ts#49).
         this.readVarint();
+        const count = this.num();
+        if (count > ARRAY_MAX) throw invalidMsgError("array count out of range");
+        if (count > this.maxArrayCount) {
+          throw limitExceededError(
+            `array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`,
+          );
+        }
+        this.readVarint();
+        const sub = this.lo & 7;
         const size = this.upper();
+        const ok =
+          (sub === FixlenSubtype.Fp32 && size === 4) ||
+          (sub === FixlenSubtype.Fp64 && size === 8);
+        if (!ok) throw invalidMsgError("invalid fixlen array element type");
         this.take(count * size);
         return;
       }
