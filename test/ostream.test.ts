@@ -152,9 +152,10 @@ describe("OStream input flexibility", () => {
 describe("OStream writeString UTF-8", () => {
   // The in-memory (growable) writeString scans the UTF-8 length and writes the
   // characters straight into the buffer; the streaming (fixed-buffer) path still
-  // materialises via TextEncoder. Both must emit byte-identical fields for every
-  // input — including 4-byte code points and unpaired surrogates (which WHATWG,
-  // and therefore TextEncoder, replaces with U+FFFD).
+  // materialises via TextEncoder. For every *valid* input — including 4-byte
+  // code points — both must emit byte-identical fields. Strict UTF-8 (§8/§6.4)
+  // means unpaired surrogates are rejected, not collapsed to U+FFFD; that
+  // encode-reject behaviour is covered in test/utf8.test.ts.
   const cases = [
     "",
     "a",
@@ -165,12 +166,7 @@ describe("OStream writeString UTF-8", () => {
     "𝕳𝖊𝖑𝖑𝖔",
     "日本語テスト",
     "café naïve",
-    "\uD800", // lone high surrogate -> U+FFFD
-    "\uDC00", // lone low surrogate -> U+FFFD
-    "a\uD800b", // lone high surrogate in the middle
-    "a\uDC00b", // lone low surrogate in the middle
-    "\uD800\uD800", // two high surrogates (first is unpaired)
-    "\uDFFF\uD83D", // low then high (both unpaired)
+    "a\u0000b", // embedded U+0000 round-trips (valid UTF-8)
     "x".repeat(500) + "€", // longer, with a multibyte tail
   ];
 
@@ -197,9 +193,8 @@ describe("OStream writeString UTF-8", () => {
           got = dec.decode(chunk);
         },
       });
-      // Compare against TextEncoder's own normalisation (unpaired surrogates
-      // become U+FFFD), which is what a correct encoder must have written.
-      expect(got).toBe(dec.decode(new TextEncoder().encode(s)));
+      // Every case is valid UTF-8, so it round-trips unchanged.
+      expect(got).toBe(s);
     }
   });
 });

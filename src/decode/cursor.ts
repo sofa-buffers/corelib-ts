@@ -42,7 +42,13 @@ import { zigzagDecode } from "../varint/zigzag.js";
 import type { DecodeLimits } from "./limits.js";
 
 const TWO32 = 0x1_0000_0000; // 2^32, for combining the 32-bit halves
-const _utf8 = new TextDecoder();
+// Strict UTF-8 (MESSAGE_SPEC §8, CORELIB_PLAN §6.4): JavaScript strings are a
+// Unicode string type, so this target is always strict — the decoder builds the
+// string with the fatal TextDecoder, which throws on any invalid-UTF-8 payload
+// (overlong forms, surrogate code points, out-of-range, truncated or stray
+// bytes) rather than silently substituting U+FFFD. readString maps that throw to
+// the INVALID decode outcome. A lossy decoder is never used.
+const _utf8 = new TextDecoder("utf-8", { fatal: true });
 
 /**
  * A pull decoder over a complete message held in one contiguous buffer.
@@ -170,7 +176,15 @@ export class Cursor {
   /** Read a UTF-8 string scalar (wire {@link WireType.Fixlen}, subtype string). */
   readString(): string {
     const len = this.fixlenLen(FixlenSubtype.String);
-    return _utf8.decode(this.take(len));
+    // take() (truncation → INCOMPLETE) runs before the decode, so a short
+    // payload stays INCOMPLETE; only genuinely malformed UTF-8 bytes reach the
+    // fatal decoder. Its TypeError becomes the INVALID outcome (§8/§6.4/§5.2).
+    const bytes = this.take(len);
+    try {
+      return _utf8.decode(bytes);
+    } catch {
+      throw invalidMsgError("invalid UTF-8 in string");
+    }
   }
 
   /**
