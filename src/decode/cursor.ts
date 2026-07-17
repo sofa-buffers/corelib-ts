@@ -566,9 +566,11 @@ export class Cursor {
     hi |= (b & 0x7f) << 24;
     if (b < 0x80) return this.set(lo, hi, p);
 
-    // 10th byte: only bit 63 remains; any continuation here is a >64-bit overflow.
+    // 10th byte: only bit 63 (1 payload bit) remains below 64; any higher
+    // payload bit, or a continuation into an 11th byte, is a >64-bit overflow.
     if (p >= n) throw incompleteError("truncated varint");
     b = buf[p++]!;
+    if (((b & 0x7f) >> 1) !== 0) throw invalidMsgError("varint overflow");
     hi |= (b & 0x7f) << 31;
     if (b < 0x80) return this.set(lo, hi, p);
 

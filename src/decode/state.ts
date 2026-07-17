@@ -386,7 +386,12 @@ export class DecoderState {
       else if (k === 4) {
         lo |= (b & 0x0f) << 28;
         hi |= (b >> 4) & 0x07;
-      } else hi |= (b & 0x7f) << (7 * k - 32);
+      } else {
+        // 10th byte (k === 9) has only bit 63 below 64; any higher payload
+        // bit would spill past bit 63 and is a >64-bit overflow.
+        if (k === 9 && ((b & 0x7f) >> 1) !== 0) throw invalidMsgError("varint overflow");
+        hi |= (b & 0x7f) << (7 * k - 32);
+      }
       k++;
       if ((b & 0x80) === 0) {
         this.vLo = lo;

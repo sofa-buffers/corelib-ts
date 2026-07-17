@@ -144,6 +144,11 @@ export function decodeVarint(buf: Uint8Array, pos: number): VarintResult {
     if (pos >= buf.length) throw incompleteError("truncated varint");
     if (bytes >= VARINT_MAX_BYTES) throw invalidMsgError("varint overflow");
     const byte = buf[pos++]!;
+    // 10th byte carries only bit 63 below 64; any higher payload bit would
+    // spill past bit 63 and is a >64-bit overflow (silently accepted before).
+    if (bytes === VARINT_MAX_BYTES - 1 && (byte & 0x7f) > 1) {
+      throw invalidMsgError("varint overflow");
+    }
     value |= BigInt(byte & 0x7f) << shift;
     bytes++;
     if ((byte & 0x80) === 0) return { value, pos };

@@ -659,4 +659,30 @@ describe("Cursor varint errors", () => {
       }),
     ).toBe(SofabErrorCode.InvalidMsg);
   });
+
+  // Regression for #53: an overlong (>64-bit) varint whose 10th byte carries
+  // more than bit 63 was silently truncated/wrapped instead of rejected. Only
+  // the low bit of the 10th byte is valid (it supplies bit 63); any higher
+  // payload bit is a >64-bit overflow → INVALID.
+  describe("overlong 10th byte is INVALID, not truncated (#53)", () => {
+    const nineFF = () => new Array(9).fill(0xff); // fills bits 0..62
+
+    const readValue = (tail: number[]) => {
+      const c = new Cursor(bytes(header(1, 0), nineFF(), tail));
+      c.readHeader();
+      return c.readUnsigned();
+    };
+
+    it("accepts the 2^64-1 maximum (10th byte 0x01) as the control", () => {
+      expect(BigInt(readValue([0x01]))).toBe(U64_MAX);
+    });
+
+    it("rejects the 65th bit (10th byte 0x02)", () => {
+      expect(codeOf(() => readValue([0x02]))).toBe(SofabErrorCode.InvalidMsg);
+    });
+
+    it("rejects high payload bits in the 10th byte (0x7f)", () => {
+      expect(codeOf(() => readValue([0x7f]))).toBe(SofabErrorCode.InvalidMsg);
+    });
+  });
 });
