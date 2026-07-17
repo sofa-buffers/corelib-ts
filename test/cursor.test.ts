@@ -514,6 +514,66 @@ describe("Cursor skip fixlen validation (§5.2 precedence; corelib-ts#49)", () =
   });
 });
 
+// The known-field array read path must validate the fixlen element word at its
+// header exactly like the skip path (#49), so a *malformed* element word is
+// INVALID even when the payload is also truncated — INVALID takes precedence
+// over INCOMPLETE (§5.2). arrayFixlenHeader used to call arrayCount() first,
+// whose `count > remaining` guard fired INCOMPLETE before the element word was
+// ever read (corelib-ts#51, follow-up to #49).
+describe("Cursor read fixlen-array validation (§5.2 precedence; corelib-ts#51)", () => {
+  it("rejects a reserved element subtype in a truncated fp64 array read", () => {
+    // count 12019 (> the remaining byte, so the old count>remaining guard would
+    // have fired INCOMPLETE), element word subtype 7 (reserved) → INVALID.
+    const buf = bytes(
+      header(11, 5 /* ArrayFixlen */),
+      uvarint(12019n),
+      fixlenSub(0, 7 /* reserved element subtype */),
+    );
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.readFp64Array();
+      }),
+    ).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  it("rejects a string element subtype in a truncated fp32 array read", () => {
+    // subtype 2 (string) is not a valid array element type; large count so the
+    // old guard would have masked it as INCOMPLETE.
+    const buf = bytes(
+      header(11, 5 /* ArrayFixlen */),
+      uvarint(12019n),
+      fixlenSub(1, 2 /* String, not fp32/fp64 */),
+    );
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.readFp32Array();
+      }),
+    ).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  // Control: a *well-formed* element word that merely truncates the payload
+  // stays INCOMPLETE — the fix must not over-reject.
+  it("still reports INCOMPLETE for a well-formed but truncated fp64 array read", () => {
+    // one fp64 element (size 8) declared, no payload bytes → truncated.
+    const buf = bytes(
+      header(11, 5 /* ArrayFixlen */),
+      uvarint(1n),
+      fixlenSub(8, 1 /* Fp64 */),
+    );
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.readFp64Array();
+      }),
+    ).toBe(SofabErrorCode.Incomplete);
+  });
+});
+
 describe("Cursor array errors", () => {
   it("rejects an array count past ARRAY_MAX", () => {
     const buf = bytes(header(1, 3 /* ArrayUnsigned */), uvarint(BigInt(ARRAY_MAX) + 1n));
