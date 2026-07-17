@@ -411,7 +411,22 @@ export class Cursor {
   private arrayFixlenHeader(wantSub: number, wantSize: number): number {
     // §4.8: a fixlen array always carries its element-length word — even when
     // empty — so the element kind stays known. count may then be 0.
-    const count = this.arrayCount();
+    //
+    // Read the count and validate the element word *before* the count ≤
+    // remaining-bytes truncation guard, so a malformed element word on a
+    // truncated array is INVALID, not INCOMPLETE (§5.2 precedence). This
+    // deliberately inlines the count parse rather than calling {@link
+    // arrayCount}, whose own `count > remaining` guard would otherwise fire
+    // first — the same trap #49 sidestepped in skipValue's ArrayFixlen case
+    // (corelib-ts#51, follow-up to #49).
+    this.readVarint();
+    const count = this.num();
+    if (count > ARRAY_MAX) throw invalidMsgError("array count out of range");
+    if (count > this.maxArrayCount) {
+      throw limitExceededError(
+        `array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`,
+      );
+    }
     this.readVarint();
     const sub = this.lo & 7;
     const size = this.upper();
@@ -421,6 +436,7 @@ export class Cursor {
     // Part A hardening (corelib-ts#38): now the element size is known, a fixlen
     // array needs count * size payload bytes; a count claiming more than the
     // buffer holds is truncation — reject before sizing `new Array(count)`.
+    // This tighter bound subsumes arrayCount's `count > remaining` guard.
     if (count > (this.n - this.p) / wantSize) {
       throw incompleteError("truncated fixlen array");
     }
