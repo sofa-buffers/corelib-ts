@@ -23,6 +23,15 @@ export class Long {
     this.high = high >>> 0;
   }
 
+  /**
+   * The 64-bit zero. `Long` is immutable (readonly halves), so this single shared
+   * instance is safe to reuse anywhere a zero default is needed — generated code
+   * uses it for fixed-count array defaults and pad-fill instead of
+   * `Long.fromValue(0)`, which would run `bigint` arithmetic per call on the hot
+   * decode/encode path.
+   */
+  static readonly ZERO: Long = new Long(0, 0);
+
   /** Construct from raw 32-bit halves. */
   static fromBits(low: number, high: number): Long {
     return new Long(low, high);
