@@ -44,6 +44,32 @@ export function loadVectors(): Vector[] {
   return doc.vectors;
 }
 
+/**
+ * A negative UTF-8 vector (top-level `invalid_utf8` array). `string_hex` is the
+ * raw string payload that a strict encoder must refuse; `serialized_hex` is the
+ * full wire message a strict decoder must reject as the `INVALID` outcome. The
+ * `invalid_utf8` key is tracked by corelib-c-cpp#97 (source of truth).
+ */
+export interface InvalidUtf8Vector {
+  name: string;
+  group: string;
+  description: string;
+  requires?: string[];
+  id: number;
+  string_hex: string;
+  serialized_hex: string;
+  decode_outcome: "invalid";
+  encode_outcome: "invalid_argument";
+}
+
+export function loadInvalidUtf8(): InvalidUtf8Vector[] {
+  const path = fileURLToPath(new URL("../../assets/test_vectors.json", import.meta.url));
+  const doc = parseJsonWithBigInt(readFileSync(path, "utf8")) as unknown as {
+    invalid_utf8?: InvalidUtf8Vector[];
+  };
+  return doc.invalid_utf8 ?? [];
+}
+
 /** Replay a vector's fields onto `os`, exercising the public writer surface. */
 export function encodeFields(os: OStream, fields: Field[]): void {
   for (const f of fields) {

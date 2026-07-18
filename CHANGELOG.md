@@ -8,6 +8,31 @@ While the version is below `1.0.0`, breaking changes bump the **minor** version.
 
 ## [Unreleased]
 
+### Changed
+
+- **Strict UTF-8 for `string` fields (corelib-ts#85, MESSAGE_SPEC §8,
+  CORELIB_PLAN §6.4).** JavaScript strings are a Unicode string type, so the
+  corelib transcodes `string` payloads at the boundary and is now **always
+  strict** — there is no lossy mode and the `SOFAB_STRICT_UTF8` option is a no-op
+  that is omitted. Silent `U+FFFD` substitution, previously produced by both the
+  decoder and the encoder, is removed in **both** directions:
+  - *Decode:* the corelib builds the string with a **fatal** `TextDecoder`
+    (`new TextDecoder("utf-8", { fatal: true })`). An invalid-UTF-8 payload that
+    is materialized (`Cursor.readString`) is now the `INVALID` outcome —
+    `SofabError` with `SofabErrorCode.InvalidMsg` (`"INVALID_MSG"`) — instead of
+    decoding to a string full of replacement characters. Skipped fields are never
+    validated; embedded `U+0000` round-trips.
+  - *Encode:* `writeString` (both the in-memory fast path and the streaming
+    `TextEncoder` path) now **rejects** an **unpaired surrogate** with
+    `SofabError` / `SofabErrorCode.Argument` (`"ARGUMENT"`) rather than emitting
+    `EF BF BD`. Every valid string — ASCII, multibyte BMP, correctly paired
+    astral code points, embedded `U+0000` — still encodes byte-for-byte as
+    before.
+
+  The shared `assets/test_vectors.json` gains the top-level `invalid_utf8`
+  negative-vector array (tracked by corelib-c-cpp#97); the conformance suite
+  exercises it under the strict decode and encode paths.
+
 ### Added
 
 - **Opt-in decode limits (corelib-ts#38).** A new optional `DecodeLimits`
