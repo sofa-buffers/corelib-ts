@@ -35,6 +35,20 @@ While the version is below `1.0.0`, breaking changes bump the **minor** version.
 
 ### Added
 
+- **`Cursor.fixSub` — the delivered fixlen subtype (corelib-ts#58).** A new
+  public accessor on `Cursor`, the companion to `wire`, that reports the fixlen
+  subtype of the header `readHeader` just accepted — one of `FixlenSubtype`
+  (`Fp32`/`Fp64`/`String`/`Blob`) when `wire` is `Fixlen` or `ArrayFixlen`, and
+  `-1` otherwise. The four fixlen subtypes all share one wire type, so `wire`
+  alone cannot separate them; `fixSub` lets a generated guard skip a fixlen
+  field whose subtype contradicts the schema (MESSAGE_SPEC §7.3) — exactly as it
+  already does on `wire` for the other kinds — instead of passing the wire-type
+  guard and then throwing from the wrong-typed reader. It is *peeked* (the
+  subtype word is not consumed), so the matching typed reader / `skip()` still
+  reads and validates the word and a malformed or truncated one still surfaces
+  `INVALID` / `INCOMPLETE`. Completes §7.3 for the TypeScript target, matching
+  corelib-py's `Field.subtype` and corelib-cpp's `fixType()`.
+
 - **Opt-in decode limits (corelib-ts#38).** A new optional `DecodeLimits`
   options object — `{ maxArrayCount?, maxStringLen?, maxBlobLen? }` — is accepted
   by every decode entry point: `decode(bytes, visitor, limits?)`, the `IStream`

@@ -67,6 +67,30 @@ export class Cursor {
   id = 0;
   /** Wire type of the header last accepted by {@link readHeader}. */
   wire = 0;
+  /**
+   * Fixlen subtype of the header last accepted by {@link readHeader} — one of
+   * {@link FixlenSubtype} — when its {@link wire} is {@link WireType.Fixlen} or
+   * {@link WireType.ArrayFixlen}; `-1` otherwise (a non-fixlen field, or a
+   * fixlen field whose subtype word is truncated away).
+   *
+   * The four fixlen subtypes (`fp32`, `fp64`, `string`, `blob`) all share one
+   * {@link wire} type, so {@link wire} alone cannot separate them. This is the
+   * companion accessor that can: a generated guard reads it right after
+   * {@link readHeader} to skip a field whose delivered subtype contradicts the
+   * schema (MESSAGE_SPEC §7.3), exactly as it already does on {@link wire} for
+   * the other kinds:
+   *
+   * ```ts
+   * case 9: if (c.wire !== WireType.Fixlen || c.fixSub !== FixlenSubtype.Fp64) {
+   *   c.skip(c.wire); break;
+   * } o.somefp64 = c.readFp64(); break;
+   * ```
+   *
+   * It is *peeked* — the subtype word is not consumed — so the matching typed
+   * reader (or {@link skip}) still reads and validates it, and a malformed or
+   * truncated word surfaces `INVALID` / `INCOMPLETE` there as before.
+   */
+  fixSub = -1;
 
   private readonly buf: Uint8Array;
   private readonly view: DataView;
@@ -146,6 +170,7 @@ export class Cursor {
     if (wire === WireType.SequenceStart) this.depth++;
     this.id = id;
     this.wire = wire;
+    this.fixSub = this.peekFixSub(wire);
     return true;
   }
 
@@ -367,6 +392,34 @@ export class Cursor {
   }
 
   // --- field helpers ------------------------------------------------------
+
+  /**
+   * Peek the delivered fixlen subtype of the field {@link readHeader} just
+   * accepted, **without advancing the cursor** — the readers / {@link skip}
+   * still re-read and validate the word. Returns one of {@link FixlenSubtype}
+   * (0..3), a reserved value (4..7), or `-1` when the wire is not a fixlen kind
+   * or the subtype word is truncated away.
+   *
+   * The subtype is the low 3 bits of the fixlen sub-header word, and the low
+   * bits of a LEB128 word live entirely in its **first** byte — so this only
+   * reads one byte, it never decodes a varint.
+   */
+  private peekFixSub(wire: number): number {
+    // Scalar fixlen: the sub-header is the byte right after the field header.
+    if (wire === WireType.Fixlen) {
+      return this.p < this.n ? this.buf[this.p]! & 7 : -1;
+    }
+    // Fixlen array: the element sub-header sits after the count varint (§4.8:
+    // always present, even for count 0), so step over the count's bytes first —
+    // a varint's last byte is the first one with the high bit clear.
+    if (wire === WireType.ArrayFixlen) {
+      let p = this.p;
+      while (p < this.n && this.buf[p]! >= 0x80) p++;
+      p++;
+      return p < this.n ? this.buf[p]! & 7 : -1;
+    }
+    return -1; // not a fixlen field
+  }
 
   /** Read and validate an array count word (0..ARRAY_MAX; §4.7/§4.8). */
   private arrayCount(): number {
