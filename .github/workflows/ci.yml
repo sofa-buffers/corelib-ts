@@ -15,7 +15,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: [20, 24]
+        # Every Node line that is still supported plus the current release:
+        #   20 = Iron   (EOL, still allowed by `engines: node >=20`)
+        #   22 = Jod    (LTS)
+        #   24 = Krypton(LTS)
+        #   26 = Current
+        node-version: [20, 22, 24, 26]
     steps:
       - uses: actions/checkout@v7
 
@@ -36,42 +41,103 @@ jobs:
       - name: Build (ESM + CJS + IIFE + types)
         run: npm run build
 
-  # Smoke-test the *built* bundle on every supported JS runtime. The library is
-  # dependency-free and uses only standard JS / Web APIs, so the shipped artifact
-  # must run unchanged on Node, Deno and Bun — this guards against an accidental
-  # Node-only API sneaking into src/. (The full vitest suite runs on Node above;
-  # re-running it per runtime would only duplicate that, and vitest-on-Deno is
-  # not well supported — a bundle smoke test is the right granularity here.)
-  cross-runtime:
+  # Smoke-test the *built* bundles. This is the only place dist/ is exercised —
+  # the vitest suite above covers src/ — so it is what stands between a broken
+  # tsup/exports config and a broken publish.
+  #
+  # Two axes matter, and they are not equally valuable:
+  #
+  #   * ARTIFACT (high value): package.json ships ESM + CJS + IIFE and resolves
+  #     them through an `exports` map. Each is a separate way for a build config
+  #     change to break consumers, and nothing else in CI looks at them.
+  #   * RUNTIME VERSION (low value): the bundle is dependency-free standard JS.
+  #     Whether Bun 1.1 or 1.3 loads it is near-zero risk, so we test the
+  #     boundaries (oldest Node that `engines` promises, newest Node) and the
+  #     current stable Deno/Bun rather than a broad version fan-out.
+  #
+  # Note that Node+Deno+Bun canNOT prove the bundle is runtime-agnostic: Deno 2
+  # and Bun implement the `node:` builtins and most Node globals deliberately,
+  # so an accidental `process`/`Buffer` dependency would pass on all three. The
+  # runtime that would catch it is the browser — covered by smoke-browser.mjs,
+  # which loads the IIFE with no Node globals in scope.
+  #
+  # The bundle is built once here and handed to the smoke jobs as an artifact,
+  # so those jobs need no npm install at all — they only ever see what a
+  # consumer would see.
+  smoke-build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-
       - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
       - run: npm ci
-
       - name: Build (produces the dist/ bundle the smoke test imports)
         run: npm run build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          retention-days: 1
 
-      - name: Smoke test on Node
+  smoke-node:
+    needs: smoke-build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The boundaries of what `engines: node >=20` promises: the oldest
+        # supported line and the current release. The lines in between are
+        # already covered by the full vitest suite in build-test.
+        node-version: [20, 26]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Smoke test ESM bundle + exports map
         run: node test/smoke.mjs
+      - name: Smoke test CJS bundle + exports map
+        run: node test/smoke.cjs
+      - name: Smoke test IIFE bundle without Node globals
+        run: node test/smoke-browser.mjs
 
-      - name: Set up Deno
-        uses: denoland/setup-deno@v2
+  smoke-deno:
+    needs: smoke-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-      - name: Smoke test on Deno
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Smoke test ESM bundle on Deno
         run: deno run --allow-read test/smoke.mjs
 
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
+  smoke-bun:
+    needs: smoke-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      - name: Smoke test on Bun
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Smoke test ESM bundle on Bun
         run: bun ./test/smoke.mjs
+      - name: Smoke test CJS bundle on Bun
+        run: bun ./test/smoke.cjs
 
   coverage:
     runs-on: ubuntu-latest
