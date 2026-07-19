@@ -386,24 +386,25 @@ export class Cursor {
    * (0..3), a reserved value (4..7), or `-1` when the wire is not a fixlen kind
    * or the subtype word is truncated away.
    *
-   * The subtype occupies the low 3 bits of the fixlen sub-header word, and the
-   * low bits of a LEB128 word live entirely in its **first** byte — so this
-   * only has to locate that byte, never decode the whole word. For a scalar
-   * {@link WireType.Fixlen} it is the byte right after the header
-   * (`this.p`); for a {@link WireType.ArrayFixlen} it is the byte after the
-   * count varint (§4.8: the element word is always present, even for count 0).
+   * The subtype is the low 3 bits of the fixlen sub-header word, and the low
+   * bits of a LEB128 word live entirely in its **first** byte — so this only
+   * reads one byte, it never decodes a varint.
    */
   private peekFixSub(wire: number): number {
-    let p = this.p;
-    if (wire === WireType.ArrayFixlen) {
-      // Step over the count varint to reach the element word: walk its
-      // continuation bytes (high bit set), then one past its terminal byte.
-      while (p < this.n && (this.buf[p]! & 0x80) !== 0) p++;
-      p++;
-    } else if (wire !== WireType.Fixlen) {
-      return -1;
+    // Scalar fixlen: the sub-header is the byte right after the field header.
+    if (wire === WireType.Fixlen) {
+      return this.p < this.n ? this.buf[this.p]! & 7 : -1;
     }
-    return p < this.n ? this.buf[p]! & 7 : -1;
+    // Fixlen array: the element sub-header sits after the count varint (§4.8:
+    // always present, even for count 0), so step over the count's bytes first —
+    // a varint's last byte is the first one with the high bit clear.
+    if (wire === WireType.ArrayFixlen) {
+      let p = this.p;
+      while (p < this.n && this.buf[p]! >= 0x80) p++;
+      p++;
+      return p < this.n ? this.buf[p]! & 7 : -1;
+    }
+    return -1; // not a fixlen field
   }
 
   /** Read and validate an array count word (0..ARRAY_MAX; §4.7/§4.8). */
