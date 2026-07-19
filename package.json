@@ -56,7 +56,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "smoke": "node test/smoke.mjs",
+    "smoke": "node test/smoke.mjs && node test/smoke.cjs && node test/smoke-browser.mjs",
     "coverage": "vitest run --coverage",
     "bench": "tsx bench/bench.ts",
     "perf": "tsx bench/perf.ts",
