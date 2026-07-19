@@ -7,8 +7,7 @@ ENV NODE_VERSION=${NODE_VERSION}
 # Make npm behave well in a container
 ENV NPM_CONFIG_FUND=false \
     NPM_CONFIG_AUDIT=false \
-    NPM_CONFIG_UPDATE_NOTIFIER=false \
-    CI=true
+    NPM_CONFIG_UPDATE_NOTIFIER=false
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
