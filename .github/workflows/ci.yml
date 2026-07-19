@@ -15,7 +15,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: [20, 24]
+        # Every Node line that is still supported plus the current release:
+        #   20 = Iron   (EOL, still allowed by `engines: node >=20`)
+        #   22 = Jod    (LTS)
+        #   24 = Krypton(LTS)
+        #   26 = Current
+        node-version: [20, 22, 24, 26]
     steps:
       - uses: actions/checkout@v7
 
@@ -42,35 +47,86 @@ jobs:
   # Node-only API sneaking into src/. (The full vitest suite runs on Node above;
   # re-running it per runtime would only duplicate that, and vitest-on-Deno is
   # not well supported — a bundle smoke test is the right granularity here.)
-  cross-runtime:
+  #
+  # The bundle is built once here and handed to the per-runtime smoke jobs as an
+  # artifact, so those jobs need no npm install at all — they only ever see what
+  # a consumer would see.
+  smoke-build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-
       - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
       - run: npm ci
-
       - name: Build (produces the dist/ bundle the smoke test imports)
         run: npm run build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          retention-days: 1
 
-      - name: Smoke test on Node
+  smoke-node:
+    needs: smoke-build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22, 24, 26]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Smoke test on Node ${{ matrix.node-version }}
         run: node test/smoke.mjs
 
-      - name: Set up Deno
-        uses: denoland/setup-deno@v2
+  smoke-deno:
+    needs: smoke-build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest Deno 2 line, the current 2.x, and the unreleased canary as an
+        # early warning. Canary is allowed to fail — it is not a release gate.
+        deno-version: [v2.0.x, v2.x, canary]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: denoland/setup-deno@v2
         with:
-          deno-version: v2.x
-      - name: Smoke test on Deno
+          deno-version: ${{ matrix.deno-version }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Smoke test on Deno ${{ matrix.deno-version }}
+        continue-on-error: ${{ matrix.deno-version == 'canary' }}
         run: deno run --allow-read test/smoke.mjs
 
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
+  smoke-bun:
+    needs: smoke-build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        bun-version: ['1.1.x', '1.2.x', latest, canary]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
-      - name: Smoke test on Bun
+          bun-version: ${{ matrix.bun-version }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Smoke test on Bun ${{ matrix.bun-version }}
+        continue-on-error: ${{ matrix.bun-version == 'canary' }}
         run: bun ./test/smoke.mjs
 
   coverage:
