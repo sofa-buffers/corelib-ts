@@ -138,6 +138,142 @@ describe("Cursor arrays", () => {
   });
 });
 
+// The delivered fixlen subtype, peeked by readHeader onto Cursor.fixSub, is the
+// companion to `wire`: it separates the four fixlen kinds (fp32/fp64/string/blob)
+// that all share WireType.Fixlen, so a generated guard can skip a fixlen field
+// whose subtype contradicts the schema (MESSAGE_SPEC §7.3) instead of throwing
+// from the wrong-typed reader (corelib-ts#58).
+describe("Cursor fixlen subtype accessor (§7.3; corelib-ts#58)", () => {
+  const FIXLEN = 2;
+  const ARRAY_FIXLEN = 5;
+  // FixlenSubtype: Fp32=0, Fp64=1, String=2, Blob=3.
+
+  it("reports the delivered subtype for each scalar fixlen kind", () => {
+    const os = new OStream();
+    os.writeFp32(1, 1.5);
+    os.writeFp64(2, 2.5);
+    os.writeString(3, "hi");
+    os.writeBlob(4, Uint8Array.from([0xaa]));
+
+    const c = new Cursor(os.bytes());
+    const got: Record<number, number> = {};
+    while (c.readHeader()) {
+      got[c.id] = c.fixSub;
+      c.skip(c.wire);
+    }
+    // Fp32=0, Fp64=1, String=2, Blob=3 — keyed by field id.
+    expect(got).toEqual({ 1: 0, 2: 1, 3: 2, 4: 3 });
+  });
+
+  it("reports the element subtype for fixlen arrays", () => {
+    const os = new OStream();
+    os.writeFp32Array(1, [1, 2]);
+    os.writeFp64Array(2, [3.5]);
+
+    const c = new Cursor(os.bytes());
+    const got: Record<number, number> = {};
+    while (c.readHeader()) {
+      got[c.id] = c.fixSub;
+      c.skip(c.wire);
+    }
+    expect(got).toEqual({ 1: 0 /* Fp32 */, 2: 1 /* Fp64 */ });
+  });
+
+  it("reports -1 for a non-fixlen field, and does not leak a stale subtype", () => {
+    const os = new OStream();
+    os.writeString(1, "x"); // sets fixSub = 2 (String)
+    os.writeUnsigned(2, 7n); // must reset fixSub to -1, not leak the 2
+
+    const c = new Cursor(os.bytes());
+    const got: Record<number, number> = {};
+    while (c.readHeader()) {
+      got[c.id] = c.fixSub;
+      c.skip(c.wire);
+    }
+    expect(got).toEqual({ 1: 2, 2: -1 });
+  });
+
+  it("lets a guard skip a wrong-subtype fixlen field instead of throwing (the issue's case)", () => {
+    // id 9, wire Fixlen, but a STRING subtype where the schema wants fp64: the
+    // §7.3 guard skips it. Then a real u32 follows and still decodes.
+    const os = new OStream();
+    os.writeString(9, "x"); // schema expects fp64 at id 9 — subtype contradicts it
+    os.writeUnsigned(4, 42n);
+
+    const c = new Cursor(os.bytes());
+    let u32 = 0 as number | bigint;
+    let skipped = false;
+    while (c.readHeader()) {
+      // Generated guard shape for an fp64 field at id 9.
+      if (c.id === 9) {
+        if (c.wire !== FIXLEN || c.fixSub !== 1 /* Fp64 */) {
+          c.skip(c.wire);
+          skipped = true;
+          continue;
+        }
+        c.readFp64();
+      } else if (c.id === 4) {
+        u32 = c.readUnsigned();
+      } else {
+        c.skip(c.wire);
+      }
+    }
+    expect(skipped).toBe(true);
+    expect(u32).toBe(42);
+  });
+
+  it("peeks without consuming: the matching reader still reads the value", () => {
+    const os = new OStream();
+    os.writeFp64(9, 3.5);
+
+    const c = new Cursor(os.bytes());
+    expect(c.readHeader()).toBe(true);
+    expect(c.fixSub).toBe(1); // Fp64, peeked
+    expect(c.fixSub).toBe(1); // idempotent — peeking did not advance
+    expect(c.readFp64()).toBe(3.5); // reader still consumes the word + payload
+    expect(c.readHeader()).toBe(false);
+  });
+
+  it("reports a reserved subtype verbatim (guard skips, then skip() rejects it)", () => {
+    // subtype 4 is reserved; the guard sees fixSub=4 (≠ any real subtype) and
+    // skips, and skip() then rejects the malformed word as INVALID (§5.2).
+    const buf = bytes(header(1, FIXLEN), fixlenSub(15, 4 /* reserved */));
+    const c = new Cursor(buf);
+    expect(c.readHeader()).toBe(true);
+    expect(c.fixSub).toBe(4);
+    expect(codeOf(() => c.skip(c.wire))).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  it("reports -1 when the subtype word is truncated away", () => {
+    // A Fixlen header with no following subtype word at all.
+    const c = new Cursor(bytes(header(1, FIXLEN)));
+    expect(c.readHeader()).toBe(true);
+    expect(c.fixSub).toBe(-1);
+    // The reader still surfaces the truncation.
+    expect(codeOf(() => c.readFp64())).toBe(SofabErrorCode.Incomplete);
+  });
+
+  it("reports -1 for an array-fixlen header truncated before its element word", () => {
+    // header + count varint, but the element (subtype) word is missing.
+    const c = new Cursor(bytes(header(1, ARRAY_FIXLEN), uvarint(3n)));
+    expect(c.readHeader()).toBe(true);
+    expect(c.fixSub).toBe(-1);
+  });
+
+  it("peeks the element subtype past a multi-byte array count", () => {
+    // A count large enough to encode as several LEB128 bytes, so the peek must
+    // walk the count varint's continuation bytes to find the element word.
+    const buf = bytes(
+      header(1, ARRAY_FIXLEN),
+      uvarint(300000n), // multi-byte count
+      fixlenSub(8, 1 /* Fp64 */),
+    );
+    const c = new Cursor(buf);
+    expect(c.readHeader()).toBe(true);
+    expect(c.fixSub).toBe(1);
+  });
+});
+
 describe("Cursor sequence depth (§7 outcome; corelib-ts#42)", () => {
   const SEQ_START = 6;
   const SEQ_END = 7;
