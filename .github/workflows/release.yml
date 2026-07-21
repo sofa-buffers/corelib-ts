@@ -1,29 +1,80 @@
 name: Release
 
 # Publish @sofa-buffers/corelib to npm whenever a GitHub Release is published.
-# Tag/version bookkeeping stays with the human who cuts the release; this
-# workflow only takes the already-tagged tree and ships it.
+#
+# The git tag is the single source of truth for the version: it is resolved
+# from the release tag, validated, checked against the registry, and injected
+# into package.json at build time. The version committed in package.json is
+# never trusted for the publish — the tag wins.
 on:
   release:
     types: [published]
 
-# Trusted Publishing (OIDC) instead of a long-lived npm token:
-#   * id-token: write  — lets the runner mint the short-lived OIDC token that
-#     npm exchanges for a one-off publish credential. No NPM_TOKEN secret.
-#   * contents: read   — checkout only; the release itself is already tagged.
-# The npm side must be configured once under the package's
-# Settings -> Trusted Publishing, pointing at this repo + `release.yml`
-# (and the `npm` environment below).
 permissions:
-  id-token: write
   contents: read
 
 jobs:
-  publish:
+  # Preflight gate. Fails the whole workflow *before* any build or publish so a
+  # bad tag surfaces here with a clear message instead of deep inside
+  # `npm publish`. Emits the resolved version for the publish job to consume.
+  guard:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Resolve and validate version from tag
+        id: resolve
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          # The tag is the truth. Strip an optional leading "v".
+          VERSION="${TAG#v}"
+          # Reject anything that is not plain semver (with optional
+          # prerelease / build metadata). A malformed tag must never reach
+          # `npm publish`.
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$TAG' does not resolve to a valid semver version ('$VERSION')."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved release version: $VERSION"
+
+      - name: Guard against republishing an existing version
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          # `npm view pkg@version version` prints the version if it exists and
+          # nothing (exit 0) if the package exists but this version does not.
+          # A missing package entirely (first publish) errors E404 -> treated
+          # as "not published", which is correct.
+          PUBLISHED="$(npm view "@sofa-buffers/corelib@$VERSION" version 2>/dev/null || true)"
+          if [ -n "$PUBLISHED" ]; then
+            echo "::error::@sofa-buffers/corelib@$VERSION is already on npm. Bump the version and cut a new tag."
+            exit 1
+          fi
+          echo "$VERSION is not yet on npm — clear to publish."
+
+  publish:
+    needs: guard
+    runs-on: ubuntu-latest
+    # Trusted Publishing (OIDC) instead of a long-lived npm token:
+    #   * id-token: write  — lets the runner mint the short-lived OIDC token
+    #     that npm exchanges for a one-off publish credential. No NPM_TOKEN.
+    #   * contents: read   — checkout only; the release is already tagged.
+    # The npm side is configured once under the package's
+    # Settings -> Trusted Publishing (repo + `release.yml` + `npm` environment).
+    permissions:
+      id-token: write
+      contents: read
     environment:
       name: npm
       url: https://www.npmjs.com/package/@sofa-buffers/corelib
+    env:
+      VERSION: ${{ needs.guard.outputs.version }}
     steps:
       - uses: actions/checkout@v7
 
@@ -42,9 +93,12 @@ jobs:
 
       - run: npm ci
 
-      # typecheck + test + build also run via prepublishOnly, but doing them as
-      # explicit steps surfaces a failure on the right line instead of burying
-      # it inside `npm publish`.
+      # Inject the tag-derived version into package.json. --no-git-tag-version
+      # keeps npm from touching git (the tag already exists); --allow-same-version
+      # makes this a no-op if package.json already matches, so it never fails.
+      - name: Inject version from tag
+        run: npm version "$VERSION" --no-git-tag-version --allow-same-version
+
       - name: Type-check
         run: npm run typecheck
 
