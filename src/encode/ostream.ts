@@ -313,6 +313,24 @@ export class OStream {
     }
   }
 
+  /**
+   * Write an fp32 array from its raw little-endian element payload. The bytes
+   * are emitted verbatim — no per-element `setFloat32` — so a signaling NaN
+   * survives bit-for-bit (§4.6), which {@link writeFp32Array} cannot guarantee
+   * because it re-quantizes each JS `number`. `payload.length` must be a
+   * multiple of 4; the element count is `payload.length / 4`.
+   */
+  writeFp32ArrayRaw(id: number, payload: Uint8Array): void {
+    if ((payload.length & 3) !== 0) {
+      throw argumentError(
+        `fp32 array payload length ${payload.length} is not a multiple of 4`,
+      );
+    }
+    this.arrayHead(id, WireType.ArrayFixlen, payload.length >> 2);
+    this.putVarintNum(4 * 8 + FixlenSubtype.Fp32);
+    this.writeRaw(payload);
+  }
+
   /** Write an array of IEEE-754 64-bit doubles. */
   writeFp64Array(id: number, values: ArrayLike<number>): void {
     this.arrayHead(id, WireType.ArrayFixlen, values.length);

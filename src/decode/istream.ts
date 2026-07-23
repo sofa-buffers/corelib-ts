@@ -44,9 +44,18 @@ export interface Visitor {
   unsigned?(id: number, value: number | bigint): void;
   /** A signed integer field. Number-first like {@link unsigned} (`|value| ≤ 2^53-1` ⇒ `number`). */
   signed?(id: number, value: number | bigint): void;
-  /** An IEEE-754 32-bit float field. */
-  fp32?(id: number, value: number): void;
-  /** An IEEE-754 64-bit double field. */
+  /**
+   * An IEEE-754 32-bit float field. `raw` is a zero-copy little-endian view of
+   * the exact 4 wire bytes; use it — not `value` — when the bytes must
+   * round-trip bit-for-bit (§4.6). `value` is a JS `number` (a 64-bit double),
+   * and widening a *signaling* NaN into a double quiets it (sets the is-quiet
+   * bit), so `value` cannot represent an fp32 sNaN faithfully. The view aliases
+   * the decoder's working buffer and is valid only for the duration of the call
+   * — copy it if you retain it, exactly as with a string/blob `chunk`. fp64
+   * needs no such channel: a double holds all 64 bits verbatim (see {@link fp64}).
+   */
+  fp32?(id: number, value: number, raw?: Uint8Array): void;
+  /** An IEEE-754 64-bit double field. `value` is exact — a double is 64 bits wide. */
   fp64?(id: number, value: number): void;
   /** A chunk of a UTF-8 string field. */
   string?(id: number, total: number, offset: number, chunk: Uint8Array): void;
@@ -58,9 +67,9 @@ export interface Visitor {
   arrayUnsigned?(id: number, index: number, value: number | bigint): void;
   /** One signed array element. Number-first like {@link signed}. */
   arraySigned?(id: number, index: number, value: number | bigint): void;
-  /** One fp32 array element. */
-  arrayFp32?(id: number, index: number, value: number): void;
-  /** One fp64 array element. */
+  /** One fp32 array element. `raw` is the element's 4 wire bytes — see {@link fp32}. */
+  arrayFp32?(id: number, index: number, value: number, raw?: Uint8Array): void;
+  /** One fp64 array element. `value` is exact — see {@link fp64}. */
   arrayFp64?(id: number, index: number, value: number): void;
   /** End of an array. */
   arrayEnd?(id: number): void;

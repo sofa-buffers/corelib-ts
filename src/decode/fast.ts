@@ -127,10 +127,18 @@ class FastDecoder {
           if (sub === FixlenSubtype.Fp32 || sub === FixlenSubtype.Fp64) {
             const want = sub === FixlenSubtype.Fp32 ? 4 : 8;
             if (len !== want) throw invalidMsgError("fixlen float length mismatch");
-            const value =
-              sub === FixlenSubtype.Fp32 ? this.readFp32() : this.readFp64();
-            if (sub === FixlenSubtype.Fp32) top.fp32?.(id, value);
-            else top.fp64?.(id, value);
+            if (sub === FixlenSubtype.Fp32) {
+              // Hand the visitor the raw 4 wire bytes too: `value` (a double)
+              // cannot carry an fp32 signaling NaN faithfully (§4.6; Visitor.fp32).
+              const p = this.p;
+              const value = this.readFp32();
+              top.fp32?.(id, value, this.buf.subarray(p, p + 4));
+            } else {
+              // Read into a local *before* the optional call: `v?.m(read())`
+              // would short-circuit and never advance when fp64 is absent.
+              const value = this.readFp64();
+              top.fp64?.(id, value);
+            }
           } else {
             const chunk = this.take(len);
             if (sub === FixlenSubtype.String) top.string?.(id, len, 0, chunk);
@@ -178,8 +186,9 @@ class FastDecoder {
           // absent handler, `v?.m(read())` would short-circuit and never advance.
           if (kind === ArrayKind.Fp32) {
             for (let i = 0; i < count; i++) {
+              const p = this.p;
               const value = this.readFp32();
-              top.arrayFp32?.(id, i, value);
+              top.arrayFp32?.(id, i, value, this.buf.subarray(p, p + 4));
             }
           } else {
             for (let i = 0; i < count; i++) {
