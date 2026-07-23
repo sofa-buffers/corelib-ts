@@ -11,6 +11,9 @@ import { ArrayKind, FixlenSubtype, OStream, type Visitor } from "../../src/index
 
 /** Decodes into an OStream so the round-tripped bytes can be compared to input. */
 export class TranscodeVisitor implements Visitor {
+  // Opt into raw fp32 bytes so a signaling NaN survives the re-encode (§4.6).
+  readonly fp32Raw = true;
+
   private array: {
     kind: ArrayKind;
     id: number;

@@ -128,11 +128,13 @@ class FastDecoder {
             const want = sub === FixlenSubtype.Fp32 ? 4 : 8;
             if (len !== want) throw invalidMsgError("fixlen float length mismatch");
             if (sub === FixlenSubtype.Fp32) {
-              // Hand the visitor the raw 4 wire bytes too: `value` (a double)
-              // cannot carry an fp32 signaling NaN faithfully (§4.6; Visitor.fp32).
+              // Hand the visitor the raw 4 wire bytes only when it opts in
+              // (Visitor.fp32Raw): `value` (a double) cannot carry an fp32
+              // signaling NaN faithfully (§4.6), but the per-value view is pure
+              // waste for the common value-only consumer, so it is not allocated.
               const p = this.p;
               const value = this.readFp32();
-              top.fp32?.(id, value, this.buf.subarray(p, p + 4));
+              top.fp32?.(id, value, top.fp32Raw ? this.buf.subarray(p, p + 4) : undefined);
             } else {
               // Read into a local *before* the optional call: `v?.m(read())`
               // would short-circuit and never advance when fp64 is absent.
@@ -185,10 +187,13 @@ class FastDecoder {
           // Read each element into a local *before* the optional call: with an
           // absent handler, `v?.m(read())` would short-circuit and never advance.
           if (kind === ArrayKind.Fp32) {
+            // Hoist the opt-in check out of the loop: a value-only consumer
+            // (Visitor.fp32Raw unset) allocates no per-element views.
+            const wantRaw = top.fp32Raw === true;
             for (let i = 0; i < count; i++) {
               const p = this.p;
               const value = this.readFp32();
-              top.arrayFp32?.(id, i, value, this.buf.subarray(p, p + 4));
+              top.arrayFp32?.(id, i, value, wantRaw ? this.buf.subarray(p, p + 4) : undefined);
             }
           } else {
             for (let i = 0; i < count; i++) {

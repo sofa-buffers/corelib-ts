@@ -108,6 +108,7 @@ describe("Visitor.fp32 raw channel vs. the quieted double (#66)", () => {
     let seenValue = 0;
     let seenRaw: Uint8Array | undefined;
     decode(os.bytes(), {
+      fp32Raw: true, // opt into the raw channel
       fp32(_id, value, raw) {
         seenValue = value;
         seenRaw = raw?.slice();
