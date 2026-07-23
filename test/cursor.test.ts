@@ -13,6 +13,7 @@ import {
   Cursor,
   I64_MAX,
   I64_MIN,
+  MAX_DEPTH,
   OStream,
   SofabError,
   SofabErrorCode,
@@ -334,6 +335,25 @@ describe("Cursor sequence depth (§7 outcome; corelib-ts#42)", () => {
     expect(() =>
       driveSkipping(bytes(header(10, SEQ_START), header(0, SEQ_END))),
     ).not.toThrow();
+  });
+
+  // §4.9/§6.2: nesting beyond MAX_DEPTH is INVALID regardless of what follows,
+  // so it dominates the unclosed-at-EOF INCOMPLETE (documentation#17). The
+  // guard lives in readHeader, so it is the recursion path — not skip() — that
+  // exercises the ceiling (corelib-ts#65).
+  it("accepts exactly MAX_DEPTH-deep nesting", () => {
+    const buf = bytes(
+      new Array<number>(MAX_DEPTH).fill(0x06), // MAX_DEPTH SequenceStart markers
+      new Array<number>(MAX_DEPTH).fill(0x07), // ...all closed
+    );
+    expect(() => driveRecursive(buf)).not.toThrow();
+  });
+
+  it("rejects nesting one past MAX_DEPTH as INVALID (recursion path)", () => {
+    // The 256th open exceeds the ceiling — rejected there, before EOF is reached,
+    // so INVALID dominates the INCOMPLETE these unclosed sequences would give.
+    const buf = bytes(new Array<number>(MAX_DEPTH + 1).fill(0x06));
+    expect(codeOf(() => driveRecursive(buf))).toBe(SofabErrorCode.InvalidMsg);
   });
 });
 

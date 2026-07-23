@@ -30,6 +30,7 @@ import {
   FIXLEN_MAX,
   FixlenSubtype,
   ID_MAX,
+  MAX_DEPTH,
   WireType,
 } from "../constants.js";
 import {
@@ -167,7 +168,16 @@ export class Cursor {
     }
     const id = this.upper();
     if (id > ID_MAX) throw invalidMsgError(`field id ${id} out of range`);
-    if (wire === WireType.SequenceStart) this.depth++;
+    if (wire === WireType.SequenceStart) {
+      // §4.9/§6.2: reject nesting deeper than MAX_DEPTH. `depth` counts open
+      // sequences (0 = root), so the (MAX_DEPTH + 1)-th open is the first to
+      // exceed the ceiling — mirrors fast.ts:197 / state.ts:334. INVALID
+      // dominates the unclosed-at-EOF INCOMPLETE (documentation#17).
+      if (this.depth >= MAX_DEPTH) {
+        throw invalidMsgError(`nesting exceeds MAX_DEPTH (${MAX_DEPTH})`);
+      }
+      this.depth++;
+    }
     this.id = id;
     this.wire = wire;
     this.fixSub = this.peekFixSub(wire);
