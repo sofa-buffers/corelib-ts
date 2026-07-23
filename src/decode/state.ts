@@ -173,8 +173,13 @@ export class DecoderState {
             this.fixSub === FixlenSubtype.Fp32
               ? unpackFp32(this.scratch, 0)
               : unpackFp64(this.scratch, 0);
-          if (this.fixSub === FixlenSubtype.Fp32) this.top().fp32?.(this.id, value);
-          else this.top().fp64?.(this.id, value);
+          if (this.fixSub === FixlenSubtype.Fp32) {
+            // Pass the raw 4 LE bytes (still in `scratch`) only when the visitor
+            // opts in (Visitor.fp32Raw): `value` (a double) would have quieted a
+            // signaling NaN (§4.6), but the view is waste for a value consumer.
+            const top = this.top();
+            top.fp32?.(this.id, value, top.fp32Raw ? this.scratch.subarray(0, 4) : undefined);
+          } else this.top().fp64?.(this.id, value);
           this.state = S.Header;
           break;
         }
@@ -274,8 +279,10 @@ export class DecoderState {
             this.arrKind === ArrayKind.Fp32
               ? unpackFp32(this.scratch, 0)
               : unpackFp64(this.scratch, 0);
-          if (this.arrKind === ArrayKind.Fp32) this.top().arrayFp32?.(this.id, this.arrIndex, value);
-          else this.top().arrayFp64?.(this.id, this.arrIndex, value);
+          if (this.arrKind === ArrayKind.Fp32) {
+            const top = this.top();
+            top.arrayFp32?.(this.id, this.arrIndex, value, top.fp32Raw ? this.scratch.subarray(0, 4) : undefined);
+          } else this.top().arrayFp64?.(this.id, this.arrIndex, value);
           this.have = 0;
           this.advanceArray();
           break;

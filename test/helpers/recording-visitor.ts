@@ -11,7 +11,15 @@ import { ArrayKind, FixlenSubtype, OStream, type Visitor } from "../../src/index
 
 /** Decodes into an OStream so the round-tripped bytes can be compared to input. */
 export class TranscodeVisitor implements Visitor {
-  private array: { kind: ArrayKind; id: number; vals: (bigint | number)[] } | null = null;
+  // Opt into raw fp32 bytes so a signaling NaN survives the re-encode (§4.6).
+  readonly fp32Raw = true;
+
+  private array: {
+    kind: ArrayKind;
+    id: number;
+    vals: (bigint | number)[];
+    raw: Uint8Array[];
+  } | null = null;
   private fix: { sub: FixlenSubtype; id: number; buf: Uint8Array; got: number } | null = null;
 
   constructor(private readonly out: OStream) {}
@@ -22,8 +30,12 @@ export class TranscodeVisitor implements Visitor {
   signed(id: number, value: number | bigint): void {
     this.out.writeSigned(id, value);
   }
-  fp32(id: number, value: number): void {
-    this.out.writeFp32(id, value);
+  fp32(id: number, value: number, raw?: Uint8Array): void {
+    // Re-emit the raw wire bytes verbatim: writeFp32(value) would re-quantize a
+    // signaling NaN through setFloat32 and quiet it (§4.6). writeFixlen copies
+    // `raw` synchronously, so the transient view is safe to pass through.
+    if (raw) this.out.writeFixlen(id, raw, FixlenSubtype.Fp32);
+    else this.out.writeFp32(id, value);
   }
   fp64(id: number, value: number): void {
     this.out.writeFp64(id, value);
@@ -37,7 +49,7 @@ export class TranscodeVisitor implements Visitor {
   }
 
   arrayBegin(id: number, kind: ArrayKind, _count: number): void {
-    this.array = { kind, id, vals: [] };
+    this.array = { kind, id, vals: [], raw: [] };
   }
   arrayUnsigned(_id: number, _index: number, value: number | bigint): void {
     this.array!.vals.push(value);
@@ -45,8 +57,10 @@ export class TranscodeVisitor implements Visitor {
   arraySigned(_id: number, _index: number, value: number | bigint): void {
     this.array!.vals.push(value);
   }
-  arrayFp32(_id: number, _index: number, value: number): void {
+  arrayFp32(_id: number, _index: number, value: number, raw?: Uint8Array): void {
     this.array!.vals.push(value);
+    // Copy: on the streaming path `raw` aliases a scratch buffer reused per element.
+    if (raw) this.array!.raw.push(raw.slice());
   }
   arrayFp64(_id: number, _index: number, value: number): void {
     this.array!.vals.push(value);
@@ -56,8 +70,15 @@ export class TranscodeVisitor implements Visitor {
     this.array = null;
     if (a.kind === ArrayKind.Unsigned) this.out.writeUnsignedArray(id, a.vals);
     else if (a.kind === ArrayKind.Signed) this.out.writeSignedArray(id, a.vals);
-    else if (a.kind === ArrayKind.Fp32) this.out.writeFp32Array(id, a.vals as number[]);
-    else this.out.writeFp64Array(id, a.vals as number[]);
+    else if (a.kind === ArrayKind.Fp32) {
+      // Bit-exact re-emit from the raw element bytes (preserves an sNaN element);
+      // fall back to values only if the decoder gave no raw channel.
+      if (a.raw.length === a.vals.length) {
+        const payload = new Uint8Array(a.raw.length * 4);
+        a.raw.forEach((b, k) => payload.set(b, k * 4));
+        this.out.writeFp32ArrayRaw(id, payload);
+      } else this.out.writeFp32Array(id, a.vals as number[]);
+    } else this.out.writeFp64Array(id, a.vals as number[]);
   }
 
   sequenceBegin(id: number): Visitor {
