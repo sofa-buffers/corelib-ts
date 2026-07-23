@@ -208,9 +208,15 @@ export class Cursor {
     return this.rawFp64();
   }
 
-  /** Read a UTF-8 string scalar (wire {@link WireType.Fixlen}, subtype string). */
-  readString(): string {
-    const len = this.fixlenLen(FixlenSubtype.String);
+  /**
+   * Read a UTF-8 string scalar (wire {@link WireType.Fixlen}, subtype string).
+   * Pass the schema `maxlen` (byte length) for a bounded string so an
+   * over-length is rejected as `INVALID` at the header, before the payload is
+   * taken (see {@link fixlenLen}); the wire length is exactly the UTF-8 byte
+   * length, so the check is exact. Omit for an unbounded string.
+   */
+  readString(schemaMaxlen?: number): string {
+    const len = this.fixlenLen(FixlenSubtype.String, schemaMaxlen);
     // take() (truncation → INCOMPLETE) runs before the decode, so a short
     // payload stays INCOMPLETE; only genuinely malformed UTF-8 bytes reach the
     // fatal decoder. Its TypeError becomes the INVALID outcome (§8/§6.4/§5.2).
@@ -226,14 +232,19 @@ export class Cursor {
    * Read a blob scalar (wire {@link WireType.Fixlen}, subtype blob) as a
    * zero-copy {@link Uint8Array} view into the source buffer.
    */
-  readBlob(): Uint8Array {
-    const len = this.fixlenLen(FixlenSubtype.Blob);
+  readBlob(schemaMaxlen?: number): Uint8Array {
+    const len = this.fixlenLen(FixlenSubtype.Blob, schemaMaxlen);
     return this.take(len);
   }
 
-  /** Read an unsigned array (wire {@link WireType.ArrayUnsigned}), number-first per element. */
-  readUnsignedArray(): (number | bigint)[] {
-    const count = this.arrayCount();
+  /**
+   * Read an unsigned array (wire {@link WireType.ArrayUnsigned}), number-first
+   * per element. Pass the schema `count` for a bounded array so an over-count is
+   * rejected as `INVALID` at the header (see {@link arrayCount}); omit it for an
+   * unbounded array (today's behavior).
+   */
+  readUnsignedArray(schemaCount?: number): (number | bigint)[] {
+    const count = this.arrayCount(schemaCount);
     const out: (number | bigint)[] = new Array(count);
     for (let i = 0; i < count; i++) {
       this.readVarint();
@@ -243,8 +254,8 @@ export class Cursor {
   }
 
   /** Read a signed array (wire {@link WireType.ArraySigned}), zig-zag, number-first per element. */
-  readSignedArray(): (number | bigint)[] {
-    const count = this.arrayCount();
+  readSignedArray(schemaCount?: number): (number | bigint)[] {
+    const count = this.arrayCount(schemaCount);
     const out: (number | bigint)[] = new Array(count);
     for (let i = 0; i < count; i++) {
       this.readVarint();
@@ -258,8 +269,8 @@ export class Cursor {
    * Each element keeps the raw lo/hi halves; call {@link Long.toBigInt} to
    * materialise only the values the caller actually needs.
    */
-  readUnsignedArrayLong(): Long[] {
-    const count = this.arrayCount();
+  readUnsignedArrayLong(schemaCount?: number): Long[] {
+    const count = this.arrayCount(schemaCount);
     const out = new Array<Long>(count);
     for (let i = 0; i < count; i++) {
       this.readVarint();
@@ -269,8 +280,8 @@ export class Cursor {
   }
 
   /** Read a signed 64-bit array (zig-zag) into {@link Long}[] — the `bigint`-free path. */
-  readSignedArrayLong(): Long[] {
-    const count = this.arrayCount();
+  readSignedArrayLong(schemaCount?: number): Long[] {
+    const count = this.arrayCount(schemaCount);
     const out = new Array<Long>(count);
     for (let i = 0; i < count; i++) {
       this.readVarint();
@@ -283,16 +294,16 @@ export class Cursor {
   }
 
   /** Read an fp32 array (wire {@link WireType.ArrayFixlen}, element subtype fp32). */
-  readFp32Array(): number[] {
-    const count = this.arrayFixlenHeader(FixlenSubtype.Fp32, 4);
+  readFp32Array(schemaCount?: number): number[] {
+    const count = this.arrayFixlenHeader(FixlenSubtype.Fp32, 4, schemaCount);
     const out: number[] = new Array(count);
     for (let i = 0; i < count; i++) out[i] = this.rawFp32();
     return out;
   }
 
   /** Read an fp64 array (wire {@link WireType.ArrayFixlen}, element subtype fp64). */
-  readFp64Array(): number[] {
-    const count = this.arrayFixlenHeader(FixlenSubtype.Fp64, 8);
+  readFp64Array(schemaCount?: number): number[] {
+    const count = this.arrayFixlenHeader(FixlenSubtype.Fp64, 8, schemaCount);
     const out: number[] = new Array(count);
     for (let i = 0; i < count; i++) out[i] = this.rawFp64();
     return out;
@@ -431,11 +442,28 @@ export class Cursor {
     return -1; // not a fixlen field
   }
 
-  /** Read and validate an array count word (0..ARRAY_MAX; §4.7/§4.8). */
-  private arrayCount(): number {
+  /**
+   * Read and validate an array count word (0..ARRAY_MAX; §4.7/§4.8). When a
+   * `schemaCount` is given, a count above it is a schema-bound violation and is
+   * rejected as `INVALID` — see the check below.
+   */
+  private arrayCount(schemaCount?: number): number {
     this.readVarint();
     const count = this.num();
     if (count > ARRAY_MAX) throw invalidMsgError("array count out of range");
+    // §5.2/§7 (corelib-ts#69): a count above the field's schema capacity is a
+    // malformed message (INVALID) and MUST dominate the truncated-array
+    // INCOMPLETE below — so the deciding count word is bound-checked here, at
+    // the header, before the `count > remaining` guard a truncated over-count
+    // would otherwise trip first (anti-folding: INVALID over INCOMPLETE). It
+    // also precedes the LIMIT_EXCEEDED cap, keeping the precedence INVALID >
+    // LIMIT_EXCEEDED > INCOMPLETE. An unset bound (skip paths, unbounded
+    // arrays) preserves today's behavior; when the generator passes the schema
+    // count this is a predicted-false integer compare on valid data — no hot-
+    // path cost.
+    if (schemaCount !== undefined && count > schemaCount) {
+      throw invalidMsgError("array count above schema capacity");
+    }
     if (count > this.maxArrayCount) {
       throw limitExceededError(
         `array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`,
@@ -461,13 +489,28 @@ export class Cursor {
     if (len !== wantLen) throw invalidMsgError("fixlen float length mismatch");
   }
 
-  /** Read a scalar fixlen sub-header for a string/blob, asserting subtype; returns byte length. */
-  private fixlenLen(wantSub: number): number {
+  /**
+   * Read a scalar fixlen sub-header for a string/blob, asserting subtype;
+   * returns the byte length. When a `schemaMaxlen` is given, a length above it
+   * is a schema-bound violation and is rejected as `INVALID` — see below.
+   */
+  private fixlenLen(wantSub: number, schemaMaxlen?: number): number {
     this.readVarint();
     const sub = this.lo & 7;
     const len = this.upper();
     if (sub !== wantSub) throw invalidMsgError(`invalid fixlen subtype ${sub}`);
     if (len > FIXLEN_MAX) throw invalidMsgError("fixlen length out of range");
+    // §5.2/§7.1 (corelib-ts#69): a declared length above the field's schema
+    // maxlen is a malformed message (INVALID) and MUST dominate the truncated-
+    // payload INCOMPLETE that take() raises below — so the deciding length word
+    // is bound-checked here, before the payload is taken (anti-folding: INVALID
+    // over INCOMPLETE), and before the LIMIT_EXCEEDED cap (INVALID > LIMIT_
+    // EXCEEDED > INCOMPLETE). For a string the wire len is exactly its UTF-8
+    // byte length, so this header check is exact. An unset bound preserves
+    // today's behavior; a predicted-false compare on valid data.
+    if (schemaMaxlen !== undefined && len > schemaMaxlen) {
+      throw invalidMsgError("fixlen length above schema maxlen");
+    }
     // Opt-in length cap (corelib-ts#38), enforced at the header before the
     // payload is taken. wantSub tells string from blob, so the right limit
     // applies to each.
@@ -484,8 +527,16 @@ export class Cursor {
     return len;
   }
 
-  /** Read an array fixlen element header (count + element type); returns the count. */
-  private arrayFixlenHeader(wantSub: number, wantSize: number): number {
+  /**
+   * Read an array fixlen element header (count + element type); returns the
+   * count. When a `schemaCount` is given, a count above it is a schema-bound
+   * violation and is rejected as `INVALID` — see below.
+   */
+  private arrayFixlenHeader(
+    wantSub: number,
+    wantSize: number,
+    schemaCount?: number,
+  ): number {
     // §4.8: a fixlen array always carries its element-length word — even when
     // empty — so the element kind stays known. count may then be 0.
     //
@@ -499,6 +550,14 @@ export class Cursor {
     this.readVarint();
     const count = this.num();
     if (count > ARRAY_MAX) throw invalidMsgError("array count out of range");
+    // §5.2/§7 (corelib-ts#69): as in {@link arrayCount}, a count above the
+    // field's schema capacity is INVALID and dominates both the LIMIT_EXCEEDED
+    // cap and the truncated-array INCOMPLETE guard below. A coincident malformed
+    // element word is likewise INVALID, so the outcome is unaffected by checking
+    // the count before the element word is read.
+    if (schemaCount !== undefined && count > schemaCount) {
+      throw invalidMsgError("array count above schema capacity");
+    }
     if (count > this.maxArrayCount) {
       throw limitExceededError(
         `array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`,

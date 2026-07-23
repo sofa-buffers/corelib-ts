@@ -62,6 +62,7 @@
     "smoke": "node test/smoke.mjs && node test/smoke.cjs && node test/smoke-browser.mjs",
     "coverage": "vitest run --coverage",
     "bench": "tsx bench/bench.ts",
+    "bench:bound": "tsx bench/bound.ts",
     "perf": "tsx bench/perf.ts",
     "bench:callgrind": "bash bench/run_callgrind.sh",
     "docs": "typedoc",

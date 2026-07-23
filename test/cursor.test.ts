@@ -730,6 +730,165 @@ describe("Cursor read fixlen-array validation (§5.2 precedence; corelib-ts#51)"
   });
 });
 
+// A field that is BOTH a schema-bound violation (over-count / over-maxlen) AND
+// truncated must be INVALID, never INCOMPLETE — INVALID dominates INCOMPLETE
+// (MESSAGE_SPEC §5.2 anti-folding; §6.2/§7 over-count, §7.1 over-maxlen). The
+// whole-unit readers now take the per-field schema bound and reject at the
+// deciding count/length word, before their own truncation guard fires
+// (corelib-ts#69; generator side sofa-buffers/generator#216). The reproduction
+// vectors are the wire-level table from the issue: field id 15, count bound 4.
+describe("Cursor schema-bound reject at header (§5.2 precedence; corelib-ts#69)", () => {
+  // 0x7b = header(15, ArrayUnsigned): (15 << 3) | 3.
+  it("rejects a truncated over-count unsigned array as INVALID, not INCOMPLETE", () => {
+    // count 6 (> bound 4) then EOF after two element bytes: complete-message
+    // over-count is already INVALID; this asserts the truncated twin is too.
+    const buf = bytes(header(15, 3 /* ArrayUnsigned */), uvarint(6n), [0x01, 0x02]);
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.readUnsignedArray(4);
+      }),
+    ).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  // Control: count == bound, then a truncated payload, stays INCOMPLETE — the
+  // bound check must not over-reject a well-formed-but-short array.
+  it("still reports INCOMPLETE for a count == bound array that truncates", () => {
+    const buf = bytes(header(15, 3 /* ArrayUnsigned */), uvarint(4n), [0x01, 0x02]);
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.readUnsignedArray(4);
+      }),
+    ).toBe(SofabErrorCode.Incomplete);
+  });
+
+  it("rejects a truncated over-count signed array as INVALID", () => {
+    const buf = bytes(header(15, 4 /* ArraySigned */), uvarint(6n), [0x02]);
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.readSignedArray(4);
+      }),
+    ).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  it("rejects a truncated over-count array on the Long paths as INVALID", () => {
+    const un = bytes(header(15, 3 /* ArrayUnsigned */), uvarint(6n), [0x01]);
+    expect(
+      codeOf(() => {
+        const c = new Cursor(un);
+        c.readHeader();
+        c.readUnsignedArrayLong(4);
+      }),
+    ).toBe(SofabErrorCode.InvalidMsg);
+    const si = bytes(header(15, 4 /* ArraySigned */), uvarint(6n), [0x01]);
+    expect(
+      codeOf(() => {
+        const c = new Cursor(si);
+        c.readHeader();
+        c.readSignedArrayLong(4);
+      }),
+    ).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  it("rejects a truncated over-count fp64 array as INVALID", () => {
+    // count 6 (> bound 4), valid fp64 element word, no payload → truncated.
+    const buf = bytes(
+      header(15, 5 /* ArrayFixlen */),
+      uvarint(6n),
+      fixlenSub(8, 1 /* Fp64 */),
+    );
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.readFp64Array(4);
+      }),
+    ).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  it("still reports INCOMPLETE for a count == bound fp64 array that truncates", () => {
+    const buf = bytes(
+      header(15, 5 /* ArrayFixlen */),
+      uvarint(4n),
+      fixlenSub(8, 1 /* Fp64 */),
+    );
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.readFp64Array(4);
+      }),
+    ).toBe(SofabErrorCode.Incomplete);
+  });
+
+  it("rejects a truncated over-maxlen string as INVALID, not INCOMPLETE", () => {
+    // declared length 6 (> maxlen 4), only two payload bytes → truncated.
+    const buf = bytes(
+      header(15, 2 /* Fixlen */),
+      fixlenSub(6, 2 /* String */),
+      [0x61, 0x62],
+    );
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.readString(4);
+      }),
+    ).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  it("still reports INCOMPLETE for a length == maxlen string that truncates", () => {
+    const buf = bytes(
+      header(15, 2 /* Fixlen */),
+      fixlenSub(4, 2 /* String */),
+      [0x61, 0x62],
+    );
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.readString(4);
+      }),
+    ).toBe(SofabErrorCode.Incomplete);
+  });
+
+  it("rejects a truncated over-maxlen blob as INVALID", () => {
+    const buf = bytes(
+      header(15, 2 /* Fixlen */),
+      fixlenSub(6, 3 /* Blob */),
+      [0x61, 0x62],
+    );
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.readBlob(4);
+      }),
+    ).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  // Reading exactly at the bound with a complete payload still yields the value:
+  // the bound is a ceiling (count/len may equal it), not a strict cap.
+  it("reads a bound-sized array and string unchanged when complete", () => {
+    const arr = bytes(header(15, 3 /* ArrayUnsigned */), uvarint(4n), [1, 2, 3, 4]);
+    const ca = new Cursor(arr);
+    ca.readHeader();
+    expect(ca.readUnsignedArray(4)).toEqual([1, 2, 3, 4]);
+
+    const str = bytes(header(15, 2 /* Fixlen */), fixlenSub(4, 2 /* String */), [
+      0x61, 0x62, 0x63, 0x64,
+    ]);
+    const cs = new Cursor(str);
+    cs.readHeader();
+    expect(cs.readString(4)).toBe("abcd");
+  });
+});
+
 describe("Cursor array errors", () => {
   it("rejects an array count past ARRAY_MAX", () => {
     const buf = bytes(header(1, 3 /* ArrayUnsigned */), uvarint(BigInt(ARRAY_MAX) + 1n));
