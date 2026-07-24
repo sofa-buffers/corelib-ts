@@ -355,6 +355,26 @@ describe("Cursor sequence depth (§7 outcome; corelib-ts#42)", () => {
     const buf = bytes(new Array<number>(MAX_DEPTH + 1).fill(0x06));
     expect(codeOf(() => driveRecursive(buf))).toBe(SofabErrorCode.InvalidMsg);
   });
+
+  // The skip path (skipSequence) must honour the same ceiling as the recursion
+  // path: a subtree skipped on a wire-type mismatch is what the Crucible F-0029
+  // reproducer exercises (300x 0x06 on a scalar field → c.skip(SequenceStart)),
+  // and the readHeader-only guard left it reporting INCOMPLETE (corelib-ts#65).
+  it("accepts exactly MAX_DEPTH-deep nesting (skip path)", () => {
+    const buf = bytes(
+      new Array<number>(MAX_DEPTH).fill(0x06), // MAX_DEPTH SequenceStart markers
+      new Array<number>(MAX_DEPTH).fill(0x07), // ...all closed
+    );
+    expect(() => driveSkipping(buf)).not.toThrow();
+  });
+
+  it("rejects nesting one past MAX_DEPTH as INVALID (skip path)", () => {
+    // readHeader accepts the first open (depth 0→1), then c.skip descends the
+    // rest through skipSequence; the 256th open exceeds the ceiling and is
+    // rejected there, before EOF, so INVALID dominates the unbalanced INCOMPLETE.
+    const buf = bytes(new Array<number>(MAX_DEPTH + 1).fill(0x06));
+    expect(codeOf(() => driveSkipping(buf))).toBe(SofabErrorCode.InvalidMsg);
+  });
 });
 
 describe("Cursor nested sequences", () => {
