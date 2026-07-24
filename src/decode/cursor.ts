@@ -407,8 +407,22 @@ export class Cursor {
       }
       const id = this.upper();
       if (id > ID_MAX) throw invalidMsgError(`field id ${id} out of range`);
-      if (wire === WireType.SequenceStart) depth++;
-      else this.skipValue(wire);
+      if (wire === WireType.SequenceStart) {
+        // §4.9/§6.2: the skip path must honour the same MAX_DEPTH ceiling as the
+        // read path ({@link readHeader}), else a subtree skipped on a wire-type
+        // mismatch could nest past MAX_DEPTH and fall through to the unbalanced-
+        // at-EOF INCOMPLETE above instead of INVALID — the F-0029 divergence the
+        // readHeader-only fix left in this path (corelib-ts#65). `this.depth`
+        // counts the opens *above* this skip (readHeader already accepted the
+        // entry sequence, which the local `depth == 1` aliases), so the true
+        // nesting is `this.depth + depth - 1`; the next open must not exceed it.
+        if (this.depth + depth - 1 >= MAX_DEPTH) {
+          throw invalidMsgError(`nesting exceeds MAX_DEPTH (${MAX_DEPTH})`);
+        }
+        depth++;
+      } else {
+        this.skipValue(wire);
+      }
     }
   }
 
