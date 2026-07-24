@@ -14,6 +14,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  Cursor,
   FixlenSubtype,
   IStream,
   OStream,
@@ -98,6 +99,74 @@ describe("fp32 float payloads round-trip bit-for-bit (§4.6; #66)", () => {
       });
     });
   }
+});
+
+// The pull (Cursor) decoder is the third decode surface, alongside the two
+// visitor drivers above. Its value readers (readFp32 / readFp32Array) return a
+// JS `number` and so quiet an fp32 sNaN identically; the bit-preserving
+// companions (readFp32Raw / readFp32ArrayRaw) are what let generated bit-exact
+// decode round-trip one on this path (corelib-ts#66).
+describe("Cursor fp32 raw readers round-trip bit-for-bit (§4.6; #66)", () => {
+  it("preserves a scalar signaling NaN via readFp32Raw", () => {
+    const os = new OStream();
+    os.writeFixlen(7, FP32_SNAN, FixlenSubtype.Fp32);
+    const wire = os.bytes();
+
+    const c = new Cursor(wire);
+    expect(c.readHeader()).toBe(true);
+    const raw = c.readFp32Raw();
+    expect(bytesToHex(raw)).toBe(bytesToHex(FP32_SNAN)); // …80 7f, not …c0 7f
+
+    // Re-encode from the raw bytes and confirm the wire is byte-identical.
+    const out = new OStream();
+    out.writeFixlen(7, raw, FixlenSubtype.Fp32);
+    expect(bytesToHex(out.bytes())).toBe(bytesToHex(wire));
+  });
+
+  it("the scalar value reader (readFp32) still quiets the sNaN — why Raw exists", () => {
+    const os = new OStream();
+    os.writeFixlen(7, FP32_SNAN, FixlenSubtype.Fp32);
+
+    const c = new Cursor(os.bytes());
+    c.readHeader();
+    const value = c.readFp32();
+    const dv = new DataView(new ArrayBuffer(4));
+    dv.setFloat32(0, value, true);
+    expect(dv.getUint32(0, true)).toBe(0x7fc00001);
+  });
+
+  it("preserves a signaling NaN element via readFp32ArrayRaw", () => {
+    const payload = new Uint8Array(8);
+    payload.set(FP32_SNAN, 0);
+    payload.set(FP32_NORMAL, 4);
+    const os = new OStream();
+    os.writeFp32ArrayRaw(5, payload);
+    const wire = os.bytes();
+
+    const c = new Cursor(wire);
+    expect(c.readHeader()).toBe(true);
+    const raw = c.readFp32ArrayRaw();
+    expect(bytesToHex(raw)).toBe(bytesToHex(payload));
+
+    const out = new OStream();
+    out.writeFp32ArrayRaw(5, raw);
+    expect(bytesToHex(out.bytes())).toBe(bytesToHex(wire));
+  });
+
+  it("preserves quiet, negative-quiet and normal scalars via readFp32Raw", () => {
+    for (const bits of [FP32_QNAN, FP32_NEG_QNAN, FP32_NORMAL]) {
+      const os = new OStream();
+      os.writeFixlen(3, bits, FixlenSubtype.Fp32);
+      const wire = os.bytes();
+
+      const c = new Cursor(wire);
+      c.readHeader();
+      const raw = c.readFp32Raw();
+      const out = new OStream();
+      out.writeFixlen(3, raw, FixlenSubtype.Fp32);
+      expect(bytesToHex(out.bytes())).toBe(bytesToHex(wire));
+    }
+  });
 });
 
 describe("Visitor.fp32 raw channel vs. the quieted double (#66)", () => {

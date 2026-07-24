@@ -202,6 +202,27 @@ export class Cursor {
     return this.rawFp32();
   }
 
+  /**
+   * Read a 32-bit float scalar as its raw 4 wire bytes (little-endian), zero-copy
+   * — the bit-preserving companion to {@link readFp32}.
+   *
+   * {@link readFp32} returns a JS `number` (a 64-bit double), and widening an
+   * fp32 *signaling* NaN into a double quiets it (0x7F800001 → 0x7FC00001), so a
+   * value consumer can never round-trip one bit-for-bit (§4.6). Generated
+   * bit-exact decode reads the bytes here instead and re-emits them verbatim with
+   * {@link OStream.writeFixlen} (subtype fp32) — mirroring the visitor `raw`
+   * channel on the push paths (fast.ts / state.ts), which the pull path was
+   * missing (corelib-ts#66).
+   *
+   * The header (subtype fp32, length 4) is validated exactly as in
+   * {@link readFp32}; the returned view aliases the source buffer, valid only
+   * until it is reused, like {@link readBlob}.
+   */
+  readFp32Raw(): Uint8Array {
+    this.fixlenHeader(FixlenSubtype.Fp32, 4);
+    return this.take(4);
+  }
+
   /** Read a 64-bit float scalar (wire {@link WireType.Fixlen}, subtype fp64). */
   readFp64(): number {
     this.fixlenHeader(FixlenSubtype.Fp64, 8);
@@ -299,6 +320,21 @@ export class Cursor {
     const out: number[] = new Array(count);
     for (let i = 0; i < count; i++) out[i] = this.rawFp32();
     return out;
+  }
+
+  /**
+   * Read an fp32 array as its raw little-endian element payload (`count * 4`
+   * bytes), zero-copy — the bit-preserving companion to {@link readFp32Array}.
+   * Widening each element to a JS `number` quiets an fp32 *signaling* NaN just as
+   * on the scalar path (§4.6; see {@link readFp32Raw}), so bit-exact decode reads
+   * the whole payload here and re-emits it with {@link OStream.writeFp32ArrayRaw}
+   * (corelib-ts#66). The header (element subtype fp32, size 4) is validated
+   * exactly as in {@link readFp32Array}; the returned view aliases the source
+   * buffer, like {@link readBlob}.
+   */
+  readFp32ArrayRaw(schemaCount?: number): Uint8Array {
+    const count = this.arrayFixlenHeader(FixlenSubtype.Fp32, 4, schemaCount);
+    return this.take(count * 4);
   }
 
   /** Read an fp64 array (wire {@link WireType.ArrayFixlen}, element subtype fp64). */
