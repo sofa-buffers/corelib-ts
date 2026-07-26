@@ -12,10 +12,10 @@ import { IStream, OStream, decode, type Visitor } from "../src/index.js";
 function build(os: OStream): void {
   os.writeUnsigned(1, 100);
   os.writeString(2, "skip-me");
-  os.writeSequenceBegin(3); // <- whole sub-sequence to be skipped
+  os.writeSequenceBeginLazy(3); // <- whole sub-sequence to be skipped
   os.writeUnsigned(1, 1);
   os.writeSignedArray(2, [-1, -2, -3]);
-  os.writeSequenceBegin(4); // nested deeper
+  os.writeSequenceBeginLazy(4); // nested deeper
   os.writeFp64(1, 2.5);
   os.writeSequenceEnd();
   os.writeSequenceEnd();

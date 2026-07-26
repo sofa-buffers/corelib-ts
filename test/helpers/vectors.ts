@@ -70,7 +70,16 @@ export function loadInvalidUtf8(): InvalidUtf8Vector[] {
   return doc.invalid_utf8 ?? [];
 }
 
-/** Replay a vector's fields onto `os`, exercising the public writer surface. */
+/**
+ * Replay a vector's fields onto `os`, exercising the public writer surface.
+ *
+ * A vector's `serialized` form is the primitive-layer ground truth and always
+ * carries the frame, so every `sequence_end` op closes with
+ * {@link OStream.writeSequenceEndKeep}: identical bytes once the sequence has
+ * content, and the empty-sequence vectors keep their `begin`+`end` pair instead
+ * of vanishing (MESSAGE_SPEC §2). The sparse-canonical form the new closer
+ * produces is the vectors' separate `serialized_sparse` field.
+ */
 export function encodeFields(os: OStream, fields: Field[]): void {
   for (const f of fields) {
     const id = Number(f.id ?? 0);
@@ -100,10 +109,10 @@ export function encodeFields(os: OStream, fields: Field[]): void {
         encodeArray(os, id, f.element_type!, f.values!);
         break;
       case "sequence_begin":
-        os.writeSequenceBegin(id);
+        os.writeSequenceBeginLazy(id);
         break;
       case "sequence_end":
-        os.writeSequenceEnd();
+        os.writeSequenceEndKeep();
         break;
       default:
         throw new Error(`unknown vector op: ${f.op}`);

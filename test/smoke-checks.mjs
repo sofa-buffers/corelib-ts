@@ -45,7 +45,7 @@ export function runChecks(api, label) {
   os.writeUnsignedArray(9, [10, 20, 30]);
   os.writeSignedArray(10, [-1, -2]);
   os.writeFp64Array(11, [1.25, -3.5]);
-  os.writeSequenceBegin(12);
+  os.writeSequenceBeginLazy(12);
   os.writeUnsigned(1, 99);
   os.writeSequenceEnd();
   const bytes = os.bytes().slice();
@@ -104,8 +104,10 @@ export function runChecks(api, label) {
         else if (a.kind === 2) out.writeFp32Array(id, a.vals);
         else out.writeFp64Array(id, a.vals);
       },
-      sequenceBegin(id) { out.writeSequenceBegin(id); return this; },
-      sequenceEnd() { out.writeSequenceEnd(); },
+      // endKeep, not end: a transcode must reproduce its input byte for byte,
+      // including an empty frame the input may legitimately carry (§2/§5.1).
+      sequenceBegin(id) { out.writeSequenceBeginLazy(id); return this; },
+      sequenceEnd() { out.writeSequenceEndKeep(); },
     };
     decode(bytes, transcode);
     return hex(out.bytes()) === hex(bytes);

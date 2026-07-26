@@ -119,6 +119,13 @@ describe("encoder rejects bad arguments", () => {
     expect(codeOf(() => new OStream().writeUnsigned(ID_MAX + 1, 0))).toBe(SofabErrorCode.Argument);
   });
 
+  it("sequence-begin field id out of range", () => {
+    // A lazily-opened sequence may never write its header, so the id is checked
+    // at the call that supplied it rather than at commit time.
+    expect(codeOf(() => new OStream().writeSequenceBeginLazy(-1))).toBe(SofabErrorCode.Argument);
+    expect(codeOf(() => new OStream().writeSequenceBeginLazy(ID_MAX + 1))).toBe(SofabErrorCode.Argument);
+  });
+
   it("unsigned value out of 64-bit range", () => {
     expect(codeOf(() => new OStream().writeUnsigned(1, -1n))).toBe(SofabErrorCode.Argument);
     expect(codeOf(() => new OStream().writeUnsigned(1, 1n << 64n))).toBe(SofabErrorCode.Argument);

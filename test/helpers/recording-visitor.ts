@@ -82,11 +82,15 @@ export class TranscodeVisitor implements Visitor {
   }
 
   sequenceBegin(id: number): Visitor {
-    this.out.writeSequenceBegin(id);
+    this.out.writeSequenceBeginLazy(id);
     return this; // single shared OStream — nesting is encoded by begin/end calls
   }
   sequenceEnd(): void {
-    this.out.writeSequenceEnd();
+    // Frame-preserving close: a transcode must reproduce its input byte for
+    // byte, and the input may legitimately contain an empty frame (an array
+    // element, or an explicitly-empty array — MESSAGE_SPEC §2/§5.1). `end`
+    // would silently drop it and change the decoded array's *length*.
+    this.out.writeSequenceEndKeep();
   }
 
   private fixChunk(sub: FixlenSubtype, id: number, total: number, offset: number, chunk: Uint8Array): void {

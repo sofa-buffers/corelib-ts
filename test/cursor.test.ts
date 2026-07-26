@@ -382,7 +382,7 @@ describe("Cursor nested sequences", () => {
     // { u1=11, seq(2){ u1=99 } }
     const os = new OStream();
     os.writeUnsigned(1, 11n);
-    os.writeSequenceBegin(2);
+    os.writeSequenceBeginLazy(2);
     os.writeUnsigned(1, 99n);
     os.writeSequenceEnd();
 
@@ -406,9 +406,9 @@ describe("Cursor skip", () => {
     const os = new OStream();
     os.writeUnsigned(1, 7n);
     os.writeUnsignedArray(2, [1n, 2n, 3n]);
-    os.writeSequenceBegin(3);
+    os.writeSequenceBeginLazy(3);
     os.writeString(1, "ignored");
-    os.writeSequenceBegin(9);
+    os.writeSequenceBeginLazy(9);
     os.writeUnsigned(1, 5n);
     os.writeSequenceEnd();
     os.writeSequenceEnd();
