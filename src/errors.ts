@@ -16,16 +16,14 @@
  */
 
 /**
- * The cause of a {@link SofabError}. `Argument`, `Usage`, `BufferFull` and
- * `InvalidMsg` match the C reference's `sofab_ret_t` codes; `Incomplete` is the
+ * The cause of a {@link SofabError}. `Argument`, `BufferFull` and `InvalidMsg`
+ * match the C reference's `sofab_ret_t` codes; `Incomplete` is the
  * finish-less INCOMPLETE decode outcome (MESSAGE_SPEC §7), a distinct,
  * more-bytes-could-complete-it signal split out from `InvalidMsg`.
  */
 export const SofabErrorCode = {
   /** A caller argument was invalid (e.g. id out of range, empty array). */
   Argument: "ARGUMENT",
-  /** The API was used incorrectly (e.g. unbalanced sequence end). */
-  Usage: "USAGE",
   /** The output buffer is full and no flush sink was provided. */
   BufferFull: "BUFFER_FULL",
   /** The input being decoded is malformed regardless of what follows (`INVALID`). */
@@ -70,11 +68,6 @@ export class SofabError extends Error {
 /** @internal A caller passed an invalid argument. */
 export function argumentError(message: string): SofabError {
   return new SofabError(SofabErrorCode.Argument, message);
-}
-
-/** @internal The API was driven into an invalid state. */
-export function usageError(message: string): SofabError {
-  return new SofabError(SofabErrorCode.Usage, message);
 }
 
 /** @internal The output buffer filled with no flush sink to drain it. */

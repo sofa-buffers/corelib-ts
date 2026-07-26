@@ -26,7 +26,6 @@ import {
 import {
   argumentError,
   bufferFullError,
-  usageError,
 } from "../errors.js";
 import {
   getKernel,
@@ -354,20 +353,28 @@ export class OStream {
 
   /** Open a nested sequence (a fresh id scope). */
   writeSequenceBegin(id: number): void {
-    // §4.9/§6.2: refuse to open more than MAX_DEPTH nested sequences.
+    // §4.9/§6.2: refuse to open more than MAX_DEPTH nested sequences. This is a
+    // bound on a caller-supplied value, so it reports Argument — the category
+    // the C and Java ports use for the same check.
     if (this.depth >= MAX_DEPTH) {
-      throw usageError(`nesting exceeds MAX_DEPTH (${MAX_DEPTH})`);
+      throw argumentError(`nesting exceeds MAX_DEPTH (${MAX_DEPTH})`);
     }
     this.header(id, WireType.SequenceStart);
     this.depth++;
   }
 
-  /** Close the current sequence. */
+  /**
+   * Close the current sequence.
+   *
+   * An end with no matching begin is not rejected: the encoder writes what it is
+   * told, and the resulting bytes are then malformed, which is the decoder's
+   * verdict to make. No other port refuses it. The depth counter stops at zero
+   * so the MAX_DEPTH check on begin cannot be fooled by an underflow.
+   */
   writeSequenceEnd(): void {
-    if (this.depth <= 0) throw usageError("sequence end without matching begin");
     this.ensure(1);
     this.buf[this.pos++] = WireType.SequenceEnd; // id 0, type 7 -> byte 0x07
-    this.depth--;
+    if (this.depth > 0) this.depth--;
   }
 
   // --- internals ----------------------------------------------------------

@@ -128,8 +128,13 @@ describe("encoder rejects bad arguments", () => {
     expect(codeOf(() => new OStream().writeSigned(1, 1n << 63n))).toBe(SofabErrorCode.Argument);
   });
 
-  it("sequence end without a matching begin", () => {
-    expect(codeOf(() => new OStream().writeSequenceEnd())).toBe(SofabErrorCode.Usage);
+  it("sequence end without a matching begin is written, not rejected", () => {
+    // The encoder writes what it is told; an end with no matching begin makes
+    // the *bytes* malformed, which is the decoder's verdict, not the encoder's.
+    // No other port refuses it.
+    const os = new OStream();
+    os.writeSequenceEnd();
+    expect(os.bytes()).toEqual(Uint8Array.from([0x07]));
   });
 
   it("buffer full with no flush sink", () => {
