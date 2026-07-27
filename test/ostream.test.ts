@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { FixlenSubtype, type FlushSink, IStream, Long, OStream, decode } from "../src/index.js";
+import { FixlenSubtype, type FlushSink, IStream, Long, MAX_DEPTH, OStream, decode } from "../src/index.js";
 import { RecordingVisitor } from "./helpers/recording-visitor.js";
 
 function collect(): { sink: FlushSink; bytes: () => Uint8Array } {
@@ -355,21 +355,94 @@ describe("OStream lazy sequence framing", () => {
     })).toEqual([0x00, 0x01, 0x10, 0x03]);
   });
 
-  it("produces the same bytes through a buffer far smaller than the message", () => {
-    // Held-back headers are encoder state, not buffer content, so a flush can
-    // never split a pending run: a 3-byte buffer sees the one-shot bytes.
+  it("commits runs across flush boundaries byte-identically to the one-shot encode", () => {
+    // What this proves: runs committed while a 4-byte output buffer is
+    // constantly draining produce exactly the bytes of the one-shot in-memory
+    // encode — dozens of flushes land in the middle of this message, and none
+    // of them changes a byte.
+    //
+    // What it deliberately does NOT prove — because the case is unreachable by
+    // construction — is a flush landing *while* a header is still held back. A
+    // held-back id is encoder state, never buffer content, so a pending run
+    // occupies zero bytes; and the buffer can only fill through a write, which
+    // commits the run before its own first byte. A pending run therefore cannot
+    // straddle a flush. There is no test for that case because there is no such
+    // case: the property follows from where the commit sits (in `header`, ahead
+    // of every field byte), not from buffer arithmetic.
+    const body = (os: OStream): void => {
+      os.writeSequenceBeginLazy(1);
+      os.writeSequenceBeginLazy(2);
+      os.writeSequenceEnd(); // contentless: dropped, whatever the buffer does
+      for (let i = 0; i < 40; i++) {
+        os.writeSequenceBeginLazy(i);
+        os.writeUnsigned(i, i * 100000); // 4-byte varint: fills the buffer exactly
+        os.writeSequenceEnd();
+      }
+      os.writeSequenceEnd();
+    };
+
     const { sink, bytes } = collect();
-    const os = new OStream(new Uint8Array(3), 0, sink);
-    os.writeSequenceBeginLazy(1);
-    os.writeSequenceBeginLazy(2);
-    os.writeSequenceEnd();
-    os.writeUnsigned(0, 42);
-    os.writeSequenceEnd();
-    os.flush();
-    expect(Array.from(bytes())).toEqual([0x0e, 0x00, 0x2a, 0x07]);
+    let flushes = 0;
+    const streamed = new OStream(new Uint8Array(4), 0, (chunk) => {
+      flushes++;
+      sink(chunk);
+    });
+    body(streamed);
+    streamed.flush();
+
+    const mem = new OStream();
+    body(mem);
+
+    expect(flushes).toBeGreaterThan(10); // the buffer really did drain, repeatedly
+    expect(bytes()).toEqual(mem.bytes());
   });
 
-  it("commits the run for every writer, not just the scalar one", () => {
+  it("stays canonical however deep the nesting goes", () => {
+    // There is no hold-back window here and so no eager fallback: `pending` is
+    // an ordinary growable array bounded only by MAX_DEPTH, which is what
+    // CORELIB_PLAN §6 ("How deep the hold-back reaches") requires of an
+    // implementation that can allocate. 40 levels is well past the fixed window
+    // the heap-free ports bound themselves to — the depth at which an eager
+    // fallback starts emitting the empty frames §2 omits — and MAX_DEPTH is the
+    // ceiling itself. Closed contentless, both must emit not one byte.
+    const varint = (v: number): number[] => {
+      const out: number[] = [];
+      while (v > 0x7f) {
+        out.push((v & 0x7f) | 0x80);
+        v >>>= 7;
+      }
+      out.push(v);
+      return out;
+    };
+
+    for (const depth of [40, MAX_DEPTH]) {
+      expect(
+        enc((os) => {
+          for (let i = 0; i < depth; i++) os.writeSequenceBeginLazy(i);
+          for (let i = 0; i < depth; i++) os.writeSequenceEnd();
+        }),
+        `depth ${depth}, contentless`,
+      ).toEqual([]);
+
+      // ...and a single leaf at the bottom brings every enclosing header back,
+      // outermost first, however long the run is.
+      const expected: number[] = [];
+      for (let i = 0; i < depth; i++) expected.push(...varint(i * 8 + 6)); // begin id i
+      expected.push(0x00, 0x01); // unsigned id 0 = 1
+      for (let i = 0; i < depth; i++) expected.push(0x07);
+
+      expect(
+        enc((os) => {
+          for (let i = 0; i < depth; i++) os.writeSequenceBeginLazy(i);
+          os.writeUnsigned(0, 1);
+          for (let i = 0; i < depth; i++) os.writeSequenceEnd();
+        }),
+        `depth ${depth}, one leaf`,
+      ).toEqual(expected);
+    }
+  });
+
+  it("commits the run for every writer, on the growable and the fixed-buffer path", () => {
     // Invariant: every writer on the public surface must emit the held-back run
     // before its own first byte. One that forgot would silently drop the frame.
     const writes: Array<[string, (os: OStream) => void]> = [
@@ -390,16 +463,44 @@ describe("OStream lazy sequence framing", () => {
       ["fp64Array", (os) => os.writeFp64Array(0, [1.5])],
     ];
 
+    // Both encoder modes, because almost every writer branches on `canGrow` and
+    // a hook that only fired on the growable path would pass a growable-only
+    // test: `writeString` materialises through TextEncoder + the chunked
+    // `writeRaw` instead of writing UTF-8 straight into the buffer, and the
+    // integer/fp array writers run their per-element loop instead of the bulk
+    // kernel. The fixed buffer is deliberately small enough that the writers
+    // also flush partway through their payload.
+    const modes: Array<[string, (body: (os: OStream) => void) => number[]]> = [
+      ["growable", enc],
+      [
+        "fixed buffer + sink",
+        (body) => {
+          const { sink, bytes } = collect();
+          const os = new OStream(new Uint8Array(24), 0, sink);
+          body(os);
+          os.flush();
+          return Array.from(bytes());
+        },
+      ],
+    ];
+
     for (const [name, write] of writes) {
-      // Same field, once inside a lazily-opened sequence and once bare: the
-      // framed form must be exactly the bare form wrapped in 0E ... 07.
-      const framed = enc((os) => {
-        os.writeSequenceBeginLazy(1);
-        write(os);
-        os.writeSequenceEnd();
-      });
-      const bare = enc(write);
-      expect(framed, `${name} must commit the pending run`).toEqual([0x0e, ...bare, 0x07]);
+      let reference: number[] | undefined;
+      for (const [mode, run] of modes) {
+        // Same field, once inside a lazily-opened sequence and once bare: the
+        // framed form must be exactly the bare form wrapped in 0E ... 07.
+        const framed = run((os) => {
+          os.writeSequenceBeginLazy(1);
+          write(os);
+          os.writeSequenceEnd();
+        });
+        const bare = run(write);
+        expect(framed, `${name} must commit the pending run (${mode})`).toEqual([0x0e, ...bare, 0x07]);
+
+        // And the two paths must agree on the field's bytes in the first place.
+        if (reference === undefined) reference = bare;
+        else expect(bare, `${name}: ${mode} disagrees with the growable path`).toEqual(reference);
+      }
     }
   });
 

@@ -36,6 +36,29 @@ export interface Vector {
   serialized: { length: number; hex: string };
 }
 
+/**
+ * Load the shared vectors.
+ *
+ * **Which column this repo asserts: `serialized`, and only `serialized`.** It is
+ * the primitive-layer ground truth — the exact bytes a `fields` replay through
+ * the raw writer surface must produce, and the exact bytes the decoder must
+ * accept — so it is the one form a corelib can both emit and verify. Every
+ * vector test here (`vectors.test.ts`, `istream.chunked.test.ts`,
+ * `skip-ids.test.ts`) compares against it.
+ *
+ * The file also carries a **`serialized_sparse`** column — the MESSAGE_SPEC §2
+ * canonical form, with every all-default sequence *field* omitted rather than
+ * framed empty. Nothing in this repo reads it, deliberately and permanently: it
+ * is a **message-layer** form, and choosing which sequences are all-default
+ * (and therefore which closer applies, §5.1) is a decision only generated code
+ * holds. A corelib has no message layer and cannot produce it. That column is
+ * consumed by the *generator's* conformance drivers — `sofabgen`'s
+ * `tests/conformance/<lang>/run.sh`, which generates message classes from the
+ * schema and byte-compares their `encode()` output against it. The absence of a
+ * `serialized_sparse` test here is therefore not a coverage gap; a test for it
+ * could only be written by re-implementing the message layer in the test.
+ * `Vector` above intentionally does not declare the field.
+ */
 export function loadVectors(): Vector[] {
   const path = fileURLToPath(new URL("../../assets/test_vectors.json", import.meta.url));
   const doc = parseJsonWithBigInt(readFileSync(path, "utf8")) as unknown as {

@@ -78,6 +78,11 @@ export class OStream {
    * Storage plus an explicit count rather than `push`/`pop`, so the slots are
    * reused across messages (no allocation on a pooled encoder) and so
    * {@link OStream.commitPending} can zero the count *before* it writes.
+   *
+   * The array grows on demand and is bounded only by `MAX_DEPTH` — there is no
+   * fixed hold-back window and hence no eager-framing fallback, which is what
+   * CORELIB_PLAN §6 ("How deep the hold-back reaches") demands of an
+   * implementation that can allocate: canonical output at *every* depth.
    */
   private readonly pending: number[] = [];
   /** Valid entries in {@link OStream.pending}. */
@@ -404,7 +409,9 @@ export class OStream {
     // No hold-back window and so no eager fallback: the run is an ordinary
     // growable array already bounded by MAX_DEPTH, so it is *always* a
     // contiguous suffix of the open sequences and every sequence stays
-    // canonical however deep it nests.
+    // canonical however deep it nests. That is what CORELIB_PLAN §6 ("How deep
+    // the hold-back reaches") requires of an implementation that can allocate;
+    // only a heap-free profile may bound the run and frame eagerly past it.
     this.pending[this.nPending++] = id;
     this.depth++;
   }
@@ -514,6 +521,13 @@ export class OStream {
    */
   private commitPending(): void {
     const n = this.nPending;
+    // Zero the count *first*, before a single byte is written. Deliberate, and
+    // the ordering matters: the writes below can fill the buffer and call the
+    // flush sink, which is caller code and may re-enter this encoder (that is
+    // what `setBuffer` is for, and a sink is free to write a framing field of
+    // its own). A re-entrant `header()` must find an empty run, or it would
+    // emit these same ids a second time. The loop counts with the local `n`, so
+    // clearing the field does not cut short the run it is already emitting.
     this.nPending = 0;
     for (let i = 0; i < n; i++) {
       this.putVarintNum(this.pending[i]! * 8 + WireType.SequenceStart);
