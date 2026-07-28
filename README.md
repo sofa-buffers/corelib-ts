@@ -104,6 +104,61 @@ for (let i = 0; i < 1000; i++) os.writeUnsigned(i, BigInt(i));
 os.flush();                                            // push the tail
 ```
 
+### Nested sequences
+
+A nested message is a *sequence*: a fresh id scope between a begin header and the
+`0x07` end marker. MESSAGE_SPEC §2 omits a sequence-typed **field** whose value
+equals its declared default, so the encoder holds the begin header back until the
+sequence proves it has content — no buffering of the sub-message, and nothing to
+compare byte images against:
+
+```ts
+const os = new OStream();
+os.writeUnsigned(1, 42);
+os.writeSequenceBeginLazy(2);   // a nested field...
+os.writeSequenceEnd();          // ...that got no content: header and end both vanish
+os.writeSequenceBeginLazy(3);
+os.writeString(1, "hi");        // content — commits the held-back header first
+os.writeSequenceEnd();
+os.bytes();                     // 08 2a 1e 0a 12 68 69 07  (field 2 is not on the wire)
+```
+
+Which closer to use is decided **statically**, by the position in the schema, not
+by the value:
+
+| position | closer |
+|---|---|
+| `struct` / `union` field, array-field wrapper | `writeSequenceEnd()` — drops a contentless frame |
+| wrapper-array **element**, or an array field differing from a non-empty declared default | `writeSequenceEndKeep()` — always emits `begin` + `end` |
+
+An element keeps its frame because element presence is what carries a dynamic
+array's length (highest present id + 1, §5.1); dropping an all-default element
+would change the decoded length, not just the bytes. The failure directions are
+not symmetric, so `writeSequenceEndKeep()` is the safe choice when in doubt: a
+needless one costs a non-canonical empty frame that a decoder normalizes away,
+while a wrong `writeSequenceEnd()` shortens an array. Raw transcoding — replaying
+bytes rather than encoding a schema value — should use `writeSequenceEndKeep()`
+throughout, so the output reproduces the input frame for frame.
+
+```ts
+const os = new OStream();
+os.writeSequenceBeginLazy(4);   // the wrapper array
+os.writeSequenceBeginLazy(0);   // element 0 — has content
+os.writeUnsigned(0, 7);
+os.writeSequenceEndKeep();
+os.writeSequenceBeginLazy(1);   // element 1 — all-default, but still present
+os.writeSequenceEndKeep();      // ...so its frame stays: the array has length 2
+os.writeSequenceEnd();
+os.bytes();                     // 26 06 00 07 07 0e 07 07
+```
+
+Decoding is unaffected by the distinction: an empty frame is valid input that the
+message layer normalizes to the default, and an absent sequence field is
+reconstructed from the schema default. Nesting is capped at `MAX_DEPTH` (255) on
+both sides; the encoder holds headers back to that full depth, so its output is
+canonical however deep a message nests. A held-back header is encoder state, never
+buffer content, so streaming through a small buffer produces the same bytes.
+
 ### Deserialize
 
 `decode()` walks a whole buffer and calls one optional `Visitor` method per field;

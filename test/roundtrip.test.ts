@@ -123,9 +123,9 @@ describe("nested sequences", () => {
   it("records balanced begin/end markers", () => {
     const seen = roundtrip((os) => {
       os.writeUnsigned(1, 1);
-      os.writeSequenceBegin(2);
+      os.writeSequenceBeginLazy(2);
       os.writeUnsigned(1, 2);
-      os.writeSequenceBegin(3);
+      os.writeSequenceBeginLazy(3);
       os.writeUnsigned(1, 3);
       os.writeSequenceEnd();
       os.writeSequenceEnd();
@@ -162,7 +162,7 @@ describe("nested sequences", () => {
 
     const os = new OStream();
     os.writeUnsigned(1, 11n);
-    os.writeSequenceBegin(2);
+    os.writeSequenceBeginLazy(2);
     os.writeUnsigned(1, 99n); // must land on Inner, not Outer
     os.writeSequenceEnd();
 

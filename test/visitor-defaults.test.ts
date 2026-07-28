@@ -19,7 +19,7 @@ function everyKind(os: OStream): void {
   os.writeSignedArray(9, [-1, -2]);
   os.writeFp32Array(10, [1, 2]);
   os.writeFp64Array(11, [3, 4]);
-  os.writeSequenceBegin(12);
+  os.writeSequenceBeginLazy(12);
   os.writeUnsigned(1, 1);
   os.writeSequenceEnd();
 }

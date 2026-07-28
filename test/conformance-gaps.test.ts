@@ -121,8 +121,8 @@ describe("MAX_DEPTH (255) is enforced", () => {
 
   it("encoder allows exactly 255 nested sequences but refuses a 256th", () => {
     const os = new OStream();
-    for (let i = 0; i < MAX_DEPTH; i++) os.writeSequenceBegin(0);
-    expect(codeOf(() => os.writeSequenceBegin(0))).toBe(SofabErrorCode.Argument);
+    for (let i = 0; i < MAX_DEPTH; i++) os.writeSequenceBeginLazy(0);
+    expect(codeOf(() => os.writeSequenceBeginLazy(0))).toBe(SofabErrorCode.Argument);
   });
 
   it("fast decoder accepts 255-deep nesting", () => {

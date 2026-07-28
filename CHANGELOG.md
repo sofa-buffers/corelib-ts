@@ -8,7 +8,60 @@ While the version is below `1.0.0`, breaking changes bump the **minor** version.
 
 ## [Unreleased]
 
+> The breaking entries below make the next release a **minor** bump (the first
+> since `0.2.0`), per the pre-`1.0.0` rule above — never a patch. The published
+> package is `@sofa-buffers/corelib`; the git tag is the source of truth for the
+> version number, and `package.json` stays at `0.0.0-dev`.
+
 ### Changed
+
+- **BREAKING (encode API) — an all-default sequence is now *omitted*, not framed
+  empty (MESSAGE_SPEC §2, CORELIB_PLAN §6).** A sequence-typed **field** whose
+  value equals its declared default carries no information, so it no longer
+  reaches the wire at all, where it previously appeared as the two-byte empty
+  frame `0E 07`. An all-default message is now the **empty byte string**. A
+  wrapper-array **element** is the exception and keeps its frame: element
+  presence is what carries a dynamic array's length (§5.1), so dropping one
+  would change the decoded value, not just the bytes.
+
+  Deciding this without buffering the sub-message means the sequence header has
+  to be held back until the sequence proves it has content, which changes the
+  encoder's public sequence API:
+
+  | before | after |
+  |---|---|
+  | `writeSequenceBegin(id)` — **removed** | `writeSequenceBeginLazy(id)` — opens the scope and holds the header back; writes no byte |
+  | `writeSequenceEnd()` | `writeSequenceEnd()` — drops the frame (header *and* end marker) if the sequence got no content |
+  | — | `writeSequenceEndKeep()` — new; emits the held-back headers plus the end marker, so a contentless sequence still reaches the wire as `begin` + `end` |
+
+  **Migration.** Replace every `writeSequenceBegin` with
+  `writeSequenceBeginLazy`. Then pick the closer *statically*, by the position in
+  the schema — it is a property of the position, not of the value:
+  `writeSequenceEnd` for a `struct`/`union` field and for an array-field wrapper;
+  `writeSequenceEndKeep` for a wrapper-array element, and for an array field
+  already known to differ from a **non-empty** declared default. When in doubt
+  `writeSequenceEndKeep` is the safe choice: the failure directions are not
+  symmetric — a needless `endKeep` costs one non-canonical empty frame that a
+  decoder normalizes away, while a wrong `end` silently changes an array's
+  length. Code that transcodes or replays raw bytes (rather than encoding a
+  schema value) wants `writeSequenceEndKeep` throughout, so its output reproduces
+  its input frame for frame.
+
+  **Decoding is unaffected**, in both directions: an empty frame remains valid
+  input that the message layer normalizes to the default, and an omitted
+  sequence field was already reconstructed from the schema default. Old and new
+  encoders therefore interoperate; they disagree only about which encoding is
+  canonical. Every non-sequence byte is unchanged — the shared
+  `assets/test_vectors.json` is re-synced and every `serialized` hex is
+  byte-identical; the vectors' separate `serialized_sparse` column is the new
+  canonical form, and is exercised by the generator's conformance drivers (a
+  corelib has no message layer and cannot produce it).
+
+  The hold-back run is bounded only by `MAX_DEPTH`: this port can allocate, so
+  it holds back to the full nesting depth and is canonical at every depth
+  (CORELIB_PLAN §6, "How deep the hold-back reaches"). Held-back ids are encoder
+  state and never buffer content, so a flush cannot split a run and a buffer
+  smaller than the message still produces the one-shot bytes.
 
 - **Strict UTF-8 for `string` fields (corelib-ts#85, MESSAGE_SPEC §8,
   CORELIB_PLAN §6.4).** JavaScript strings are a Unicode string type, so the

@@ -36,6 +36,29 @@ export interface Vector {
   serialized: { length: number; hex: string };
 }
 
+/**
+ * Load the shared vectors.
+ *
+ * **Which column this repo asserts: `serialized`, and only `serialized`.** It is
+ * the primitive-layer ground truth — the exact bytes a `fields` replay through
+ * the raw writer surface must produce, and the exact bytes the decoder must
+ * accept — so it is the one form a corelib can both emit and verify. Every
+ * vector test here (`vectors.test.ts`, `istream.chunked.test.ts`,
+ * `skip-ids.test.ts`) compares against it.
+ *
+ * The file also carries a **`serialized_sparse`** column — the MESSAGE_SPEC §2
+ * canonical form, with every all-default sequence *field* omitted rather than
+ * framed empty. Nothing in this repo reads it, deliberately and permanently: it
+ * is a **message-layer** form, and choosing which sequences are all-default
+ * (and therefore which closer applies, §5.1) is a decision only generated code
+ * holds. A corelib has no message layer and cannot produce it. That column is
+ * consumed by the *generator's* conformance drivers — `sofabgen`'s
+ * `tests/conformance/<lang>/run.sh`, which generates message classes from the
+ * schema and byte-compares their `encode()` output against it. The absence of a
+ * `serialized_sparse` test here is therefore not a coverage gap; a test for it
+ * could only be written by re-implementing the message layer in the test.
+ * `Vector` above intentionally does not declare the field.
+ */
 export function loadVectors(): Vector[] {
   const path = fileURLToPath(new URL("../../assets/test_vectors.json", import.meta.url));
   const doc = parseJsonWithBigInt(readFileSync(path, "utf8")) as unknown as {
@@ -70,7 +93,16 @@ export function loadInvalidUtf8(): InvalidUtf8Vector[] {
   return doc.invalid_utf8 ?? [];
 }
 
-/** Replay a vector's fields onto `os`, exercising the public writer surface. */
+/**
+ * Replay a vector's fields onto `os`, exercising the public writer surface.
+ *
+ * A vector's `serialized` form is the primitive-layer ground truth and always
+ * carries the frame, so every `sequence_end` op closes with
+ * {@link OStream.writeSequenceEndKeep}: identical bytes once the sequence has
+ * content, and the empty-sequence vectors keep their `begin`+`end` pair instead
+ * of vanishing (MESSAGE_SPEC §2). The sparse-canonical form the new closer
+ * produces is the vectors' separate `serialized_sparse` field.
+ */
 export function encodeFields(os: OStream, fields: Field[]): void {
   for (const f of fields) {
     const id = Number(f.id ?? 0);
@@ -100,10 +132,10 @@ export function encodeFields(os: OStream, fields: Field[]): void {
         encodeArray(os, id, f.element_type!, f.values!);
         break;
       case "sequence_begin":
-        os.writeSequenceBegin(id);
+        os.writeSequenceBeginLazy(id);
         break;
       case "sequence_end":
-        os.writeSequenceEnd();
+        os.writeSequenceEndKeep();
         break;
       default:
         throw new Error(`unknown vector op: ${f.op}`);

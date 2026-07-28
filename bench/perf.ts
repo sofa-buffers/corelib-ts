@@ -36,7 +36,7 @@ function perfEncode(os: OStream): void {
   os.writeUnsignedArray(9, PERF_SAMPLES);
   os.writeSignedArray(10, PERF_DELTAS);
   os.writeFp64Array(11, PERF_FP64);
-  os.writeSequenceBegin(12);
+  os.writeSequenceBeginLazy(12);
   os.writeUnsigned(1, 99);
   os.writeSigned(2, -7);
   os.writeSequenceEnd();

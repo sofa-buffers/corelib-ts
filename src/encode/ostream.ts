@@ -12,6 +12,12 @@
  *
  * Generated code typically writes one field per message field; the methods map
  * one-to-one onto the wire types. Problems throw {@link SofabError}.
+ *
+ * Nested sequences are opened with {@link OStream.writeSequenceBeginLazy}, which
+ * holds the header back until the sequence proves it has content, so an
+ * all-default one is omitted rather than framed empty (MESSAGE_SPEC §2). Close a
+ * `struct`/`union` field or an array wrapper with {@link OStream.writeSequenceEnd}
+ * and a wrapper-array *element* with {@link OStream.writeSequenceEndKeep}.
  */
 
 import {
@@ -61,6 +67,26 @@ export class OStream {
   private readonly flushSink: FlushSink | undefined;
   private readonly canGrow: boolean;
   private depth = 0;
+  /**
+   * Ids of the innermost open sequences whose header has not been written yet
+   * (MESSAGE_SPEC §2 lazy framing, {@link OStream.writeSequenceBeginLazy}).
+   * Always a contiguous suffix of the open sequences: writing any field commits
+   * the whole run at once, so {@link OStream.writeSequenceEnd} can drop the
+   * innermost one by dropping the last entry. Held-back ids are encoder state,
+   * never buffer content, so a flush can never split a run.
+   *
+   * Storage plus an explicit count rather than `push`/`pop`, so the slots are
+   * reused across messages (no allocation on a pooled encoder) and so
+   * {@link OStream.commitPending} can zero the count *before* it writes.
+   *
+   * The array grows on demand and is bounded only by `MAX_DEPTH` — there is no
+   * fixed hold-back window and hence no eager-framing fallback, which is what
+   * CORELIB_PLAN §6 ("How deep the hold-back reaches") demands of an
+   * implementation that can allocate: canonical output at *every* depth.
+   */
+  private readonly pending: number[] = [];
+  /** Valid entries in {@link OStream.pending}. */
+  private nPending = 0;
   private kernel: Kernel;
 
   /** In-memory encoder backed by an auto-growing buffer. */
@@ -134,6 +160,7 @@ export class OStream {
   reset(): void {
     this.pos = this.start;
     this.depth = 0;
+    this.nPending = 0;
   }
 
   // --- scalars ------------------------------------------------------------
@@ -351,20 +378,51 @@ export class OStream {
 
   // --- sequences ----------------------------------------------------------
 
-  /** Open a nested sequence (a fresh id scope). */
-  writeSequenceBegin(id: number): void {
+  /**
+   * Open a nested sequence (a fresh id scope) whose header is **held back**
+   * until the sequence turns out to have content.
+   *
+   * MESSAGE_SPEC §2 omits a sequence-typed field whose value equals its declared
+   * default, and "not one child was written" is exactly that condition —
+   * evaluated per child field, recursively, for free, because the message layer
+   * already omits every child equal to its default. A sequence closed with
+   * nothing in it therefore emits **nothing** instead of a two-byte empty frame,
+   * and an all-default message becomes the empty byte string. No byte image is
+   * ever compared, so in-memory layout never enters the decision.
+   *
+   * This is the only way to open a sequence. How it closes decides whether a
+   * contentless one survives: {@link OStream.writeSequenceEnd} drops it,
+   * {@link OStream.writeSequenceEndKeep} forces the frame out.
+   */
+  writeSequenceBeginLazy(id: number): void {
     // §4.9/§6.2: refuse to open more than MAX_DEPTH nested sequences. This is a
     // bound on a caller-supplied value, so it reports Argument — the category
     // the C and Java ports use for the same check.
     if (this.depth >= MAX_DEPTH) {
       throw argumentError(`nesting exceeds MAX_DEPTH (${MAX_DEPTH})`);
     }
-    this.header(id, WireType.SequenceStart);
+    // Validate here, not at commit time: the header may never be written, and a
+    // bad id must still be rejected at the call that supplied it.
+    if (id < 0 || id > ID_MAX || !Number.isInteger(id)) {
+      throw argumentError(`field id ${id} out of range 0..${ID_MAX}`);
+    }
+    // No hold-back window and so no eager fallback: the run is an ordinary
+    // growable array already bounded by MAX_DEPTH, so it is *always* a
+    // contiguous suffix of the open sequences and every sequence stays
+    // canonical however deep it nests. That is what CORELIB_PLAN §6 ("How deep
+    // the hold-back reaches") requires of an implementation that can allocate;
+    // only a heap-free profile may bound the run and frame eagerly past it.
+    this.pending[this.nPending++] = id;
     this.depth++;
   }
 
   /**
-   * Close the current sequence.
+   * Close the current sequence, letting it **vanish** if it received no content.
+   *
+   * Use it wherever absence encodes the same value as an empty frame: a
+   * `struct`/`union` field, and an array field whose declared `default` is the
+   * empty collection (MESSAGE_SPEC §2). Where the frame must be visible, close
+   * with {@link OStream.writeSequenceEndKeep} instead.
    *
    * An end with no matching begin is not rejected: the encoder writes what it is
    * told, and the resulting bytes are then malformed, which is the decoder's
@@ -372,6 +430,43 @@ export class OStream {
    * so the MAX_DEPTH check on begin cannot be fooled by an underflow.
    */
   writeSequenceEnd(): void {
+    if (this.nPending !== 0) {
+      // The innermost open sequence is the last held-back one (the run is a
+      // suffix of the open sequences), and it never got content: drop it —
+      // header and end marker both.
+      this.nPending--;
+      if (this.depth > 0) this.depth--;
+      return;
+    }
+    this.ensure(1);
+    this.buf[this.pos++] = WireType.SequenceEnd; // id 0, type 7 -> byte 0x07
+    if (this.depth > 0) this.depth--;
+  }
+
+  /**
+   * Close the current sequence, **keeping** its frame even when it received no
+   * content.
+   *
+   * Behaves like a write: it first emits any held-back headers — this frame's
+   * and every enclosing one's — and then the end marker, so an empty sequence
+   * reaches the wire as `begin` + `end`.
+   *
+   * Required wherever the frame carries information beyond its contents:
+   * - a **wrapper-array element** (`struct`/`union`/nested row): element
+   *   presence is what carries a dynamic array's length — *highest present id +
+   *   1* (MESSAGE_SPEC §5.1) — so dropping an all-default element would change
+   *   the decoded length, not just the bytes;
+   * - an array field already known to **differ from a non-empty declared
+   *   `default`**: absence would reconstruct that default, so the empty frame is
+   *   the only encoding of "explicitly empty" (§2, §3).
+   *
+   * The two failure directions are not symmetric, which is why this is the safe
+   * choice when in doubt: using it where {@link OStream.writeSequenceEnd} would
+   * do costs one non-canonical empty frame that a decoder normalizes away, while
+   * the reverse silently changes an array's length.
+   */
+  writeSequenceEndKeep(): void {
+    if (this.nPending !== 0) this.commitPending();
     this.ensure(1);
     this.buf[this.pos++] = WireType.SequenceEnd; // id 0, type 7 -> byte 0x07
     if (this.depth > 0) this.depth--;
@@ -391,12 +486,52 @@ export class OStream {
     this.pos = encodeVarintNum(value, this.buf, this.pos);
   }
 
+  /**
+   * Write a field header, the `(id << 3) | wireType` tag, as a varint.
+   *
+   * This is the single choke point every field write passes through — the
+   * scalar, fixlen, float, string, blob and both array writers all reach the
+   * wire through `header` / `fixlenHead` / `arrayHead`, and `fixlenHead` and
+   * `arrayHead` are themselves nothing but `header` plus a follow-up varint. So
+   * this is also where a held-back sequence run is committed: the field about to
+   * be written is content, which means every enclosing sequence is non-default
+   * and must be framed after all (MESSAGE_SPEC §2).
+   *
+   * The only writers that do *not* pass through here are the two sequence
+   * closers, which must not commit ({@link OStream.writeSequenceEnd}) or commit
+   * explicitly ({@link OStream.writeSequenceEndKeep}), and
+   * {@link OStream.writeSequenceBeginLazy}, which writes no byte at all.
+   */
   private header(id: number, type: WireType): void {
     if (id < 0 || id > ID_MAX || !Number.isInteger(id)) {
       throw argumentError(`field id ${id} out of range 0..${ID_MAX}`);
     }
+    if (this.nPending !== 0) this.commitPending();
     // (id << 3) | type as a number: id ≤ 2^31-1, so the word stays ≤ 2^34.
     this.putVarintNum(id * 8 + type);
+  }
+
+  /**
+   * Write out the held-back sequence headers, **outermost first**, and clear the
+   * run. Runs at most once per non-default sequence, never per field — the cost
+   * on the hot path is the single `nPending` test in {@link header}.
+   *
+   * The count is zeroed before the first byte goes out, so a write re-entered
+   * from a flush sink cannot emit the same run twice.
+   */
+  private commitPending(): void {
+    const n = this.nPending;
+    // Zero the count *first*, before a single byte is written. Deliberate, and
+    // the ordering matters: the writes below can fill the buffer and call the
+    // flush sink, which is caller code and may re-enter this encoder (that is
+    // what `setBuffer` is for, and a sink is free to write a framing field of
+    // its own). A re-entrant `header()` must find an empty run, or it would
+    // emit these same ids a second time. The loop counts with the local `n`, so
+    // clearing the field does not cut short the run it is already emitting.
+    this.nPending = 0;
+    for (let i = 0; i < n; i++) {
+      this.putVarintNum(this.pending[i]! * 8 + WireType.SequenceStart);
+    }
   }
 
   private fixlenHead(id: number, length: number, subtype: FixlenSubtype): void {

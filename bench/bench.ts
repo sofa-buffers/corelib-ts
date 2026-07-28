@@ -29,7 +29,7 @@ function encodeTypical(os: OStream): void {
   os.writeFp32(4, 3.14159);
   os.writeString(5, "sofab");
   os.writeUnsignedArray(6, [10, 20, 30, 40]);
-  os.writeSequenceBegin(7);
+  os.writeSequenceBeginLazy(7);
   os.writeUnsigned(1, 99);
   os.writeSigned(2, -7);
   os.writeSequenceEnd();
