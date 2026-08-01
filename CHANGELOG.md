@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the version is below `1.0.0`, breaking changes bump the **minor** version.
 
-## [Unreleased]
+## [0.10.0] - 2026-08-01
 
 > The breaking entries below make the next release a **minor** bump (the first
 > since `0.2.0`), per the pre-`1.0.0` rule above — never a patch. The published
