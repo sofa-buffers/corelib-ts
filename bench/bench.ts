@@ -10,7 +10,15 @@
  */
 
 import { IStream, OStream } from "../src/index.js";
-import { Checksum, MIN_SECONDS, WARMUP, blackholeValue, cpuNow, sink } from "./common.js";
+import {
+  Checksum,
+  MIN_SECONDS,
+  WARMUP,
+  blackholeValue,
+  calibrateBatch,
+  cpuNow,
+  sink,
+} from "./common.js";
 
 const N = 1000;
 const GOLDEN = 0x9e37_79b9_7f4a_7c15n;
@@ -38,12 +46,13 @@ function encodeTypical(os: OStream): void {
 /** Run `body` for ~1 s of CPU time after warmup; return MB/s for `bytes`. */
 function measure(bytes: number, body: () => void): number {
   for (let i = 0; i < WARMUP; i++) body();
+  const batch = calibrateBatch(body);
   let it = 0;
   const t0 = cpuNow();
   let el: number;
   do {
-    body();
-    it++;
+    for (let k = 0; k < batch; k++) body();
+    it += batch;
     el = cpuNow() - t0;
   } while (el < MIN_SECONDS);
   return (bytes * it) / el / 1e6;

@@ -17,7 +17,15 @@
  */
 
 import { IStream, OStream } from "../src/index.js";
-import { Checksum, MIN_SECONDS, WARMUP, blackholeValue, cpuNow, sink } from "./common.js";
+import {
+  Checksum,
+  MIN_SECONDS,
+  WARMUP,
+  blackholeValue,
+  calibrateBatch,
+  cpuNow,
+  sink,
+} from "./common.js";
 
 const PERF_STRING = "perf-benchmark-message";
 const PERF_SAMPLES = [1e6, 2e6, 3e6, 4e6, 5e6, 6e6, 7e6, 8e6];
@@ -50,12 +58,13 @@ interface Result {
 
 function measure(bytes: number, body: () => void): Result {
   for (let i = 0; i < WARMUP; i++) body();
+  const batch = calibrateBatch(body);
   let it = 0;
   const t0 = cpuNow();
   let el: number;
   do {
-    body();
-    it++;
+    for (let k = 0; k < batch; k++) body();
+    it += batch;
     el = cpuNow() - t0;
   } while (el < MIN_SECONDS);
   return { iterations: it, nsOp: (el / it) * 1e9, mbs: (bytes * it) / el / 1e6 };

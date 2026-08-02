@@ -10,11 +10,26 @@ import type { Visitor } from "../src/index.js";
 
 export const MIN_SECONDS = 1.0;
 export const WARMUP = 200_000;
+export const BATCH_SECONDS = 0.01; // clock cost lands under ~0.01% of a batch
 
 /** Process CPU time in seconds (user + system), not wall-clock. */
 export function cpuNow(): number {
   const u = process.cpuUsage();
   return (u.user + u.system) / 1e6;
+}
+
+/**
+ * Grow a batch until it spans {@link BATCH_SECONDS}, so the clock read that
+ * ends it is a rounding error against the work it timed. `cpuNow()` costs
+ * about a microsecond per call — sampling it once per operation would make
+ * cheap workloads measure mostly the timer. Doubles as extra warmup.
+ */
+export function calibrateBatch(body: () => void): number {
+  for (let batch = 1; ; batch *= 2) {
+    const t0 = cpuNow();
+    for (let k = 0; k < batch; k++) body();
+    if (cpuNow() - t0 >= BATCH_SECONDS) return batch;
+  }
 }
 
 /** A decode sink that folds every value into a checksum so nothing is elided. */
