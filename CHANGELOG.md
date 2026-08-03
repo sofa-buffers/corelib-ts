@@ -53,6 +53,20 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Fixed
 
+- **A sequence-end header's field id escaped the `ID_MAX` ceiling** (#85, Crucible
+  F-0054). §4.9 has a decoder *discard* a sequence end's id — the marker closes the
+  innermost open sequence whatever the id says — but discarded is not unvalidated:
+  the header is an ordinary field header, so §6.2's ceiling binds it like every
+  other, and an id above it is `INVALID` (§5.2). All three decode surfaces tested
+  the wire type before computing or checking the id, so `76 87 80 80 80 40` — an
+  undeclared sequence closed by an end marker with id 2³¹ — was accepted and
+  re-encoded as the empty message. Each surface (`decode`, `IStream`, and both
+  `Cursor.readHeader` and its sequence-skip path) now splits and bounds the id
+  where it reads the header, before dispatching on the wire type, so one
+  unconditional guard covers all eight wire types with no per-type exception.
+  The bound is on the id's **value**, not its spelling: a non-minimal `0x87 0x00`
+  and any id up to `ID_MAX` still decode as an ordinary sequence end and re-encode
+  as `0x07` (§4.1 is untouched), and the encoder still emits exactly `0x07`.
 - **An array count larger than the bytes remaining reported `INCOMPLETE` for an
   already-malformed element varint** (#82, Crucible F-0053). On the pull
   decoder's skip path, `Cursor.skip` read the count through `arrayCount`, whose
