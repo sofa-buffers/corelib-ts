@@ -6,7 +6,13 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { IStream, OStream } from "../src/index.js";
+import {
+  DecodeStatus,
+  IStream,
+  OStream,
+  SofabError,
+  SofabErrorCode,
+} from "../src/index.js";
 import { bytesToHex, hexToBytes } from "./helpers/hex.js";
 import { TranscodeVisitor } from "./helpers/recording-visitor.js";
 import { loadVectors } from "./helpers/vectors.js";
@@ -80,6 +86,52 @@ describe("chunked feeding", () => {
         }
         is.end();
         expect(bytesToHex(out.bytes())).toBe(vector.serialized.hex);
+      }
+    });
+  });
+
+  // A verdict must not depend on where the chunk boundaries fell. Ten varint
+  // bytes that all carry the continuation flag require an 11th, which is past the
+  // 10-byte / 64-bit maximum (§4.1) — decidable from the bytes in hand, so
+  // INVALID (§5.2 precedence), not the suspend-then-INCOMPLETE the resumable
+  // reader used to fall into when the chunk ended exactly on the tenth byte
+  // (corelib-ts#82).
+  describe("an overlong varint is INVALID at every chunk size (corelib-ts#82)", () => {
+    const malformed: Record<string, Uint8Array> = {
+      "a bare scalar varint": Uint8Array.from([0x01, ...Array(10).fill(0x80)]),
+      // id 8 / ArrayUnsigned, count 11, then the same ten continuation bytes.
+      "an array element varint": Uint8Array.from([0x43, 0x0b, ...Array(10).fill(0x80)]),
+    };
+
+    for (const [what, bytes] of Object.entries(malformed)) {
+      it(`rejects ${what}`, () => {
+        for (let chunkSize = 1; chunkSize <= bytes.length; chunkSize++) {
+          let code: SofabErrorCode | "none" = "none";
+          try {
+            const is = new IStream();
+            for (let i = 0; i < bytes.length; i += chunkSize) {
+              is.feed(bytes.subarray(i, i + chunkSize), {});
+            }
+            is.end();
+          } catch (e) {
+            if (!(e instanceof SofabError)) throw e;
+            code = e.code;
+          }
+          expect(code, `chunk size ${chunkSize}`).toBe(SofabErrorCode.InvalidMsg);
+        }
+      });
+    }
+
+    // Control: nine continuation bytes still *could* terminate legally, so the
+    // fix must leave ordinary mid-varint suspension alone.
+    it("still suspends on nine continuation bytes", () => {
+      const bytes = Uint8Array.from([0x01, ...Array(9).fill(0x80)]);
+      for (let chunkSize = 1; chunkSize <= bytes.length; chunkSize++) {
+        const is = new IStream();
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+          is.feed(bytes.subarray(i, i + chunkSize), {});
+        }
+        expect(is.end(), `chunk size ${chunkSize}`).toBe(DecodeStatus.Incomplete);
       }
     });
   });

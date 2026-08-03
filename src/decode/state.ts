@@ -543,6 +543,14 @@ export class DecoderState {
         return i;
       }
     }
+    // Out of chunk mid-varint. If the accumulator is already full, the byte that
+    // filled it had its continuation flag set (a terminator returns above), so an
+    // 11th byte is *required* — past the 10-byte / 64-bit maximum (§4.1). That is
+    // decided by bytes already in hand, so it is INVALID now rather than a
+    // suspend that `finish()` would report as INCOMPLETE: §5.2 gives INVALID
+    // precedence, and the verdict must not depend on where the chunk boundaries
+    // fell (corelib-ts#82; the whole-buffer readers already throw here).
+    if (k >= VARINT_MAX_BYTES) throw invalidMsgError("varint overflow");
     this.vLo = lo;
     this.vHi = hi;
     this.vBytes = k;
