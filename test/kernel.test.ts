@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   type Kernel,
   OStream,
+  decode,
   getKernel,
   jsKernel,
   loadNativeKernel,
@@ -79,5 +80,76 @@ describe("optional native acceleration", () => {
     const factory = (): Kernel => ({ ...jsKernel, name: "wasm-mod" });
     expect(await loadWasmKernel(mod, factory)).toBe(true);
     expect(getKernel().name).toBe("wasm-mod");
+  });
+});
+
+/**
+ * The JS kernel inlines the body of `encodeVarintLoHi` into its unsigned bulk
+ * loop — the innermost loop of the encoder, where the JIT will not inline the
+ * shared helper. That duplication is only safe if the two provably agree, so
+ * this pins them byte-for-byte over a corpus that covers every varint length
+ * boundary, both sides of each power of two, and a spread of full-width values.
+ */
+describe("kernel parity: the inlined bulk writer matches the shared helper", () => {
+  const corpus: bigint[] = [];
+  for (let bit = 0n; bit < 64n; bit++) {
+    for (const d of [-2n, -1n, 0n, 1n, 2n]) {
+      const v = (1n << bit) + d;
+      if (v >= 0n && v < 1n << 64n) corpus.push(v);
+    }
+  }
+  for (let i = 0; i < 2000; i++) {
+    corpus.push((BigInt(i) * 0x9e37_79b9_7f4a_7c15n) & ((1n << 64n) - 1n));
+  }
+  // Number-typed elements take the kernel's other branch; cover it too.
+  const numeric = [0, 1, 127, 128, 16383, 16384, 2 ** 31, Number.MAX_SAFE_INTEGER];
+
+  it("agrees with a per-element encodeVarint for the whole corpus", () => {
+    const viaKernel = new OStream();
+    viaKernel.writeUnsignedArray(1, corpus);
+
+    // Reference: the same values, each written as its own unsigned scalar, so
+    // the payload bytes come from OStream's non-bulk `encodeVarintLoHi` route.
+    const ref = new OStream();
+    for (const v of corpus) ref.writeUnsigned(1, v);
+
+    // Strip the array header + count from one and the per-field headers from
+    // the other by comparing only the varint payload runs.
+    const kernelHex = bytesToHex(viaKernel.bytes());
+    let refPayload = "";
+    const refOne = new OStream();
+    for (const v of corpus) {
+      refOne.reset();
+      refOne.writeUnsigned(0, v);
+      refPayload += bytesToHex(refOne.bytes()).slice(2); // drop the 1-byte header
+    }
+    expect(kernelHex.endsWith(refPayload)).toBe(true);
+    expect(ref.bytesUsed).toBeGreaterThan(0);
+  });
+
+  it("agrees for number-typed elements too", () => {
+    const viaKernel = new OStream();
+    viaKernel.writeUnsignedArray(1, numeric);
+
+    let refPayload = "";
+    const refOne = new OStream();
+    for (const v of numeric) {
+      refOne.reset();
+      refOne.writeUnsigned(0, v);
+      refPayload += bytesToHex(refOne.bytes()).slice(2);
+    }
+    expect(bytesToHex(viaKernel.bytes()).endsWith(refPayload)).toBe(true);
+  });
+
+  it("round-trips the whole corpus through the decoder", () => {
+    const os = new OStream();
+    os.writeUnsignedArray(7, corpus);
+    const seen: bigint[] = [];
+    decode(os.bytes(), {
+      arrayUnsigned(_id, _i, v) {
+        seen.push(typeof v === "bigint" ? v : BigInt(v));
+      },
+    });
+    expect(seen).toEqual(corpus);
   });
 });
