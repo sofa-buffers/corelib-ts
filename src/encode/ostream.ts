@@ -38,9 +38,15 @@ import {
   type Kernel,
 } from "../backend/kernel.js";
 import { Long } from "../long.js";
-import { encodeVarint, encodeVarintLoHi, encodeVarintNum, varintSize, varintSizeNum } from "../varint/leb128.js";
-import { inI64, inU64, packFp32, packFp64, toBigInt } from "../varint/num64.js";
-import { zigzagEncode } from "../varint/zigzag.js";
+import { HI, LO, S_U32, splitI64, splitU64 } from "../varint/bits64.js";
+import {
+  encodeVarintLoHi,
+  encodeVarintNum,
+  varintSizeLoHi,
+  varintSizeNum,
+} from "../varint/leb128.js";
+import { packFp32, packFp64, toBigInt } from "../varint/num64.js";
+import { encodeZigzagVarintLoHi } from "../varint/zigzag.js";
 import { encodeUtf8, utf8Length, utf8Write } from "./fixlen.js";
 import type { FlushSink } from "./sink.js";
 
@@ -83,8 +89,11 @@ export class OStream {
    * fixed hold-back window and hence no eager-framing fallback, which is what
    * CORELIB_PLAN §6 ("How deep the hold-back reaches") demands of an
    * implementation that can allocate: canonical output at *every* depth.
+   *
+   * Created on the first {@link OStream.writeSequenceBeginLazy}, so a message
+   * with no sequence field never allocates it.
    */
-  private readonly pending: number[] = [];
+  private pending: number[] | null = null;
   /** Valid entries in {@link OStream.pending}. */
   private nPending = 0;
   private kernel: Kernel;
@@ -174,9 +183,17 @@ export class OStream {
       return;
     }
     const v = toBigInt(value);
-    if (!inU64(v)) throw argumentError(`unsigned value ${v} out of 64-bit range`);
+    // splitU64 range-checks *and* splits in one store/load pair: the round-trip
+    // through the unsigned 64-bit scratch differs from the input exactly when
+    // the input was negative or ≥ 2^64 (bits64). The halves must be copied out
+    // before `header` runs, because a flush sink it may reach is caller code
+    // that can re-enter this encoder and overwrite the shared scratch.
+    if (!splitU64(v)) throw argumentError(`unsigned value ${v} out of 64-bit range`);
+    const lo = S_U32[LO]!;
+    const hi = S_U32[HI]!;
     this.header(id, WireType.Unsigned);
-    this.putVarint(v);
+    this.ensure(varintSizeLoHi(lo, hi));
+    this.pos = encodeVarintLoHi(lo, hi, this.buf, this.pos);
   }
 
   /** Write a signed integer field (zig-zag encoded). */
@@ -188,9 +205,21 @@ export class OStream {
       return;
     }
     const v = toBigInt(value);
-    if (!inI64(v)) throw argumentError(`signed value ${v} out of 64-bit range`);
+    // As in writeUnsigned, the signed scratch round-trip is both the `inI64`
+    // range check and the split; the halves are read out before `header`.
+    if (!splitI64(v)) throw argumentError(`signed value ${v} out of 64-bit range`);
+    const lo = S_U32[LO]!;
+    const hi = S_U32[HI]!;
+    // Zig-zag on the halves — `(n << 1) ^ (n >> 63)` widened across both — so
+    // the exact varint size is known and only that many bytes are ensured, as
+    // before (a fixed caller buffer must not see a 10-byte demand for a 2-byte
+    // field).
+    const sgn = -(hi >>> 31) >>> 0;
+    const zLo = (((lo << 1) >>> 0) ^ sgn) >>> 0;
+    const zHi = ((((hi << 1) | (lo >>> 31)) >>> 0) ^ sgn) >>> 0;
     this.header(id, WireType.Signed);
-    this.putVarint(zigzagEncode(v));
+    this.ensure(varintSizeLoHi(zLo, zHi));
+    this.pos = encodeVarintLoHi(zLo, zHi, this.buf, this.pos);
   }
 
   /** Write a boolean field (encoded as the unsigned value 0 or 1). */
@@ -220,6 +249,29 @@ export class OStream {
     // buffer. This skips `TextEncoder.encode`'s per-call setup + throwaway array
     // + second copy — the encoder's dominant cost on string-heavy messages.
     if (this.canGrow) {
+      // Pure ASCII — the overwhelmingly common case for keys, identifiers and
+      // short text — needs neither of the general helpers: the UTF-8 byte length
+      // is the character count, so the header can go out after one scan and the
+      // payload is a straight character-to-byte copy. `utf8Length` /
+      // `utf8Write` below remain the single implementation of everything else,
+      // including all surrogate handling; this only short-circuits the case
+      // where both of them would reduce to exactly this loop.
+      const n = text.length;
+      let a = 0;
+      while (a < n && text.charCodeAt(a) < 0x80) a++;
+      if (a === n) {
+        if (n > FIXLEN_MAX) {
+          throw argumentError(`fixlen length ${n} exceeds ${FIXLEN_MAX}`);
+        }
+        this.fixlenHead(id, n, FixlenSubtype.String);
+        this.ensure(n);
+        const buf = this.buf;
+        const p = this.pos;
+        for (let k = 0; k < n; k++) buf[p + k] = text.charCodeAt(k);
+        this.pos = p + n;
+        return;
+      }
+
       const byteLen = utf8Length(text);
       if (byteLen > FIXLEN_MAX) {
         throw argumentError(`fixlen length ${byteLen} exceeds ${FIXLEN_MAX}`);
@@ -257,11 +309,17 @@ export class OStream {
       this.ensure(values.length * VARINT_MAX_BYTES);
       this.pos = this.kernel.encodeUnsignedVarints(values, this.buf, this.pos);
     } else {
+      // Streaming (fixed caller buffer): each element is range-checked and
+      // split by the same single scratch round-trip the scalar writers use, and
+      // the halves are read out before `ensure` — which may reach a flush sink,
+      // i.e. caller code that can re-enter and overwrite the scratch (bits64).
       for (let i = 0; i < values.length; i++) {
         const v = toBigInt(values[i]!);
-        if (!inU64(v)) throw argumentError(`unsigned value ${v} out of range`);
+        if (!splitU64(v)) throw argumentError(`unsigned value ${v} out of range`);
+        const lo = S_U32[LO]!;
+        const hi = S_U32[HI]!;
         this.ensure(VARINT_MAX_BYTES);
-        this.pos = encodeVarint(v, this.buf, this.pos);
+        this.pos = encodeVarintLoHi(lo, hi, this.buf, this.pos);
       }
     }
   }
@@ -273,11 +331,15 @@ export class OStream {
       this.ensure(values.length * VARINT_MAX_BYTES);
       this.pos = this.kernel.encodeSignedVarints(values, this.buf, this.pos);
     } else {
+      // See writeUnsignedArray: range-check and split in one round-trip, halves
+      // out before `ensure`, then zig-zag on the halves rather than in `bigint`.
       for (let i = 0; i < values.length; i++) {
         const v = toBigInt(values[i]!);
-        if (!inI64(v)) throw argumentError(`signed value ${v} out of range`);
+        if (!splitI64(v)) throw argumentError(`signed value ${v} out of range`);
+        const lo = S_U32[LO]!;
+        const hi = S_U32[HI]!;
         this.ensure(VARINT_MAX_BYTES);
-        this.pos = encodeVarint(zigzagEncode(v), this.buf, this.pos);
+        this.pos = encodeZigzagVarintLoHi(lo, hi, this.buf, this.pos);
       }
     }
   }
@@ -310,12 +372,7 @@ export class OStream {
     const buf = this.buf;
     for (let i = 0; i < values.length; i++) {
       const v = values[i]!;
-      const lo = v.low;
-      const hi = v.high;
-      const sgn = (-(hi >>> 31)) >>> 0; // all ones when negative, else zero
-      const zLo = (((lo << 1) >>> 0) ^ sgn) >>> 0;
-      const zHi = ((((hi << 1) | (lo >>> 31)) >>> 0) ^ sgn) >>> 0;
-      pos = encodeVarintLoHi(zLo, zHi, buf, pos);
+      pos = encodeZigzagVarintLoHi(v.low, v.high, buf, pos);
     }
     this.pos = pos;
   }
@@ -402,8 +459,9 @@ export class OStream {
       throw argumentError(`nesting exceeds MAX_DEPTH (${MAX_DEPTH})`);
     }
     // Validate here, not at commit time: the header may never be written, and a
-    // bad id must still be rejected at the call that supplied it.
-    if (id < 0 || id > ID_MAX || !Number.isInteger(id)) {
+    // bad id must still be rejected at the call that supplied it. (Same cheap
+    // integer/range test as `header`.)
+    if (id >>> 0 !== id || id > ID_MAX) {
       throw argumentError(`field id ${id} out of range 0..${ID_MAX}`);
     }
     // No hold-back window and so no eager fallback: the run is an ordinary
@@ -412,7 +470,7 @@ export class OStream {
     // canonical however deep it nests. That is what CORELIB_PLAN §6 ("How deep
     // the hold-back reaches") requires of an implementation that can allocate;
     // only a heap-free profile may bound the run and frame eagerly past it.
-    this.pending[this.nPending++] = id;
+    (this.pending ??= [])[this.nPending++] = id;
     this.depth++;
   }
 
@@ -474,14 +532,29 @@ export class OStream {
 
   // --- internals ----------------------------------------------------------
 
-  /** Ensure exactly `value`'s varint size, then write it (bigint path). */
-  private putVarint(value: bigint): void {
-    this.ensure(varintSize(value));
-    this.pos = encodeVarint(value, this.buf, this.pos);
-  }
-
   /** Ensure exactly `value`'s varint size, then write it (number fast path). */
   private putVarintNum(value: number): void {
+    // Single-byte fast path. Every value reaching here is non-negative (ids,
+    // lengths, counts, zig-zagged scalars, booleans), so `< 0x80` is exactly
+    // "one byte", and `pos < buf.length` is exactly "there is room for it".
+    // This is the most-executed line in the encoder — every field header, every
+    // fixlen word and every array count goes through it — and it skips the
+    // sizing pass, the `ensure` call and the encode call in one test.
+    const pos = this.pos;
+    if (value < 0x80 && pos < this.buf.length) {
+      this.buf[pos] = value;
+      this.pos = pos + 1;
+      return;
+    }
+    this.putVarintNumSlow(value);
+  }
+
+  /**
+   * The multi-byte / needs-room tail of {@link putVarintNum}, kept in its own
+   * method so the single-byte test above stays small enough for the JIT to
+   * inline into every `header` / `fixlenHead` / `arrayHead` call site.
+   */
+  private putVarintNumSlow(value: number): void {
     this.ensure(varintSizeNum(value));
     this.pos = encodeVarintNum(value, this.buf, this.pos);
   }
@@ -503,7 +576,12 @@ export class OStream {
    * {@link OStream.writeSequenceBeginLazy}, which writes no byte at all.
    */
   private header(id: number, type: WireType): void {
-    if (id < 0 || id > ID_MAX || !Number.isInteger(id)) {
+    // `id >>> 0 !== id` rejects every non-integer, negative and ≥ 2^32 value in
+    // one cheap coercion (ToUint32 is exact only on 0 .. 2^32-1 integers), so
+    // the remaining bound is the ID_MAX ceiling. Equivalent to the
+    // `id < 0 || id > ID_MAX || !Number.isInteger(id)` triple it replaces, minus
+    // the `Number.isInteger` call on every field write.
+    if (id >>> 0 !== id || id > ID_MAX) {
       throw argumentError(`field id ${id} out of range 0..${ID_MAX}`);
     }
     if (this.nPending !== 0) this.commitPending();
@@ -529,8 +607,9 @@ export class OStream {
     // emit these same ids a second time. The loop counts with the local `n`, so
     // clearing the field does not cut short the run it is already emitting.
     this.nPending = 0;
+    const pending = this.pending!;
     for (let i = 0; i < n; i++) {
-      this.putVarintNum(this.pending[i]! * 8 + WireType.SequenceStart);
+      this.putVarintNum(pending[i]! * 8 + WireType.SequenceStart);
     }
   }
 

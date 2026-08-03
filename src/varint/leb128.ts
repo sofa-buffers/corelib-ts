@@ -10,23 +10,34 @@
 
 import { VARINT_MAX_BYTES } from "../constants.js";
 import { incompleteError, invalidMsgError } from "../errors.js";
+import { HI, joinU64, LO, S_U32, S_U64 } from "./bits64.js";
 
 /** Number of bytes {@link encodeVarint} will write for `value` (unsigned). */
 export function varintSize(value: bigint): number {
-  let lo = Number(value & 0xffff_ffffn) >>> 0;
-  let hi = Number((value >> 32n) & 0xffff_ffffn) >>> 0;
-  let n = 0;
-  while (hi !== 0) {
-    n++;
-    const next = ((lo >>> 7) | (hi << 25)) >>> 0;
-    hi >>>= 7;
-    lo = next;
+  // Split through the shared scratch (see bits64): the two `bigint` masks and
+  // shift this replaces cost ~900 instructions, the store/load pair ~32.
+  S_U64[0] = value;
+  return varintSizeLoHi(S_U32[LO]!, S_U32[HI]!);
+}
+
+/**
+ * Number of bytes {@link encodeVarintLoHi} will write for the 64-bit value held
+ * as two unsigned 32-bit halves — the `bigint`-free sibling of
+ * {@link varintSize}, so a caller that has already split a value sizes it
+ * without splitting again.
+ */
+export function varintSizeLoHi(lo: number, hi: number): number {
+  // Below 2^32 the answer is a plain range ladder — no loop, no 64-bit shifting.
+  if (hi === 0) {
+    return lo < 0x80 ? 1 : lo < 0x4000 ? 2 : lo < 0x20_0000 ? 3 : lo < 0x1000_0000 ? 4 : 5;
   }
-  while (lo > 0x7f) {
-    n++;
-    lo >>>= 7;
-  }
-  return n + 1;
+  // Above it, the first five bytes are always full: four 7-bit groups out of
+  // `lo` plus a fifth straddling byte carrying lo's top 4 bits and hi's low 3.
+  // What remains is `hi >>> 3`, a 29-bit quantity, sized by the same ladder.
+  const h = hi >>> 3;
+  return h === 0
+    ? 5
+    : 5 + (h < 0x80 ? 1 : h < 0x4000 ? 2 : h < 0x20_0000 ? 3 : h < 0x1000_0000 ? 4 : 5);
 }
 
 /**
@@ -34,27 +45,18 @@ export function varintSize(value: bigint): number {
  * The caller must guarantee `out` has at least {@link VARINT_MAX_BYTES} bytes
  * of room from `pos`. Returns the position just past the last byte written.
  *
- * The 64-bit value is split into two 32-bit *number* halves once (the only two
- * `bigint` operations), then the LEB128 groups are produced with number-only
- * arithmetic — `lo`'s top bits are fed from `hi` as it drains. This avoids the
+ * The 64-bit value is split into two 32-bit *number* halves once — through the
+ * shared bit-punning scratch, so **no** `bigint` is allocated at all (see
+ * {@link "./bits64"}) — and the LEB128 groups are then produced with number-only
+ * arithmetic, `lo`'s top bits fed from `hi` as it drains. This avoids both the
  * ~20 short-lived `bigint` allocations a per-byte `v & 0x7fn; v >>= 7n` loop
- * would make, which V8 profiling showed to be the encoder's dominant cost.
+ * would make and the three the mask-and-shift split used to.
  */
 export function encodeVarint(value: bigint, out: Uint8Array, pos: number): number {
-  let lo = Number(value & 0xffff_ffffn) >>> 0;
-  let hi = Number((value >> 32n) & 0xffff_ffffn) >>> 0;
-  // While high bits remain, every emitted byte is a full 7-bit group + continuation.
-  while (hi !== 0) {
-    out[pos++] = (lo & 0x7f) | 0x80;
-    lo = ((lo >>> 7) | (hi << 25)) >>> 0; // shift the 64-bit value right by 7
-    hi >>>= 7;
-  }
-  while (lo > 0x7f) {
-    out[pos++] = (lo & 0x7f) | 0x80;
-    lo >>>= 7;
-  }
-  out[pos++] = lo;
-  return pos;
+  // One typed-array store replaces the three `bigint` allocations the mask and
+  // shift used to make; the halves are read back as plain numbers (see bits64).
+  S_U64[0] = value;
+  return encodeVarintLoHi(S_U32[LO]!, S_U32[HI]!, out, pos);
 }
 
 /**
@@ -68,16 +70,37 @@ export function encodeVarint(value: bigint, out: Uint8Array, pos: number): numbe
 export function encodeVarintLoHi(lo: number, hi: number, out: Uint8Array, pos: number): number {
   lo >>>= 0;
   hi >>>= 0;
-  while (hi !== 0) {
-    out[pos++] = (lo & 0x7f) | 0x80;
-    lo = ((lo >>> 7) | (hi << 25)) >>> 0;
-    hi >>>= 7;
+  if (hi === 0) {
+    // Wholly within 32 bits: a plain varint loop over `lo`, at most 5 bytes.
+    while (lo > 0x7f) {
+      out[pos++] = (lo & 0x7f) | 0x80;
+      lo >>>= 7;
+    }
+    out[pos++] = lo;
+    return pos;
   }
-  while (lo > 0x7f) {
-    out[pos++] = (lo & 0x7f) | 0x80;
-    lo >>>= 7;
+  // A real 64-bit value. The first four bytes are the four full 7-bit groups of
+  // `lo`, taken straight off it — the loop this replaces re-derived a shifted
+  // 64-bit value (`(lo >>> 7) | (hi << 25)`) for *every* byte, which is the
+  // dominant per-byte cost when every element is a full-width u64.
+  out[pos++] = (lo & 0x7f) | 0x80;
+  out[pos++] = ((lo >>> 7) & 0x7f) | 0x80;
+  out[pos++] = ((lo >>> 14) & 0x7f) | 0x80;
+  out[pos++] = ((lo >>> 21) & 0x7f) | 0x80;
+  // Fifth byte straddles the halves: lo's top 4 bits, then hi's low 3.
+  const b4 = (lo >>> 28) | ((hi & 0x07) << 4);
+  let h = hi >>> 3;
+  if (h === 0) {
+    out[pos++] = b4;
+    return pos;
   }
-  out[pos++] = lo;
+  out[pos++] = b4 | 0x80;
+  // What is left is a 29-bit quantity — an ordinary 32-bit varint tail.
+  while (h > 0x7f) {
+    out[pos++] = (h & 0x7f) | 0x80;
+    h >>>= 7;
+  }
+  out[pos++] = h;
   return pos;
 }
 
@@ -137,8 +160,11 @@ export interface VarintResult {
  * (an unterminated varint that more bytes could complete).
  */
 export function decodeVarint(buf: Uint8Array, pos: number): VarintResult {
-  let value = 0n;
-  let shift = 0n;
+  // Accumulate into two 32-bit *number* halves and materialise the `bigint`
+  // once, at the end — the per-byte `BigInt(b) << shift` this replaces
+  // allocated two `bigint`s for every byte consumed (see {@link "./bits64"}).
+  let lo = 0;
+  let hi = 0;
   let bytes = 0;
   for (;;) {
     if (pos >= buf.length) throw incompleteError("truncated varint");
@@ -149,9 +175,12 @@ export function decodeVarint(buf: Uint8Array, pos: number): VarintResult {
     if (bytes === VARINT_MAX_BYTES - 1 && (byte & 0x7f) > 1) {
       throw invalidMsgError("varint overflow");
     }
-    value |= BigInt(byte & 0x7f) << shift;
+    if (bytes < 4) lo |= (byte & 0x7f) << (7 * bytes);
+    else if (bytes === 4) {
+      lo |= (byte & 0x0f) << 28;
+      hi |= (byte >> 4) & 0x07;
+    } else hi |= (byte & 0x7f) << (7 * bytes - 32);
     bytes++;
-    if ((byte & 0x80) === 0) return { value, pos };
-    shift += 7n;
+    if ((byte & 0x80) === 0) return { value: joinU64(lo >>> 0, hi >>> 0), pos };
   }
 }

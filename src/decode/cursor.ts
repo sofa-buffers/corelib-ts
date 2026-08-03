@@ -39,7 +39,8 @@ import {
   limitExceededError,
 } from "../errors.js";
 import { Long } from "../long.js";
-import { zigzagDecode } from "../varint/zigzag.js";
+import { joinU64 } from "../varint/bits64.js";
+import { zigzagDecodeLoHi } from "../varint/zigzag.js";
 import type { DecodeLimits } from "./limits.js";
 
 const TWO32 = 0x1_0000_0000; // 2^32, for combining the 32-bit halves
@@ -655,21 +656,14 @@ export class Cursor {
   // --- varint reading (shared verbatim with ./fast) -----------------------
 
   /**
-   * The last varint's full value as a `bigint` (64-bit fidelity). Only ever
-   * called from {@link unsignedValue} / {@link signedValue} on the `hi` overflow
-   * path (`this.hi >>> 0 > 0x1fffff`), so `hi` is always non-zero here.
-   */
-  private big(): bigint {
-    return (BigInt(this.hi >>> 0) << 32n) | BigInt(this.lo >>> 0);
-  }
-
-  /**
    * The last varint as an unsigned value, number-first: a `number` when it fits
-   * exactly (`≤ 2^53-1`), a `bigint` only beyond that.
+   * exactly (`≤ 2^53-1`), a `bigint` only beyond that — built by punning the two
+   * halves through the shared scratch, so one `bigint` is allocated where the
+   * shift-and-or form allocated four ({@link "../varint/bits64"}).
    */
   private unsignedValue(): number | bigint {
     const hi = this.hi >>> 0;
-    return hi <= 0x1fffff ? hi * TWO32 + (this.lo >>> 0) : this.big();
+    return hi <= 0x1fffff ? hi * TWO32 + (this.lo >>> 0) : joinU64(this.lo >>> 0, hi);
   }
 
   /** The last zig-zag varint as a signed value, number-first. */
@@ -679,7 +673,7 @@ export class Cursor {
       const r = hi * TWO32 + (this.lo >>> 0); // raw zig-zag, ≤ 2^53-1
       return r % 2 === 0 ? r / 2 : -(r + 1) / 2;
     }
-    return zigzagDecode(this.big());
+    return zigzagDecodeLoHi(this.lo >>> 0, hi);
   }
 
   /** The last varint's value as a JS number — exact for ids/lengths/counts. */

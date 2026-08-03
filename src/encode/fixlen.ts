@@ -60,8 +60,17 @@ export function encodeUtf8(text: string): Uint8Array {
  * `U+FFFD` (3-byte) replacement (MESSAGE_SPEC §8).
  */
 export function utf8Length(text: string): number {
-  let len = 0;
-  for (let i = 0; i < text.length; i++) {
+  const n = text.length;
+  // ASCII pre-scan: one compare per character, no branch tree and no running
+  // sum. Identifiers, keys and most short strings are pure ASCII, where this
+  // returns immediately with `len === n`; anything else resumes the general
+  // walk below at the first non-ASCII character, so nothing is scanned twice.
+  let a = 0;
+  while (a < n && text.charCodeAt(a) < 0x80) a++;
+  if (a === n) return n;
+
+  let len = a;
+  for (let i = a; i < n; i++) {
     const c = text.charCodeAt(i);
     if (c < 0x80) {
       len += 1;
@@ -97,7 +106,21 @@ export function utf8Length(text: string): number {
  * {@link utf8Length} first, so the fast path rejects before any byte is emitted.
  */
 export function utf8Write(text: string, out: Uint8Array, pos: number): number {
-  for (let i = 0; i < text.length; i++) {
+  const n = text.length;
+  // ASCII fast copy, mirroring utf8Length's pre-scan: one compare and one store
+  // per character until the first non-ASCII one, then the general walk resumes
+  // from there.
+  let a = 0;
+  while (a < n) {
+    const c = text.charCodeAt(a);
+    if (c >= 0x80) break;
+    out[pos + a] = c;
+    a++;
+  }
+  pos += a;
+  if (a === n) return pos;
+
+  for (let i = a; i < n; i++) {
     let c = text.charCodeAt(i);
     if (c < 0x80) {
       out[pos++] = c;

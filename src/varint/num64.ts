@@ -9,7 +9,14 @@
 
 import { I64_MAX, I64_MIN, U64_MAX } from "../constants.js";
 
-const SCRATCH = new DataView(new ArrayBuffer(8));
+// One 8-byte scratch, viewed two ways: the `DataView` performs the IEEE-754
+// conversion with an explicit little-endian flag (so the wire stays
+// little-endian on any host, §4), and the `Uint8Array` alias moves the bytes.
+// Reading through the alias rather than `DataView.getUint8` turns each byte
+// into a plain typed-array load instead of a method call.
+const SCRATCH_BUF = new ArrayBuffer(8);
+const SCRATCH = new DataView(SCRATCH_BUF);
+const SCRATCH_BYTES = new Uint8Array(SCRATCH_BUF);
 
 /** Coerce a `number | bigint` to a `bigint`, rejecting non-integers. */
 export function toBigInt(value: number | bigint): bigint {
@@ -20,44 +27,68 @@ export function toBigInt(value: number | bigint): bigint {
   return BigInt(value);
 }
 
-/** True when `value` fits in an unsigned 64-bit integer. */
-export function inU64(value: bigint): boolean {
-  return value >= 0n && value <= U64_MAX;
-}
-
-/** True when `value` fits in a signed 64-bit integer. */
-export function inI64(value: bigint): boolean {
-  return value >= I64_MIN && value <= I64_MAX;
-}
-
 /** Write `value` as a little-endian fp32 into `out` at `pos`; returns `pos + 4`. */
 export function packFp32(out: Uint8Array, pos: number, value: number): number {
   SCRATCH.setFloat32(0, value, true);
-  out[pos] = SCRATCH.getUint8(0);
-  out[pos + 1] = SCRATCH.getUint8(1);
-  out[pos + 2] = SCRATCH.getUint8(2);
-  out[pos + 3] = SCRATCH.getUint8(3);
+  out[pos] = SCRATCH_BYTES[0]!;
+  out[pos + 1] = SCRATCH_BYTES[1]!;
+  out[pos + 2] = SCRATCH_BYTES[2]!;
+  out[pos + 3] = SCRATCH_BYTES[3]!;
   return pos + 4;
 }
 
 /** Write `value` as a little-endian fp64 into `out` at `pos`; returns `pos + 8`. */
 export function packFp64(out: Uint8Array, pos: number, value: number): number {
   SCRATCH.setFloat64(0, value, true);
-  for (let i = 0; i < 8; i++) out[pos + i] = SCRATCH.getUint8(i);
+  out[pos] = SCRATCH_BYTES[0]!;
+  out[pos + 1] = SCRATCH_BYTES[1]!;
+  out[pos + 2] = SCRATCH_BYTES[2]!;
+  out[pos + 3] = SCRATCH_BYTES[3]!;
+  out[pos + 4] = SCRATCH_BYTES[4]!;
+  out[pos + 5] = SCRATCH_BYTES[5]!;
+  out[pos + 6] = SCRATCH_BYTES[6]!;
+  out[pos + 7] = SCRATCH_BYTES[7]!;
   return pos + 8;
 }
 
-/** Read a little-endian fp32 from `buf` at `pos`. */
-export function unpackFp32(buf: Uint8Array, pos: number): number {
-  SCRATCH.setUint8(0, buf[pos]!);
-  SCRATCH.setUint8(1, buf[pos + 1]!);
-  SCRATCH.setUint8(2, buf[pos + 2]!);
-  SCRATCH.setUint8(3, buf[pos + 3]!);
+/**
+ * Reinterpret the 4 little-endian wire bytes of an fp32, packed into one 32-bit
+ * word (byte `k` in bits `8*k`), as a `number`. The companion to a resumable
+ * decoder that accumulates float bytes into a machine word instead of a
+ * per-instance byte array.
+ */
+export function fp32FromBits(bits: number): number {
+  SCRATCH.setUint32(0, bits, true);
   return SCRATCH.getFloat32(0, true);
 }
 
-/** Read a little-endian fp64 from `buf` at `pos`. */
-export function unpackFp64(buf: Uint8Array, pos: number): number {
-  for (let i = 0; i < 8; i++) SCRATCH.setUint8(i, buf[pos + i]!);
+/** Reinterpret the 8 little-endian wire bytes of an fp64, packed into two words. */
+export function fp64FromBits(lo: number, hi: number): number {
+  SCRATCH.setUint32(0, lo, true);
+  SCRATCH.setUint32(4, hi, true);
   return SCRATCH.getFloat64(0, true);
 }
+
+// The raw fp32 channel gets its own 4-byte scratch and its own persistent view,
+// deliberately *not* the one pack/unpack use. The whole point of the channel is
+// decode-then-re-encode, so the view is live while the consumer calls back into
+// the encoder — and sharing a buffer with `packFp32` would let that re-encode
+// overwrite the very bytes it is reading. The view is allocated once, so
+// handing it out costs no allocation per element.
+const RAW_FP32_BUF = new ArrayBuffer(4);
+const RAW_FP32_DV = new DataView(RAW_FP32_BUF);
+const RAW_FP32_VIEW = new Uint8Array(RAW_FP32_BUF);
+
+/**
+ * The 4 wire bytes of an fp32 packed word, as a `Uint8Array` view — the raw
+ * channel that lets a bit-exact consumer keep a signaling NaN (§4.6/§6.5).
+ *
+ * The view aliases a shared scratch and, exactly like the string / blob `chunk`
+ * views the decoder hands out, is valid only until the next delivered fp32; a
+ * consumer that retains it must copy.
+ */
+export function rawFp32Bytes(bits: number): Uint8Array {
+  RAW_FP32_DV.setUint32(0, bits, true);
+  return RAW_FP32_VIEW;
+}
+
