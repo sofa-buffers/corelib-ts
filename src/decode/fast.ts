@@ -41,7 +41,8 @@ import {
   invalidMsgError,
   limitExceededError,
 } from "../errors.js";
-import { zigzagDecode } from "../varint/zigzag.js";
+import { joinU64 } from "../varint/bits64.js";
+import { zigzagDecodeLoHi } from "../varint/zigzag.js";
 import type { DecodeLimits } from "./limits.js";
 import type { Visitor } from "./istream.js";
 
@@ -263,13 +264,6 @@ class FastDecoder {
 
   // --- varint reading -----------------------------------------------------
 
-  /** The last varint's full value as a `bigint` (64-bit fidelity). */
-  private big(): bigint {
-    return this.hi === 0
-      ? BigInt(this.lo >>> 0)
-      : (BigInt(this.hi >>> 0) << 32n) | BigInt(this.lo >>> 0);
-  }
-
   /**
    * The last varint as an unsigned value, number-first: a `number` when it fits
    * exactly (`≤ 2^53-1` — all ids, u8..u32 and small u64s), a `bigint` only
@@ -277,7 +271,9 @@ class FastDecoder {
    */
   private unsignedValue(): number | bigint {
     const hi = this.hi >>> 0; // unsigned: hi's bit 31 must not read as negative
-    return hi <= 0x1fffff ? hi * TWO32 + (this.lo >>> 0) : this.big();
+    return hi <= 0x1fffff
+      ? hi * TWO32 + (this.lo >>> 0)
+      : joinU64(this.lo >>> 0, hi); // one bigint, not four (bits64)
   }
 
   /** The last zig-zag varint as a signed value, number-first (see {@link unsignedValue}). */
@@ -287,7 +283,7 @@ class FastDecoder {
       const r = hi * TWO32 + (this.lo >>> 0); // raw zig-zag, ≤ 2^53-1
       return r % 2 === 0 ? r / 2 : -(r + 1) / 2;
     }
-    return zigzagDecode(this.big());
+    return zigzagDecodeLoHi(this.lo >>> 0, hi);
   }
 
   /** The last varint's value as a JS number — exact for ids/lengths/counts. */

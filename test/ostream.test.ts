@@ -49,6 +49,39 @@ describe("OStream streaming", () => {
     expect(swaps).toBeGreaterThan(1);
   });
 
+  // The two array routes are separate code: the growable one hands the whole
+  // array to the kernel, the streaming one range-checks and encodes element by
+  // element. Both derive their 32-bit halves from the same scratch round-trip,
+  // so this pins them against each other at the values where that round-trip's
+  // truncation and sign handling actually differ.
+  it("agrees with the in-memory path at the 64-bit extremes", () => {
+    const u64 = [0n, 1n, 127n, 128n, (1n << 32n) - 1n, 1n << 32n, (1n << 63n) - 1n, 1n << 63n, (1n << 64n) - 1n];
+    const i64 = [0n, -1n, 1n, -128n, 127n, (1n << 31n) - 1n, -(1n << 31n), (1n << 63n) - 1n, -(1n << 63n)];
+    const build = (os: OStream): void => {
+      os.writeUnsignedArray(1, u64);
+      os.writeSignedArray(2, i64);
+    };
+
+    const { sink, bytes } = collect();
+    const streamed = new OStream(new Uint8Array(11), 0, sink);
+    build(streamed);
+    streamed.flush();
+
+    const mem = new OStream();
+    build(mem);
+
+    expect(bytes()).toEqual(mem.bytes());
+  });
+
+  it("rejects out-of-range array elements on the streaming path", () => {
+    const { sink } = collect();
+    const os = () => new OStream(new Uint8Array(32), 0, sink);
+    expect(() => os().writeUnsignedArray(1, [1n << 64n])).toThrow(/out of range/);
+    expect(() => os().writeUnsignedArray(1, [-1n])).toThrow(/out of range/);
+    expect(() => os().writeSignedArray(2, [1n << 63n])).toThrow(/out of range/);
+    expect(() => os().writeSignedArray(2, [-(1n << 63n) - 1n])).toThrow(/out of range/);
+  });
+
   it("streams every array kind through a small buffer (per-element path)", () => {
     const build = (os: OStream): void => {
       os.writeUnsignedArray(1, [1, 2, 300000, 1n << 50n]);

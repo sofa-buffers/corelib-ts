@@ -35,6 +35,53 @@ describe("chunked feeding", () => {
     it("decodes in 7-byte chunks", () => {
       expect(feedInChunks(bytes, 7)).toBe(vector.serialized.hex);
     });
+
+    // A chunk wider than the longest varint lets the decoder take its bulk
+    // path — whole varints read straight out of the chunk with no resume
+    // bookkeeping, and array elements drained without re-entering the state
+    // switch. The 1- and 7-byte sizes above can never reach it (both are
+    // narrower than VARINT_MAX_BYTES), so without this the fast route through
+    // the state machine would go unexercised while the slow one is covered
+    // twice.
+    it("decodes as a single whole-buffer chunk", () => {
+      expect(feedInChunks(bytes, Math.max(bytes.length, 1))).toBe(vector.serialized.hex);
+    });
+
+    it("decodes in 16-byte chunks", () => {
+      expect(feedInChunks(bytes, 16)).toBe(vector.serialized.hex);
+    });
+  });
+
+  // The decoder has two routes through every construct: a bulk one that reads
+  // whole varints straight out of the chunk, and a resumable one that carries a
+  // half-read varint across the boundary. Which route runs depends on where the
+  // splits fall, so fixed chunk sizes only ever probe a few alignments. This
+  // walks every vector with a deterministic pseudo-random split pattern, which
+  // is what catches a boundary that hands the bulk route a pending accumulator.
+  describe("arbitrary split points", () => {
+    it.each(vectors.map((v) => [v.name, v] as const))("%s", (_name, vector) => {
+      const bytes = hexToBytes(vector.serialized.hex);
+      // xorshift32, seeded per vector so a failure reproduces exactly.
+      let seed = 0x9e37_79b9;
+      const next = (): number => {
+        seed ^= seed << 13;
+        seed ^= seed >>> 17;
+        seed ^= seed << 5;
+        return (seed >>> 0) % 13; // 0..12, straddling VARINT_MAX_BYTES
+      };
+      for (let trial = 0; trial < 8; trial++) {
+        const out = new OStream();
+        const visitor = new TranscodeVisitor(out);
+        const is = new IStream();
+        for (let i = 0; i < bytes.length; ) {
+          const take = next() + 1;
+          is.feed(bytes.subarray(i, i + take), visitor);
+          i += take;
+        }
+        is.end();
+        expect(bytesToHex(out.bytes())).toBe(vector.serialized.hex);
+      }
+    });
   });
 
   it("handles an empty chunk without advancing", () => {

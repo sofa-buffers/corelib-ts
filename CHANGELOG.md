@@ -6,6 +6,80 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the version is below `1.0.0`, breaking changes bump the **minor** version.
 
+## [Unreleased]
+
+### Performance
+
+Encoder and decoder throughput work. No wire-format, API or behavioural change —
+the shared vectors, the round-trip and chunked suites, and the byte-exactness
+guarantees are all unchanged; only the instruction cost of getting there moved.
+Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
+
+| Workload | before | after | |
+|---|---|---|---|
+| `encode: u64 array (1000)` | 1,229,088 | 259,650 | **−78.9%** |
+| `encode: typical message` | 13,360 | 10,408 | **−22.1%** |
+| `decode: u64 array (1000)` | 1,458,937 | 721,954 | **−50.5%** |
+| `decode: typical message` | 14,204 | 12,511 | **−11.9%** |
+
+- **`bigint` ⇄ 32-bit halves now goes through bit punning, not arithmetic**
+  (`src/varint/bits64.ts`). One `ArrayBuffer` aliased by a `BigUint64Array` and a
+  `Uint32Array` converts in both directions with no intermediate allocation,
+  where `Number(v & 0xffff_ffffn)` and `(BigInt(hi) << 32n) | BigInt(lo)`
+  allocated a `bigint` per intermediate. Profiling put the split alone at ~74% of
+  the `u64 array` encode. Truncation is identical — a `BigUint64Array` store
+  *is* reduction modulo 2^64 — so out-of-range inputs wrap exactly as before.
+- **64-bit range checks fused into the split.** `writeUnsigned` / `writeSigned`
+  and the streaming array writers get their `inU64` / `inI64` verdict from the
+  same scratch round-trip that produces the halves, instead of two `bigint`
+  comparisons followed by three `bigint` allocations.
+- **The varint writer no longer re-derives a shifted 64-bit value per byte.**
+  Above 2^32 the first four bytes come straight off the low half and the tail is
+  an ordinary 32-bit varint loop; `varintSizeLoHi` answers from a range ladder
+  rather than a loop. Zig-zag likewise runs on the halves.
+- **Decoder: fewer `bigint`s and less per-byte state.** A 64-bit value costs one
+  `bigint` instead of four; a varint whose bytes are all present in the chunk is
+  read by an unrolled reader with no resume bookkeeping; array elements drain in
+  a loop that does not re-enter the state switch; the current visitor is held in
+  a field rather than re-derived from a stack top.
+- **Fewer per-object allocations.** The decoder's resumable float scratch is two
+  number fields rather than a per-`IStream` `Uint8Array(8)`; the visitor stack
+  and the encoder's held-back-sequence array are created only if a nested
+  sequence actually occurs.
+- **Pure-ASCII strings skip the general UTF-8 walk** on both the length and the
+  write pass — the byte length is the character count, so the payload is a
+  straight character-to-byte copy. Non-ASCII is untouched, including every
+  surrogate rule.
+
+### Fixed
+
+- **`bench/run_callgrind.sh` produced an empty table.** It launched the workload
+  through `npx tsx`, which puts it in a *child* process that Callgrind does not
+  trace, so no per-op counts were collected at all. It now bundles the benchmark
+  to plain JS and runs bare `node`, and adds `--predictable` so V8's background
+  compile and GC threads cannot move the total between the two rep counts being
+  subtracted (repeat runs now agree to ~0.01%, against tens of millions of
+  instructions of drift before). Its default rep counts for the two
+  small-message workloads were also raised past V8's tier-up: at 1000 ops the
+  subtraction was reporting the JIT warming up rather than steady-state per-op
+  cost, which is not comparable with the compiled ports' `Ir/op`.
+- **Chunked decode of an array element split across a chunk boundary.** Found by
+  the new whole-buffer and 16-byte chunk scenarios; the bulk element loop could
+  start a fresh varint while a half-read one was still in the accumulator.
+
+### Tests
+
+- The chunked-decode suite now also feeds every vector as a single whole-buffer
+  chunk, in 16-byte chunks, and at deterministic pseudo-random split points. The
+  previous sizes (1 and 7 bytes) are both narrower than a maximum varint, so the
+  decoder's bulk route was never exercised while the resumable one was covered
+  twice.
+- `kernel.test.ts` pins the JS kernel's inlined bulk varint writer against the
+  shared helper over a corpus covering every varint-length boundary, so the one
+  deliberate duplication on the hot path cannot drift.
+- `float-bits.test.ts` covers re-encoding *during* an `fp32` raw-channel
+  callback, which is what the raw view's dedicated scratch exists to make safe.
+
 ## [0.10.0] - 2026-08-01
 
 > The breaking entries below make the next release a **minor** bump (the first

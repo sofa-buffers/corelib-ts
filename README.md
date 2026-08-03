@@ -312,7 +312,7 @@ a separate `docs.yml` deploys the TypeDoc API reference to GitHub Pages.
 
 ## Benchmarks
 
-Two standalone tools mirror the other-language ports so implementations can be
+Three standalone tools mirror the other-language ports so implementations can be
 compared directly:
 
 ```bash

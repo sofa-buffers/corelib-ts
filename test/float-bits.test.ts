@@ -194,3 +194,34 @@ describe("Visitor.fp32 raw channel vs. the quieted double (#66)", () => {
     expect(dv.getUint32(0, true)).toBe(0x7fc00001);
   });
 });
+
+describe("the raw fp32 view survives encoder use during the callback", () => {
+  // The streaming decoder hands `raw` out as a view over a module-level
+  // scratch rather than a per-decoder byte array. That is only safe if the
+  // scratch is not the one the *encoder's* float packer uses: the whole point
+  // of the channel is to re-encode inside the callback, so a consumer that
+  // writes an unrelated fp32 first must still read its own bytes back intact.
+  for (const [name, drive] of DRIVERS) {
+    it(`keeps the sNaN payload readable after an interleaved writeFp32 (${name})`, () => {
+      const os = new OStream();
+      os.writeFixlen(1, FP32_SNAN, FixlenSubtype.Fp32);
+      const wire = os.bytes();
+
+      const out = new OStream();
+      let seen: string | undefined;
+      drive(wire, {
+        fp32Raw: true,
+        fp32(id, _value, raw) {
+          // Pack an unrelated float first — this is what would clobber a
+          // shared scratch — then re-emit the raw bytes we were handed.
+          out.writeFp32(99, 1.5);
+          out.writeFixlen(id, raw!, FixlenSubtype.Fp32);
+          seen = bytesToHex(raw!);
+        },
+      });
+
+      expect(seen).toBe(bytesToHex(FP32_SNAN));
+      expect(bytesToHex(out.bytes()).endsWith("0100807f")).toBe(true);
+    });
+  }
+});
