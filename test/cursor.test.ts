@@ -690,6 +690,102 @@ describe("Cursor skip fixlen validation (§5.2 precedence; corelib-ts#49)", () =
   });
 });
 
+// An integer array whose declared count exceeds the bytes remaining used to
+// short-circuit to INCOMPLETE from arrayCount's allocation guard, before a single
+// element byte was examined — so an element varint already provably overlong was
+// reported as truncation. §5.2 gives INVALID precedence when input is both
+// malformed and truncated (corelib-ts#82, Crucible F-0053).
+describe("Cursor skip array count vs. element validation (§5.2 precedence; corelib-ts#82)", () => {
+  // `43 0b 80*10`: id 8 / ArrayUnsigned, count 11, then ten all-continuation
+  // bytes. The element varint cannot terminate before its 11th byte, which is
+  // past the 10-byte / 64-bit maximum (§4.1) — decidable from the bytes in hand.
+  const isolate = bytes(header(8, 3 /* ArrayUnsigned */), uvarint(11n), Array(10).fill(0x80));
+
+  it("rejects an overlong element varint whose array count outruns the buffer", () => {
+    expect(
+      codeOf(() => {
+        const c = new Cursor(isolate);
+        c.readHeader();
+        c.skip(3);
+      }),
+    ).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  it("rejects the same for a signed array", () => {
+    const buf = bytes(header(8, 4 /* ArraySigned */), uvarint(11n), Array(10).fill(0x80));
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.skip(4);
+      }),
+    ).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  // The count sweep that identified the mechanism: with the same ten payload
+  // bytes, every count must reject — the break used to sit exactly at 11, the
+  // first count that cannot fit in ten bytes (an element is at minimum 1 byte).
+  it("rejects at every declared count over the same payload", () => {
+    for (let count = 1; count <= 15; count++) {
+      const buf = bytes(header(8, 3), uvarint(BigInt(count)), Array(10).fill(0x80));
+      expect(
+        codeOf(() => {
+          const c = new Cursor(buf);
+          c.readHeader();
+          c.skip(3);
+        }),
+        `count ${count}`,
+      ).toBe(SofabErrorCode.InvalidMsg);
+    }
+  });
+
+  // Controls: the fix must not turn ordinary truncation into INVALID.
+  it("still reports INCOMPLETE for a well-formed but truncated skipped array", () => {
+    // count 11, three legal one-byte elements, then end of input.
+    const buf = bytes(header(8, 3), uvarint(11n), [0x01, 0x02, 0x03]);
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.skip(3);
+      }),
+    ).toBe(SofabErrorCode.Incomplete);
+  });
+
+  it("still accepts an array whose count and elements agree", () => {
+    const buf = bytes(header(8, 3), uvarint(11n), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    const c = new Cursor(buf);
+    expect(c.readHeader()).toBe(true);
+    c.skip(3);
+    expect(c.readHeader()).toBe(false); // resynced cleanly at end of buffer
+  });
+
+  // A hostile count with no maxArrayCount cap must still terminate: the element
+  // loop consumes ≥ 1 byte per iteration and readVarint throws at end of buffer.
+  it("terminates on a huge count rather than looping on the declared value", () => {
+    const buf = bytes(header(8, 3), uvarint(2_000_000_000n), [0x01]);
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf);
+        c.readHeader();
+        c.skip(3);
+      }),
+    ).toBe(SofabErrorCode.Incomplete);
+  });
+
+  // The opt-in cap still precedes the element walk (INVALID > LIMIT_EXCEEDED is
+  // not at stake here: the count word alone decides).
+  it("still reports LIMIT_EXCEEDED for a count above maxArrayCount", () => {
+    expect(
+      codeOf(() => {
+        const c = new Cursor(isolate, { maxArrayCount: 4 });
+        c.readHeader();
+        c.skip(3);
+      }),
+    ).toBe(SofabErrorCode.LimitExceeded);
+  });
+});
+
 // The known-field array read path must validate the fixlen element word at its
 // header exactly like the skip path (#49), so a *malformed* element word is
 // INVALID even when the payload is also truncated — INVALID takes precedence

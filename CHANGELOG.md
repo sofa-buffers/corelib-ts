@@ -53,6 +53,28 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Fixed
 
+- **An array count larger than the bytes remaining reported `INCOMPLETE` for an
+  already-malformed element varint** (#82, Crucible F-0053). On the pull
+  decoder's skip path, `Cursor.skip` read the count through `arrayCount`, whose
+  `count ≤ remaining-bytes` guard decided the outcome before a single element
+  byte was examined — so ten all-continuation bytes under a declared count of 11
+  came back as truncation, where §5.2 gives `INVALID` precedence over
+  `INCOMPLETE` for input that is both malformed and truncated. That guard exists
+  to bound `new Array(count)` on the *read* paths; a skip materializes nothing,
+  so it is now omitted there (the same reasoning already applied to fixlen arrays
+  in #49) and the element varints are validated as they are walked. The push
+  (`decode`) path never had the pre-check and is unchanged; genuine truncation
+  still reports `INCOMPLETE`, and the opt-in `maxArrayCount` cap still fires at
+  the count word.
+- **A varint that overflows 64 bits was reported as `INCOMPLETE` when the chunk
+  boundary fell on its tenth byte** (found while fixing #82). Ten bytes all
+  carrying the continuation flag require an eleventh, which is past the 10-byte
+  maximum (§4.1) — decidable from the bytes in hand. `IStream`'s resumable varint
+  reader only tested the byte count on the *next* byte, so a chunk ending exactly
+  at ten bytes suspended instead, and `end()` reported `Incomplete`; the same
+  bytes fed as one chunk threw `INVALID_MSG`. It now rejects at the tenth byte,
+  so the verdict no longer depends on where the chunks were split. A varint
+  suspended at nine bytes or fewer still resumes normally.
 - **`bench/run_callgrind.sh` produced an empty table.** It launched the workload
   through `npx tsx`, which puts it in a *child* process that Callgrind does not
   trace, so no per-op counts were collected at all. It now bundles the benchmark

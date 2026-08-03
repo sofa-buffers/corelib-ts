@@ -396,7 +396,11 @@ export class Cursor {
       }
       case WireType.ArrayUnsigned:
       case WireType.ArraySigned: {
-        const count = this.arrayCount();
+        // {@link skipArrayCount}, not {@link arrayCount}: the elements are parsed
+        // below, and a varint already in hand that is provably malformed must
+        // surface as INVALID rather than being pre-empted by the count ≤
+        // remaining-bytes truncation guard (corelib-ts#82).
+        const count = this.skipArrayCount();
         for (let i = 0; i < count; i++) this.readVarint();
         return;
       }
@@ -404,19 +408,9 @@ export class Cursor {
         // Read count and the element word, then validate the element type at the
         // header before taking the payload — a fixlen array carries only fp32
         // (size 4) or fp64 (size 8) elements (§4.8), so any other element word is
-        // INVALID even when the payload is truncated (§5.2 precedence). This
-        // deliberately does NOT use {@link arrayCount}'s count ≤ remaining-bytes
-        // guard: that guard exists to bound allocation on the read paths, but the
-        // skip path allocates nothing, and applying it here would report a
-        // malformed-element array as INCOMPLETE instead of INVALID (corelib-ts#49).
-        this.readVarint();
-        const count = this.num();
-        if (count > ARRAY_MAX) throw invalidMsgError("array count out of range");
-        if (count > this.maxArrayCount) {
-          throw limitExceededError(
-            `array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`,
-          );
-        }
+        // INVALID even when the payload is truncated (§5.2 precedence). Uses
+        // {@link skipArrayCount} for the same reason (corelib-ts#49).
+        const count = this.skipArrayCount();
         this.readVarint();
         const sub = this.lo & 7;
         const size = this.upper();
@@ -528,6 +522,36 @@ export class Cursor {
     // (count * elemSize) is applied once the element word is read, in
     // {@link arrayFixlenHeader}.
     if (count > this.n - this.p) throw incompleteError("truncated array");
+    return count;
+  }
+
+  /**
+   * Read and validate an array count word on the **skip** path (§4.7/§4.8):
+   * range- and limit-checked exactly as {@link arrayCount}, but *without* its
+   * `count ≤ remaining-bytes` guard.
+   *
+   * That guard exists solely to bound `new Array(count)` against a hostile count
+   * on the read paths. A skip materializes nothing, so it buys no safety here —
+   * and it is not free: it decides the outcome from the count alone, *before* a
+   * single element byte is examined. §5.2 gives INVALID precedence over
+   * INCOMPLETE, so input that is both malformed and truncated must be reported
+   * as INVALID; letting the guard fire first reports an already-provably-bad
+   * element varint as mere truncation (corelib-ts#82 / #49, Crucible F-0053).
+   *
+   * Dropping the guard cannot cost unbounded work: the caller's element loop
+   * consumes at least one buffer byte per iteration and {@link readVarint}
+   * throws at end of buffer, so it still terminates within `n` iterations
+   * regardless of how large the declared count is.
+   */
+  private skipArrayCount(): number {
+    this.readVarint();
+    const count = this.num();
+    if (count > ARRAY_MAX) throw invalidMsgError("array count out of range");
+    if (count > this.maxArrayCount) {
+      throw limitExceededError(
+        `array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`,
+      );
+    }
     return count;
   }
 
