@@ -157,6 +157,11 @@ export class Cursor {
     }
     this.readVarint();
     const wire = this.lo & 7;
+    // §4.9/§6.2: bound the id on every header before dispatching on the wire
+    // type — a sequence end's id is discarded, not exempt (documentation#35,
+    // and see fast.ts).
+    const id = this.upper();
+    if (id > ID_MAX) throw invalidMsgError(`field id ${id} out of range`);
     if (wire === WireType.SequenceEnd) {
       // A sequence-end closes the current nested scope. At the root (depth 0)
       // there is no open sequence to close, so it is a dangling marker → INVALID
@@ -167,8 +172,6 @@ export class Cursor {
       this.depth--;
       return false;
     }
-    const id = this.upper();
-    if (id > ID_MAX) throw invalidMsgError(`field id ${id} out of range`);
     if (wire === WireType.SequenceStart) {
       // §4.9/§6.2: reject nesting deeper than MAX_DEPTH. `depth` counts open
       // sequences (0 = root), so the (MAX_DEPTH + 1)-th open is the first to
@@ -432,12 +435,14 @@ export class Cursor {
       if (this.p >= this.n) throw incompleteError("truncated message: unbalanced sequence");
       this.readVarint();
       const wire = this.lo & 7;
+      // §4.9/§6.2: the skip path bounds the id on every header too, sequence
+      // ends included — same guard, same position as {@link readHeader}.
+      const id = this.upper();
+      if (id > ID_MAX) throw invalidMsgError(`field id ${id} out of range`);
       if (wire === WireType.SequenceEnd) {
         depth--;
         continue;
       }
-      const id = this.upper();
-      if (id > ID_MAX) throw invalidMsgError(`field id ${id} out of range`);
       if (wire === WireType.SequenceStart) {
         // §4.9/§6.2: the skip path must honour the same MAX_DEPTH ceiling as the
         // read path ({@link readHeader}), else a subtree skipped on a wire-type

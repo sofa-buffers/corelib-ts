@@ -13,6 +13,7 @@
 import { describe, expect, it } from "vitest";
 import {
   ArrayKind,
+  Cursor,
   IStream,
   MAX_DEPTH,
   OStream,
@@ -22,7 +23,7 @@ import {
   type Visitor,
 } from "../src/index.js";
 import { bytesToHex } from "./helpers/hex.js";
-import { RecordingVisitor } from "./helpers/recording-visitor.js";
+import { RecordingVisitor, TranscodeVisitor } from "./helpers/recording-visitor.js";
 
 /** Run `fn` and return the SofabError code it throws (or fail). */
 function codeOf(fn: () => void): string {
@@ -142,5 +143,121 @@ describe("MAX_DEPTH (255) is enforced", () => {
   it("streaming decoder rejects 256-deep nesting with InvalidMsg", () => {
     const bytes = Uint8Array.from(new Array(MAX_DEPTH + 1).fill(0x06));
     expect(codeOf(() => decodeChunked(bytes, {}))).toBe(SofabErrorCode.InvalidMsg);
+  });
+});
+
+// --- §4.9/§6.2: ID_MAX binds a sequence-end header too (F-0054) ---------------
+//
+// A sequence end's id is *discarded*, but discarded is not unvalidated: the
+// header is an ordinary field header, so its id is bounded by ID_MAX exactly as
+// every other header's is. The bound is on the id's **value**, not its
+// spelling — §4.1's accept-and-normalize rule is untouched, so a non-minimal
+// encoding of an in-range id stays valid. Only ID_MAX + 1 is INVALID.
+
+/** Unsigned LEB128 encoding of a bigint, as a plain byte array. */
+function uvarint(n: bigint): number[] {
+  const out: number[] = [];
+  let v = n;
+  do {
+    let b = Number(v & 0x7fn);
+    v >>= 7n;
+    if (v > 0n) b |= 0x80;
+    out.push(b);
+  } while (v > 0n);
+  return out;
+}
+
+/** A field header word `(id << 3) | wire`, LEB128 encoded. */
+function header(id: bigint, wire: number): number[] {
+  return uvarint((id << 3n) | BigInt(wire));
+}
+
+const ID_MAX = 0x7fff_ffffn;
+const SEQ_START = 6;
+const SEQ_END = 7;
+
+/** An undeclared sequence field (id 14) closed by an end marker carrying `id`. */
+function seqWithEndId(end: number[]): Uint8Array {
+  return Uint8Array.from([...header(14n, SEQ_START), ...end]);
+}
+
+/** Decode `buf` on all three surfaces; returns each surface's error code. */
+function codesOnEverySurface(buf: Uint8Array): Record<string, string> {
+  return {
+    fast: codeOf(() => decode(buf, {})),
+    streaming: codeOf(() => decodeChunked(buf, {})),
+    cursor: codeOf(() => {
+      const c = new Cursor(buf);
+      while (c.readHeader()) c.skip(c.wire);
+    }),
+    // The Cursor *skip* path (skipSequence) is a separate guard from readHeader:
+    // enter the sequence via readHeader, then skip its body wholesale.
+    cursorSkip: codeOf(() => {
+      const c = new Cursor(buf);
+      c.readHeader();
+      c.skip(SEQ_START);
+    }),
+  };
+}
+
+/** Decode `buf` on all three surfaces, asserting none of them throws. */
+function acceptedOnEverySurface(buf: Uint8Array): void {
+  expect(() => decode(buf, {})).not.toThrow();
+  expect(() => decodeChunked(buf, {})).not.toThrow();
+  expect(() => {
+    const c = new Cursor(buf);
+    while (c.readHeader()) c.skip(c.wire);
+  }).not.toThrow();
+  expect(() => {
+    const c = new Cursor(buf);
+    c.readHeader();
+    c.skip(SEQ_START);
+  }).not.toThrow();
+}
+
+describe("a sequence-end header's id is bounded by ID_MAX (§4.9/§6.2)", () => {
+  it("rejects the F-0054 isolate `76 87 80 80 80 40` on every decode surface", () => {
+    // 76        -> id 14, wire 6 (SequenceStart), undeclared -> skipped (§5.2)
+    // 87 80 80 80 40 -> wire 7 (SequenceEnd), id 2^31 = ID_MAX + 1 -> INVALID
+    const buf = Uint8Array.from([0x76, 0x87, 0x80, 0x80, 0x80, 0x40]);
+    expect(bytesToHex(buf)).toBe("768780808040");
+    expect(buf).toEqual(seqWithEndId(header(ID_MAX + 1n, SEQ_END)));
+
+    const codes = codesOnEverySurface(buf);
+    expect(codes).toEqual({
+      fast: SofabErrorCode.InvalidMsg,
+      streaming: SofabErrorCode.InvalidMsg,
+      cursor: SofabErrorCode.InvalidMsg,
+      cursorSkip: SofabErrorCode.InvalidMsg,
+    });
+  });
+
+  it("rejects an over-ceiling end-marker id at the root, with no open sequence", () => {
+    // INVALID on the id alone — it must not depend on the unbalanced-end check.
+    const buf = Uint8Array.from(header(ID_MAX + 1n, SEQ_END));
+    const codes = codesOnEverySurface(buf);
+    expect(codes.fast).toBe(SofabErrorCode.InvalidMsg);
+    expect(codes.streaming).toBe(SofabErrorCode.InvalidMsg);
+    expect(codes.cursor).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  it("accepts the three controls: end-marker ids 0, 3 and ID_MAX", () => {
+    // ctl_seqend_canonical / ctl_seqend_id_small / ctl_seqend_id_at_IDMAX.
+    for (const id of [0n, 3n, ID_MAX]) {
+      acceptedOnEverySurface(seqWithEndId(header(id, SEQ_END)));
+    }
+    // The canonical spelling really is the bare 0x07 the encoder must write.
+    expect(header(0n, SEQ_END)).toEqual([0x07]);
+  });
+
+  it("bounds the id's value, not its spelling: `87 00` for id 0 stays valid (§4.1)", () => {
+    const nonMinimal = seqWithEndId([0x87, 0x00]);
+    acceptedOnEverySurface(nonMinimal);
+
+    // It decodes as an ordinary sequence end and re-encodes to the canonical
+    // `0x07` — accept-and-normalize, not accept-and-preserve.
+    const out = new OStream();
+    decode(nonMinimal, new TranscodeVisitor(out));
+    expect(bytesToHex(out.bytes())).toBe("7607");
   });
 });

@@ -133,12 +133,15 @@ export class DecoderState {
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
           const type = this.vTag();
+          // §4.9/§6.2: bound the id on every header before dispatching on the
+          // wire type — a sequence end's id is discarded, not exempt
+          // (documentation#35, and see fast.ts).
+          const id = this.vUpper();
+          if (id > ID_MAX) throw invalidMsgError(`field id ${id} out of range`);
           if (type === WireType.SequenceEnd) {
             this.endSequence();
             break;
           }
-          const id = this.vUpper();
-          if (id > ID_MAX) throw invalidMsgError(`field id ${id} out of range`);
           this.id = id;
           this.dispatch(type);
           break;

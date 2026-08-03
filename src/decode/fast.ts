@@ -89,6 +89,14 @@ class FastDecoder {
       this.readVarint();
       const type = this.lo & 7;
 
+      // §4.9/§6.2: the ceiling binds *every* field header, the sequence end
+      // included — a sequence end's id is discarded, but discarded is not
+      // unvalidated. Splitting and checking the id before dispatching on the
+      // wire type keeps this one unconditional guard on the header path with no
+      // per-wire-type exception (documentation#35).
+      const id = this.upper();
+      if (id > ID_MAX) throw invalidMsgError(`field id ${id} out of range`);
+
       if (type === WireType.SequenceEnd) {
         if (stack.length <= 1) throw invalidMsgError("unbalanced sequence end");
         top.sequenceEnd?.();
@@ -96,9 +104,6 @@ class FastDecoder {
         top = stack[stack.length - 1]!;
         continue;
       }
-
-      const id = this.upper();
-      if (id > ID_MAX) throw invalidMsgError(`field id ${id} out of range`);
 
       switch (type) {
         case WireType.Unsigned: {
