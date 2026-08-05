@@ -181,6 +181,13 @@ export class DecoderState {
           this.fixSub = sub as FixlenSubtype;
           this.fixLen = len;
           this.fixOff = 0;
+          // Announce the field at its LENGTH WORD, before any payload — the
+          // counterpart of arrayBegin at the count word. A receiver-side bound on
+          // the declared length is decidable here, and only here for a message
+          // that ends right after it (§5.2: INVALID over INCOMPLETE).
+          if (sub === FixlenSubtype.String || sub === FixlenSubtype.Blob) {
+            this.cur.fixlenBegin?.(this.id, sub as FixlenSubtype, len);
+          }
           if (sub === FixlenSubtype.Fp32 || sub === FixlenSubtype.Fp64) {
             const want = sub === FixlenSubtype.Fp32 ? 4 : 8;
             if (this.fixLen !== want) throw invalidMsgError("fixlen float length mismatch");

@@ -148,6 +148,9 @@ class FastDecoder {
               top.fp64?.(id, value);
             }
           } else {
+            // Announce at the length word first, so a visitor sees `total` at the
+            // same point on both paths (see Visitor.fixlenBegin).
+            top.fixlenBegin?.(id, sub as FixlenSubtype, len);
             const chunk = this.take(len);
             if (sub === FixlenSubtype.String) top.string?.(id, len, 0, chunk);
             else top.blob?.(id, len, 0, chunk);
