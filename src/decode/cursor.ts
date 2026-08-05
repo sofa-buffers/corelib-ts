@@ -266,25 +266,48 @@ export class Cursor {
    * Read an unsigned array (wire {@link WireType.ArrayUnsigned}), number-first
    * per element. Pass the schema `count` for a bounded array so an over-count is
    * rejected as `INVALID` at the header (see {@link arrayCount}); omit it for an
-   * unbounded array (today's behavior).
+   * unbounded array (today's behavior). Pass `elemMax` for a narrowed element
+   * type (`u8`…`u32`) so an out-of-range element is rejected **at that element**,
+   * which is what keeps the verdict INVALID when the message is truncated
+   * immediately after it (CORELIB_PLAN §5.2, generator#267).
    */
-  readUnsignedArray(schemaCount?: number): (number | bigint)[] {
+  readUnsignedArray(schemaCount?: number, elemMax?: number | bigint): (number | bigint)[] {
     const count = this.arrayCount(schemaCount);
     const out: (number | bigint)[] = new Array(count);
     for (let i = 0; i < count; i++) {
       this.readVarint();
-      out[i] = this.unsignedValue();
+      const v = this.unsignedValue();
+      // Checked HERE, on the element that carries the value — not after the whole
+      // array. §5.2 makes INVALID dominate INCOMPLETE, so a message truncated
+      // after an out-of-range element must stay INVALID; a caller that filtered
+      // the returned array would never see one that never arrived (#267).
+      if (elemMax !== undefined && v > elemMax) {
+        throw invalidMsgError("array element above declared width");
+      }
+      out[i] = v;
     }
     return out;
   }
 
-  /** Read a signed array (wire {@link WireType.ArraySigned}), zig-zag, number-first per element. */
-  readSignedArray(schemaCount?: number): (number | bigint)[] {
+  /**
+   * Read a signed array (wire {@link WireType.ArraySigned}), zig-zag,
+   * number-first per element. `elemMin`/`elemMax` bound each element to its
+   * declared width, rejected at that element — see {@link readUnsignedArray}.
+   */
+  readSignedArray(
+    schemaCount?: number,
+    elemMin?: number | bigint,
+    elemMax?: number | bigint,
+  ): (number | bigint)[] {
     const count = this.arrayCount(schemaCount);
     const out: (number | bigint)[] = new Array(count);
     for (let i = 0; i < count; i++) {
       this.readVarint();
-      out[i] = this.signedValue();
+      const v = this.signedValue();
+      if ((elemMin !== undefined && v < elemMin) || (elemMax !== undefined && v > elemMax)) {
+        throw invalidMsgError("array element above declared width");
+      }
+      out[i] = v;
     }
     return out;
   }
