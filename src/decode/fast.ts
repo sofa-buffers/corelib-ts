@@ -294,9 +294,16 @@ class FastDecoder {
     return zigzagDecodeLoHi(this.lo >>> 0, hi);
   }
 
-  /** The last varint's value as a JS number — exact for ids/lengths/counts. */
+  /**
+   * The last varint's value as a JS number — exact for ids/lengths/counts.
+   *
+   * The `>>> 0` is load-bearing: `hi` is accumulated with 32-bit bitwise ops, so
+   * bit 63 of the varint lands on its sign bit and the value reads back
+   * negative, sliding past the `count > ARRAY_MAX` guard and emptying the array
+   * loop — see {@link Cursor.num} (corelib-ts#88).
+   */
   private num(): number {
-    return this.hi * TWO32 + (this.lo >>> 0);
+    return (this.hi >>> 0) * TWO32 + (this.lo >>> 0);
   }
 
   /** The last varint with its low 3 tag bits stripped (`value >> 3`). */
