@@ -728,9 +728,22 @@ export class Cursor {
     return zigzagDecodeLoHi(this.lo >>> 0, hi);
   }
 
-  /** The last varint's value as a JS number — exact for ids/lengths/counts. */
+  /**
+   * The last varint's value as a JS number — exact for ids/lengths/counts.
+   *
+   * `hi` is accumulated with 32-bit bitwise ops, so a varint with **bit 63** set
+   * lands on its sign bit and reads back negative. Coerce it unsigned, exactly
+   * as {@link upper} already does: without the `>>> 0` the result is a large
+   * negative number, which is not `> ARRAY_MAX` and not `> maxArrayCount`, so a
+   * hostile count slips past every guard and its element loop runs zero times —
+   * a message truncated inside that array is then reported COMPLETE
+   * (corelib-ts#88). One bit, fully attacker-controlled, and an *accept*.
+   *
+   * Past 2^53 the sum is no longer exact, but every value up there is far beyond
+   * the ARRAY_MAX ceiling this feeds and is only ever compared against it.
+   */
   private num(): number {
-    return this.hi * TWO32 + (this.lo >>> 0);
+    return (this.hi >>> 0) * TWO32 + (this.lo >>> 0);
   }
 
   /** The last varint with its low 3 tag bits stripped (`value >> 3`). */

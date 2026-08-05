@@ -661,9 +661,19 @@ export class DecoderState {
     return zigzagDecodeLoHi(this.vLo >>> 0, hi);
   }
 
-  /** The accumulated varint as a JS number — exact for ids/lengths/counts. */
+  /**
+   * The accumulated varint as a JS number — exact for ids/lengths/counts.
+   *
+   * The `>>> 0` is load-bearing: `vHi` is accumulated with 32-bit bitwise ops,
+   * so bit 63 of the varint lands on its sign bit and the value reads back
+   * negative, sliding past the `count > ARRAY_MAX` guard — see
+   * {@link Cursor.num} (corelib-ts#88). The chunked path did not report COMPLETE
+   * on such input the way the other two did (its element states leave the
+   * machine mid-field, so `end()` said INCOMPLETE), but the count word is just
+   * as malformed here, and §5.2 puts INVALID ahead of INCOMPLETE.
+   */
   private vNum(): number {
-    return this.vHi * TWO32 + (this.vLo >>> 0);
+    return (this.vHi >>> 0) * TWO32 + (this.vLo >>> 0);
   }
 
   /** The accumulated varint's low 3 tag bits (the wire type / fixlen subtype). */
