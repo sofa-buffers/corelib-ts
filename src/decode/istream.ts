@@ -20,7 +20,7 @@
  * whether a trailing `Incomplete` is a truncation error.
  */
 
-import type { ArrayKind, DecodeStatus } from "../constants.js";
+import type { ArrayKind, DecodeStatus, FixlenSubtype } from "../constants.js";
 import { decodeContiguous } from "./fast.js";
 import type { DecodeLimits } from "./limits.js";
 import { DecoderState } from "./state.js";
@@ -68,6 +68,24 @@ export interface Visitor {
   fp32?(id: number, value: number, raw?: Uint8Array): void;
   /** An IEEE-754 64-bit double field. `value` is exact — a double is 64 bits wide. */
   fp64?(id: number, value: number): void;
+  /**
+   * Start of a `string`/`blob` field: `total` payload bytes follow, in one or
+   * more {@link string}/{@link blob} calls.
+   *
+   * The counterpart of {@link arrayBegin}, and it exists for the same reason: a
+   * receiver-side bound on the *declared length* is decided by this word, not by
+   * the payload. Without it a visitor can only see `total` once payload bytes
+   * arrive, so a message that ends right after an over-bound length word escapes
+   * the check and degrades to `INCOMPLETE` — while the same bytes through
+   * {@link Cursor.readString} are `INVALID`. §5.2 gives INVALID precedence over
+   * INCOMPLETE for input already known to be malformed, so the two paths have to
+   * agree, and this is where the verdict is available.
+   *
+   * Called exactly once per field, before any payload call — including for a
+   * zero-length payload, which is still announced here and then delivered as one
+   * empty chunk.
+   */
+  fixlenBegin?(id: number, subtype: FixlenSubtype, total: number): void;
   /** A chunk of a UTF-8 string field. */
   string?(id: number, total: number, offset: number, chunk: Uint8Array): void;
   /** A chunk of a blob field. */
