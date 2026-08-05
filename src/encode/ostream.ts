@@ -351,14 +351,33 @@ export class OStream {
    */
   writeUnsignedArrayLong(id: number, values: readonly Long[]): void {
     this.arrayHead(id, WireType.ArrayUnsigned, values.length);
-    this.ensure(values.length * VARINT_MAX_BYTES);
-    let pos = this.pos;
-    const buf = this.buf;
-    for (let i = 0; i < values.length; i++) {
-      const v = values[i]!;
-      pos = encodeVarintLoHi(v.low, v.high, buf, pos);
+    if (this.canGrow) {
+      // One contiguous reserve, then a flat loop over a buffer that cannot move.
+      this.ensure(values.length * VARINT_MAX_BYTES);
+      let pos = this.pos;
+      const buf = this.buf;
+      for (let i = 0; i < values.length; i++) {
+        const v = values[i]!;
+        pos = encodeVarintLoHi(v.low, v.high, buf, pos);
+      }
+      this.pos = pos;
+    } else {
+      // Streaming (fixed caller buffer): reserve one element at a time so the
+      // sink drains between elements — the whole point of a fixed buffer is that
+      // the array may be far larger than it. Reserving the array's worst case
+      // (10 bytes × length) as one contiguous run instead made a 64-bit array
+      // unstreamable, and threw *after* arrayHead, leaving a header with no
+      // payload (corelib-ts#91). `buf`/`pos` are re-read each iteration because
+      // `ensure` may flush, and the halves come off the caller's Long before it,
+      // since a flush reaches sink code that could re-enter.
+      for (let i = 0; i < values.length; i++) {
+        const v = values[i]!;
+        const lo = v.low;
+        const hi = v.high;
+        this.ensure(VARINT_MAX_BYTES);
+        this.pos = encodeVarintLoHi(lo, hi, this.buf, this.pos);
+      }
     }
-    this.pos = pos;
   }
 
   /**
@@ -367,14 +386,26 @@ export class OStream {
    */
   writeSignedArrayLong(id: number, values: readonly Long[]): void {
     this.arrayHead(id, WireType.ArraySigned, values.length);
-    this.ensure(values.length * VARINT_MAX_BYTES);
-    let pos = this.pos;
-    const buf = this.buf;
-    for (let i = 0; i < values.length; i++) {
-      const v = values[i]!;
-      pos = encodeZigzagVarintLoHi(v.low, v.high, buf, pos);
+    if (this.canGrow) {
+      this.ensure(values.length * VARINT_MAX_BYTES);
+      let pos = this.pos;
+      const buf = this.buf;
+      for (let i = 0; i < values.length; i++) {
+        const v = values[i]!;
+        pos = encodeZigzagVarintLoHi(v.low, v.high, buf, pos);
+      }
+      this.pos = pos;
+    } else {
+      // See writeUnsignedArrayLong: one element reserved at a time so the sink
+      // drains between them, halves read out before `ensure` may flush.
+      for (let i = 0; i < values.length; i++) {
+        const v = values[i]!;
+        const lo = v.low;
+        const hi = v.high;
+        this.ensure(VARINT_MAX_BYTES);
+        this.pos = encodeZigzagVarintLoHi(lo, hi, this.buf, this.pos);
+      }
     }
-    this.pos = pos;
   }
 
   /** Write an array of IEEE-754 32-bit floats. */
