@@ -487,13 +487,25 @@ describe("OStream lazy sequence framing", () => {
       ["string", (os) => os.writeString(0, "x")],
       ["blob", (os) => os.writeBlob(0, Uint8Array.from([1]))],
       ["fixlen", (os) => os.writeFixlen(0, Uint8Array.from([1]), FixlenSubtype.Blob)],
-      ["unsignedArray", (os) => os.writeUnsignedArray(0, [1])],
-      ["signedArray", (os) => os.writeSignedArray(0, [-1])],
-      ["unsignedArrayLong", (os) => os.writeUnsignedArrayLong(0, [Long.fromNumber(1)])],
-      ["signedArrayLong", (os) => os.writeSignedArrayLong(0, [Long.fromNumber(-1)])],
-      ["fp32Array", (os) => os.writeFp32Array(0, [1.5])],
-      ["fp32ArrayRaw", (os) => os.writeFp32ArrayRaw(0, new Uint8Array(4))],
-      ["fp64Array", (os) => os.writeFp64Array(0, [1.5])],
+      // Arrays carry several elements, not one: a single element reserves one
+      // element's worth of room, which fits under any per-element *and* any
+      // whole-array reserve alike — so a writer that reserved the whole array
+      // as one contiguous run passed this test while being unable to stream at
+      // all (corelib-ts#91). Five elements put the worst-case reserve (10 bytes
+      // each = 50) past the fixed buffer below, so the two shapes now differ.
+      ["unsignedArray", (os) => os.writeUnsignedArray(0, [1, 2, 3, 4, 5])],
+      ["signedArray", (os) => os.writeSignedArray(0, [-1, -2, -3, -4, -5])],
+      [
+        "unsignedArrayLong",
+        (os) => os.writeUnsignedArrayLong(0, [1, 2, 3, 4, 5].map(Long.fromNumber)),
+      ],
+      [
+        "signedArrayLong",
+        (os) => os.writeSignedArrayLong(0, [-1, -2, -3, -4, -5].map(Long.fromNumber)),
+      ],
+      ["fp32Array", (os) => os.writeFp32Array(0, [1.5, 2.5, 3.5, 4.5, 5.5])],
+      ["fp32ArrayRaw", (os) => os.writeFp32ArrayRaw(0, new Uint8Array(20))],
+      ["fp64Array", (os) => os.writeFp64Array(0, [1.5, 2.5, 3.5, 4.5, 5.5])],
     ];
 
     // Both encoder modes, because almost every writer branches on `canGrow` and
