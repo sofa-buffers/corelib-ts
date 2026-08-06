@@ -7,8 +7,12 @@
  *   {@link OStream.bytes} for the finished message.
  * - **Streaming** (`new OStream(buffer, offset?, flush?)`): writes into a
  *   caller-provided buffer and, when it fills, hands the produced bytes to the
- *   `flush` sink and continues — so the buffer can be much smaller than the
- *   message. `offset` reserves room at the front for a lower-layer header.
+ *   `flush` sink and continues — so the buffer can be arbitrarily smaller than
+ *   the message, **down to a single byte** (CORELIB_PLAN §5.1): no single write
+ *   requires contiguous room, a value larger than the buffer is split across
+ *   flushes, and the bytes produced are identical either way. `offset` reserves
+ *   room at the front for a lower-layer header. Without a `flush` sink there is
+ *   nowhere to drain to, so the buffer must hold the whole message.
  *
  * Generated code typically writes one field per message field; the methods map
  * one-to-one onto the wire types. Problems throw {@link SofabError}.
@@ -45,7 +49,14 @@ import {
   varintSizeLoHi,
   varintSizeNum,
 } from "../varint/leb128.js";
-import { packFp32, packFp64, toBigInt } from "../varint/num64.js";
+import {
+  fp32Bits,
+  fp64BitsHi,
+  fp64BitsLo,
+  packFp32,
+  packFp64,
+  toBigInt,
+} from "../varint/num64.js";
 import { encodeZigzagVarintLoHi } from "../varint/zigzag.js";
 import { encodeUtf8, utf8Length, utf8Write } from "./fixlen.js";
 import type { FlushSink } from "./sink.js";
@@ -192,8 +203,7 @@ export class OStream {
     const lo = S_U32[LO]!;
     const hi = S_U32[HI]!;
     this.header(id, WireType.Unsigned);
-    this.ensure(varintSizeLoHi(lo, hi));
-    this.pos = encodeVarintLoHi(lo, hi, this.buf, this.pos);
+    this.putVarintLoHi(lo, hi);
   }
 
   /** Write a signed integer field (zig-zag encoded). */
@@ -211,15 +221,13 @@ export class OStream {
     const lo = S_U32[LO]!;
     const hi = S_U32[HI]!;
     // Zig-zag on the halves — `(n << 1) ^ (n >> 63)` widened across both — so
-    // the exact varint size is known and only that many bytes are ensured, as
-    // before (a fixed caller buffer must not see a 10-byte demand for a 2-byte
-    // field).
+    // the varint goes out at its exact size (a fixed caller buffer must not see
+    // a 10-byte demand for a 2-byte field).
     const sgn = -(hi >>> 31) >>> 0;
     const zLo = (((lo << 1) >>> 0) ^ sgn) >>> 0;
     const zHi = ((((hi << 1) | (lo >>> 31)) >>> 0) ^ sgn) >>> 0;
     this.header(id, WireType.Signed);
-    this.ensure(varintSizeLoHi(zLo, zHi));
-    this.pos = encodeVarintLoHi(zLo, zHi, this.buf, this.pos);
+    this.putVarintLoHi(zLo, zHi);
   }
 
   /** Write a boolean field (encoded as the unsigned value 0 or 1). */
@@ -231,15 +239,13 @@ export class OStream {
   /** Write an IEEE-754 32-bit float field. */
   writeFp32(id: number, value: number): void {
     this.fixlenHead(id, 4, FixlenSubtype.Fp32);
-    this.ensure(4);
-    this.pos = packFp32(this.buf, this.pos, value);
+    this.putFp32(value);
   }
 
   /** Write an IEEE-754 64-bit double field. */
   writeFp64(id: number, value: number): void {
     this.fixlenHead(id, 8, FixlenSubtype.Fp64);
-    this.ensure(8);
-    this.pos = packFp64(this.buf, this.pos, value);
+    this.putFp64(value);
   }
 
   /** Write a UTF-8 string field. */
@@ -311,15 +317,15 @@ export class OStream {
     } else {
       // Streaming (fixed caller buffer): each element is range-checked and
       // split by the same single scratch round-trip the scalar writers use, and
-      // the halves are read out before `ensure` — which may reach a flush sink,
-      // i.e. caller code that can re-enter and overwrite the scratch (bits64).
+      // the halves are read out before `putVarintLoHi` — which may reach a flush
+      // sink, i.e. caller code that can re-enter and overwrite the scratch
+      // (bits64).
       for (let i = 0; i < values.length; i++) {
         const v = toBigInt(values[i]!);
         if (!splitU64(v)) throw argumentError(`unsigned value ${v} out of range`);
         const lo = S_U32[LO]!;
         const hi = S_U32[HI]!;
-        this.ensure(VARINT_MAX_BYTES);
-        this.pos = encodeVarintLoHi(lo, hi, this.buf, this.pos);
+        this.putVarintLoHi(lo, hi);
       }
     }
   }
@@ -332,14 +338,12 @@ export class OStream {
       this.pos = this.kernel.encodeSignedVarints(values, this.buf, this.pos);
     } else {
       // See writeUnsignedArray: range-check and split in one round-trip, halves
-      // out before `ensure`, then zig-zag on the halves rather than in `bigint`.
+      // out before the write, then zig-zag on the halves rather than in
+      // `bigint`.
       for (let i = 0; i < values.length; i++) {
         const v = toBigInt(values[i]!);
         if (!splitI64(v)) throw argumentError(`signed value ${v} out of range`);
-        const lo = S_U32[LO]!;
-        const hi = S_U32[HI]!;
-        this.ensure(VARINT_MAX_BYTES);
-        this.pos = encodeZigzagVarintLoHi(lo, hi, this.buf, this.pos);
+        this.putZigzagVarintLoHi(S_U32[LO]!, S_U32[HI]!);
       }
     }
   }
@@ -367,15 +371,11 @@ export class OStream {
       // the array may be far larger than it. Reserving the array's worst case
       // (10 bytes × length) as one contiguous run instead made a 64-bit array
       // unstreamable, and threw *after* arrayHead, leaving a header with no
-      // payload (corelib-ts#91). `buf`/`pos` are re-read each iteration because
-      // `ensure` may flush, and the halves come off the caller's Long before it,
-      // since a flush reaches sink code that could re-enter.
+      // payload (corelib-ts#91). The halves come off the caller's Long before
+      // the write, since a flush reaches sink code that could re-enter.
       for (let i = 0; i < values.length; i++) {
         const v = values[i]!;
-        const lo = v.low;
-        const hi = v.high;
-        this.ensure(VARINT_MAX_BYTES);
-        this.pos = encodeVarintLoHi(lo, hi, this.buf, this.pos);
+        this.putVarintLoHi(v.low, v.high);
       }
     }
   }
@@ -396,14 +396,11 @@ export class OStream {
       }
       this.pos = pos;
     } else {
-      // See writeUnsignedArrayLong: one element reserved at a time so the sink
-      // drains between them, halves read out before `ensure` may flush.
+      // See writeUnsignedArrayLong: one element at a time so the sink drains
+      // between them, halves read out before a flush can re-enter.
       for (let i = 0; i < values.length; i++) {
         const v = values[i]!;
-        const lo = v.low;
-        const hi = v.high;
-        this.ensure(VARINT_MAX_BYTES);
-        this.pos = encodeZigzagVarintLoHi(lo, hi, this.buf, this.pos);
+        this.putZigzagVarintLoHi(v.low, v.high);
       }
     }
   }
@@ -420,10 +417,7 @@ export class OStream {
       this.ensure(values.length * 4);
       this.pos = this.kernel.packFp32Array(values, this.buf, this.pos);
     } else {
-      for (let i = 0; i < values.length; i++) {
-        this.ensure(4);
-        this.pos = packFp32(this.buf, this.pos, values[i]!);
-      }
+      for (let i = 0; i < values.length; i++) this.putFp32(values[i]!);
     }
   }
 
@@ -457,10 +451,7 @@ export class OStream {
       this.ensure(values.length * 8);
       this.pos = this.kernel.packFp64Array(values, this.buf, this.pos);
     } else {
-      for (let i = 0; i < values.length; i++) {
-        this.ensure(8);
-        this.pos = packFp64(this.buf, this.pos, values[i]!);
-      }
+      for (let i = 0; i < values.length; i++) this.putFp64(values[i]!);
     }
   }
 
@@ -586,8 +577,151 @@ export class OStream {
    * inline into every `header` / `fixlenHead` / `arrayHead` call site.
    */
   private putVarintNumSlow(value: number): void {
-    this.ensure(varintSizeNum(value));
-    this.pos = encodeVarintNum(value, this.buf, this.pos);
+    if (this.tryEnsure(varintSizeNum(value))) {
+      this.pos = encodeVarintNum(value, this.buf, this.pos);
+      return;
+    }
+    // Buffer too small for the whole varint: emit it a byte at a time, draining
+    // the sink in between (§5.1). The `% 128` form covers the full 0 .. 2^53
+    // domain, unlike the bitwise loop `encodeVarintNum` uses below 2^32.
+    while (value > 0x7f) {
+      this.putByte((value % 128) | 0x80);
+      value = Math.floor(value / 128);
+    }
+    this.putByte(value);
+  }
+
+  /**
+   * Write a 64-bit value, held as two 32-bit halves, as a varint.
+   *
+   * Deliberately just a bounds check and two calls: this is what the array
+   * loops call per element, and it only pays its way while it is small enough
+   * for the JIT to inline. Spelling the drain case out here instead — three
+   * more lines — cost 16-19% on an array streamed through a 32/64-byte buffer,
+   * where most elements take the fast path and want it inlined.
+   */
+  private putVarintLoHi(lo: number, hi: number): void {
+    if (this.buf.length - this.pos >= VARINT_MAX_BYTES) {
+      this.pos = encodeVarintLoHi(lo, hi, this.buf, this.pos);
+      return;
+    }
+    this.putVarintLoHiSlow(lo, hi);
+  }
+
+  /**
+   * A full buffer that is nonetheless wide enough to hold any varint: drain it
+   * and retry the worst case, which is exactly what `ensure(VARINT_MAX_BYTES)`
+   * did before §5.1 and is still the common streaming case. Sizing the value
+   * first instead — the narrow-buffer path in {@link putVarintLoHiTight} — cost
+   * +125 instructions on every element of an array streamed through a
+   * one-element-wide buffer.
+   */
+  private putVarintLoHiSlow(lo: number, hi: number): void {
+    if (this.buf.length - this.start >= VARINT_MAX_BYTES) {
+      this.flush();
+      if (this.buf.length - this.pos >= VARINT_MAX_BYTES) {
+        this.pos = encodeVarintLoHi(lo, hi, this.buf, this.pos);
+        return;
+      }
+    }
+    this.putVarintLoHiTight(lo, hi);
+  }
+
+  /**
+   * Zig-zag {@link putVarintLoHi}: `(n << 1) ^ (n >> 63)` on the halves. Keeps
+   * its own worst-case fast path so the signed array loop reaches the combined
+   * zig-zag-and-encode writer directly, exactly as it did before; the drain and
+   * narrow-buffer cases are the same for both signs, so they are shared.
+   */
+  private putZigzagVarintLoHi(lo: number, hi: number): void {
+    if (this.buf.length - this.pos >= VARINT_MAX_BYTES) {
+      this.pos = encodeZigzagVarintLoHi(lo, hi, this.buf, this.pos);
+      return;
+    }
+    const sgn = -(hi >>> 31) >>> 0;
+    this.putVarintLoHi(
+      (((lo << 1) >>> 0) ^ sgn) >>> 0,
+      ((((hi << 1) | (lo >>> 31)) >>> 0) ^ sgn) >>> 0,
+    );
+  }
+
+  /**
+   * The narrow-buffer tail of {@link putVarintLoHi}: the buffer could not hold a
+   * worst-case varint even empty. Sizing the value exactly keeps such a buffer
+   * from flushing for room it does not need; only when it cannot hold the varint
+   * *at all* does the value get split across flushes, seven bits at a time.
+   */
+  private putVarintLoHiTight(lo: number, hi: number): void {
+    lo >>>= 0;
+    hi >>>= 0;
+    if (this.tryEnsure(varintSizeLoHi(lo, hi))) {
+      this.pos = encodeVarintLoHi(lo, hi, this.buf, this.pos);
+      return;
+    }
+    for (;;) {
+      const more = hi !== 0 || lo > 0x7f;
+      this.putByte(more ? (lo & 0x7f) | 0x80 : lo);
+      if (!more) return;
+      lo = ((lo >>> 7) | (hi << 25)) >>> 0;
+      hi >>>= 7;
+    }
+  }
+
+  /** Write the 4 little-endian bytes of an fp32 (§4.6). */
+  private putFp32(value: number): void {
+    if (this.buf.length - this.pos >= 4) {
+      this.pos = packFp32(this.buf, this.pos, value);
+      return;
+    }
+    this.putFp32Slow(value);
+  }
+
+  private putFp32Slow(value: number): void {
+    if (this.tryEnsure(4)) {
+      this.pos = packFp32(this.buf, this.pos, value);
+      return;
+    }
+    // The bytes live in a local word rather than a scratch array, so a flush
+    // sink that re-enters the encoder between them cannot overwrite the tail.
+    const bits = fp32Bits(value);
+    this.putByte(bits & 0xff);
+    this.putByte((bits >>> 8) & 0xff);
+    this.putByte((bits >>> 16) & 0xff);
+    this.putByte(bits >>> 24);
+  }
+
+  /** Write the 8 little-endian bytes of an fp64 (§4.6). */
+  private putFp64(value: number): void {
+    if (this.buf.length - this.pos >= 8) {
+      this.pos = packFp64(this.buf, this.pos, value);
+      return;
+    }
+    this.putFp64Slow(value);
+  }
+
+  private putFp64Slow(value: number): void {
+    if (this.tryEnsure(8)) {
+      this.pos = packFp64(this.buf, this.pos, value);
+      return;
+    }
+    // Both halves are read out *before* the first byte goes out, for the reason
+    // in putFp32Slow: a flush between them reaches re-entrant caller code.
+    const lo = fp64BitsLo(value);
+    const hi = fp64BitsHi(value);
+    this.putByte(lo & 0xff);
+    this.putByte((lo >>> 8) & 0xff);
+    this.putByte((lo >>> 16) & 0xff);
+    this.putByte(lo >>> 24);
+    this.putByte(hi & 0xff);
+    this.putByte((hi >>> 8) & 0xff);
+    this.putByte((hi >>> 16) & 0xff);
+    this.putByte(hi >>> 24);
+  }
+
+  /** Append one byte, draining to the sink first when the buffer is full. */
+  private putByte(b: number): void {
+    if (this.pos === this.buf.length) this.ensureSome(1);
+    this.buf[this.pos++] = b;
   }
 
   /**
@@ -670,18 +804,47 @@ export class OStream {
     }
   }
 
-  /** Ensure `n` contiguous bytes are free at `pos`; returns `pos` for chaining. */
-  private ensure(n: number): number {
-    if (this.buf.length - this.pos >= n) return this.pos;
+  /**
+   * Make room for `n` contiguous bytes at `pos` if the buffer can hold them at
+   * all: `true` when it can (flushing or growing as needed), `false` when a
+   * fixed caller buffer is simply smaller than `n` and the value must be split
+   * across flushes instead — CORELIB_PLAN §5.1 puts the floor on the output
+   * buffer at a single byte, so no write may demand a contiguous run.
+   *
+   * The one case that still fails is a buffer with no sink to drain to: there is
+   * nowhere for a split to put the earlier bytes, so it reports BufferFull here,
+   * before anything is written, exactly as {@link ensure} did.
+   */
+  private tryEnsure(n: number): boolean {
+    if (this.buf.length - this.pos >= n) return true;
     this.flush();
-    if (this.buf.length - this.pos >= n) return this.pos;
+    if (this.buf.length - this.pos >= n) return true;
     if (this.canGrow) {
       this.growTo(this.pos + n);
-      return this.pos;
+      return true;
     }
-    throw bufferFullError(
-      `output buffer full: need ${n} more bytes, have ${this.buf.length - this.pos}`,
-    );
+    if (this.flushSink === undefined) {
+      throw bufferFullError(
+        `output buffer full: need ${n} more bytes, have ${this.buf.length - this.pos}`,
+      );
+    }
+    return false;
+  }
+
+  /**
+   * Ensure `n` contiguous bytes are free at `pos`; returns `pos` for chaining.
+   *
+   * The remaining callers are the ones a split cannot help: the growable
+   * encoder's bulk reserves, where {@link tryEnsure} always succeeds, and the
+   * one-byte sequence-end marker, which is indivisible.
+   */
+  private ensure(n: number): number {
+    if (!this.tryEnsure(n)) {
+      throw bufferFullError(
+        `output buffer full: need ${n} more bytes, have ${this.buf.length - this.pos}`,
+      );
+    }
+    return this.pos;
   }
 
   /** Ensure *some* room (up to `want`); returns how many bytes are available. */

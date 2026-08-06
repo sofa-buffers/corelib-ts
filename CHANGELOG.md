@@ -53,6 +53,40 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Fixed
 
+- **The encoder could not write through an output buffer smaller than its
+  largest single write** (#94). CORELIB_PLAN §5.1 now puts a normative floor on
+  the output buffer at **one byte**: it may be arbitrarily smaller than the
+  message, so an encoder must be able to split a single write across a flush and
+  may not require any write to land contiguously. `ensure(n)` demanded `n`
+  *contiguous* bytes and flushed at most once, so on a fixed caller buffer the
+  second check failed for the same reason as the first and every fixed-width
+  writer threw `BufferFull` — an `fp64` put the practical floor at 8 bytes, a
+  full-width varint at 10, making the minimum workable buffer size depend on the
+  data. The scalar, float and streaming array writers now fall back to emitting
+  the value a byte at a time across flushes when the buffer cannot hold it whole
+  (`putVarintLoHi` / `putFp32` / `putFp64`); the bytes ride in local words rather
+  than a shared scratch, so a sink that re-enters the encoder mid-value cannot
+  overwrite the tail. A fixed buffer with **no** sink still reports `BufferFull`
+  before writing anything, and the wire is byte-identical to the one-shot output
+  at every buffer size. The hot path is untouched: a write with room still
+  resolves in a single bounds check, and the growable in-memory encoder measured
+  unchanged (`bench/run_callgrind.sh`, Node 24: `encode: typical message` 10,409
+  → 10,369 `Ir/op`, −0.4%; `encode: u64 array (1000)` 259,665 → 259,888, +0.1% —
+  either side of the ±0.05% the untouched decode workloads moved in the same
+  pair of runs). A buffer wide enough to hold a worst-case varint also keeps the
+  old drain-and-retry path byte for byte, so its flush pattern is unchanged
+  (identical sink-call counts at every buffer size measured); only a buffer
+  narrower than the value pays for sizing it exactly. Streaming a 1000-element
+  `u64` array through a fixed buffer moved by, per buffer size: 10 B +0.2%,
+  32 B +6.1%, 64 B +2.4%, 128 B −0.2%, 512 B −2.3%, 4096 B −4.8%; the typical
+  message through 64 B −1.3%, an `fp64` array through 64 B −10.5%. The two
+  mid-size figures are the cost of the extra branch on a buffer only three to
+  six elements wide, and they are what is left after three rounds of measuring:
+  routing the drain case through the exact-size path costs +125 instructions on
+  *every* element of a one-element-wide buffer, and spelling that case out in
+  the per-element entry point instead — making it too big for the JIT to inline —
+  costs 16-19% at 32/64 B. The shape kept here is the best of the three at every
+  size measured.
 - **A sequence-end header's field id escaped the `ID_MAX` ceiling** (#85, Crucible
   F-0054). §4.9 has a decoder *discard* a sequence end's id — the marker closes the
   innermost open sequence whatever the id says — but discarded is not unvalidated:
@@ -105,6 +139,15 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Tests
 
+- `small-buffer-encode.test.ts` is CORELIB_PLAN §7.2 item 4: it drives a corpus
+  covering every fixed-width writer through caller buffers of 1, 2, 3, 5, 8, 16
+  and 64 bytes and asserts the concatenated flushes are byte-identical to the
+  one-shot output. The sweep is deliberately wider than the one byte §7.2 names —
+  all of those sizes failed the same way, and a fix that special-cased 1 would
+  pass a 1-only test and still break at 3. It also pins the sink seeing exactly
+  one byte per call at size 1 (so byte-identity cannot be met by the encoder
+  quietly growing a buffer of its own), a sink swapping in a fresh buffer
+  mid-value, and the two cases that must still report `BufferFull`.
 - The chunked-decode suite now also feeds every vector as a single whole-buffer
   chunk, in 16-byte chunks, and at deterministic pseudo-random split points. The
   previous sizes (1 and 7 bytes) are both narrower than a maximum varint, so the
