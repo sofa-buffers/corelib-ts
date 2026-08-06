@@ -52,6 +52,31 @@ export function packFp64(out: Uint8Array, pos: number, value: number): number {
 }
 
 /**
+ * The 4 little-endian wire bytes of `value` as one 32-bit word (byte `k` in bits
+ * `8*k`) — the inverse of {@link fp32FromBits}, and the companion to an encoder
+ * that must emit those bytes one at a time because its output buffer is smaller
+ * than the value (CORELIB_PLAN §5.1). Returning a word rather than a byte view
+ * keeps the bytes in the caller's registers, so a flush sink that re-enters the
+ * encoder mid-value cannot overwrite them the way a shared scratch would.
+ */
+export function fp32Bits(value: number): number {
+  SCRATCH.setFloat32(0, value, true);
+  return SCRATCH.getUint32(0, true);
+}
+
+/** Bytes 0..3 of `value`'s little-endian fp64 image, as a 32-bit word. */
+export function fp64BitsLo(value: number): number {
+  SCRATCH.setFloat64(0, value, true);
+  return SCRATCH.getUint32(0, true);
+}
+
+/** Bytes 4..7 of `value`'s little-endian fp64 image, as a 32-bit word. */
+export function fp64BitsHi(value: number): number {
+  SCRATCH.setFloat64(0, value, true);
+  return SCRATCH.getUint32(4, true);
+}
+
+/**
  * Reinterpret the 4 little-endian wire bytes of an fp32, packed into one 32-bit
  * word (byte `k` in bits `8*k`), as a `number`. The companion to a resumable
  * decoder that accumulates float bytes into a machine word instead of a

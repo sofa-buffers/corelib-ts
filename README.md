@@ -52,7 +52,7 @@ full type declarations.
 | Goal | How |
 |------|-----|
 | Runs everywhere | Pure TypeScript over `Uint8Array` / `DataView` / `TextEncoder`, no Node built-ins on the hot path. |
-| Streaming **out** | `OStream` writes into a small caller buffer and calls a `FlushSink` when it fills, so a message can exceed the buffer. |
+| Streaming **out** | `OStream` writes into a small caller buffer and calls a `FlushSink` when it fills, so a message can exceed the buffer — by any amount, down to a one-byte buffer: a value too large for the buffer is split across flushes. |
 | Streaming **in** | `IStream` is a resumable state machine fed arbitrary chunks; large string / blob payloads arrive in pieces. |
 | Fast whole-buffer decode | With the whole message in one buffer, `decode()` (push) and `Cursor` (pull) advance a single cursor. |
 | Full 64-bit fidelity | Scalars round-trip the entire `uint64` / `int64` range: `number` when exact, `bigint` beyond `2^53-1` (`Long` offers a `bigint`-free array path). |
