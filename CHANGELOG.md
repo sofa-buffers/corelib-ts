@@ -53,6 +53,31 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Fixed
 
+- **A varint array's allocation guard decided the verdict from the count word,
+  before any element was examined** (#99). `Cursor.arrayCount` rejected a count
+  larger than the bytes remaining as `INCOMPLETE`. The observation behind it is
+  right — a varint element needs at least one wire byte, so such a count cannot
+  be real and `new Array(count)` must never be sized from it (#38) — but
+  rejecting there decides the outcome before a single element byte is read.
+  CORELIB_PLAN §5.2 gives `INVALID` precedence over `INCOMPLETE`, so an element
+  that already breaches its declared width (`readUnsignedArray`'s `elemMax`,
+  `readSignedArray`'s `elemMin`/`elemMax`, added in #90 for exactly this) and is
+  fully on the wire must stay `INVALID` when the array behind it is cut short.
+  It did not: the read stopped at the count. `skipArrayCount` had already
+  reached this conclusion one path over (#82/#49) and says so in its doc
+  comment; this is the read-path half. The guard is now a cap on the
+  *allocation* rather than a rejection — `arrayAlloc` sizes the destination to
+  `min(count, bytes remaining)`, keeping all of #38's protection, while the
+  elements decide the verdict. A short array still ends `INCOMPLETE`, decided by
+  `readVarint` running out of buffer rather than by the count word, and on valid
+  input (`count <= remaining`) the allocation is exactly what it was. The
+  tighter fixlen bound in `arrayFixlenHeader` (`count * elemSize`) is unchanged:
+  an fp element carries no declared-width bound, so there is nothing there for
+  it to preempt. Found by Crucible F-0043 / F-0061 against the generated
+  TypeScript driver, where it accounted for 92 of the 100 chunk-invariance
+  mismatches over 10 442 truncations × 6 chunk sizes (the whole `INCOMPLETE` /
+  chunked `INVALID` direction, now zero) — the contiguous path was the wrong one.
+
 - **The encoder could not write through an output buffer smaller than its
   largest single write** (#94). CORELIB_PLAN §5.1 now puts a normative floor on
   the output buffer at **one byte**: it may be arbitrarily smaller than the

@@ -273,7 +273,7 @@ export class Cursor {
    */
   readUnsignedArray(schemaCount?: number, elemMax?: number | bigint): (number | bigint)[] {
     const count = this.arrayCount(schemaCount);
-    const out: (number | bigint)[] = new Array(count);
+    const out: (number | bigint)[] = this.arrayAlloc(count);
     for (let i = 0; i < count; i++) {
       this.readVarint();
       const v = this.unsignedValue();
@@ -300,7 +300,7 @@ export class Cursor {
     elemMax?: number | bigint,
   ): (number | bigint)[] {
     const count = this.arrayCount(schemaCount);
-    const out: (number | bigint)[] = new Array(count);
+    const out: (number | bigint)[] = this.arrayAlloc(count);
     for (let i = 0; i < count; i++) {
       this.readVarint();
       const v = this.signedValue();
@@ -319,7 +319,7 @@ export class Cursor {
    */
   readUnsignedArrayLong(schemaCount?: number): Long[] {
     const count = this.arrayCount(schemaCount);
-    const out = new Array<Long>(count);
+    const out = this.arrayAlloc<Long>(count);
     for (let i = 0; i < count; i++) {
       this.readVarint();
       out[i] = new Long(this.lo, this.hi);
@@ -330,7 +330,7 @@ export class Cursor {
   /** Read a signed 64-bit array (zig-zag) into {@link Long}[] — the `bigint`-free path. */
   readSignedArrayLong(schemaCount?: number): Long[] {
     const count = this.arrayCount(schemaCount);
-    const out = new Array<Long>(count);
+    const out = this.arrayAlloc<Long>(count);
     for (let i = 0; i < count; i++) {
       this.readVarint();
       const lo = this.lo >>> 0;
@@ -542,15 +542,41 @@ export class Cursor {
         `array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`,
       );
     }
-    // Part A hardening (corelib-ts#38): a dynamic array needs at least one wire
-    // byte per element (a varint element, or an fp element ≥ its size), so a
-    // count larger than the bytes left in the buffer cannot be real — reject it
-    // as truncation *before* sizing `new Array(count)`, so a hostile count can
-    // never drive an allocation larger than the input. A tighter fixlen bound
-    // (count * elemSize) is applied once the element word is read, in
-    // {@link arrayFixlenHeader}.
-    if (count > this.n - this.p) throw incompleteError("truncated array");
     return count;
+  }
+
+  /**
+   * Size the destination for `count` varint elements without trusting `count`.
+   *
+   * Part A hardening (corelib-ts#38) started from the same observation this
+   * does: a varint element needs at least one wire byte, so a count larger than
+   * the bytes left in the buffer cannot be real, and `new Array(count)` must
+   * never be sized from it. It drew the wrong conclusion from it — it *rejected*
+   * such a count as `INCOMPLETE`, from {@link arrayCount}, which decides the
+   * outcome before a single element byte is examined. §5.2 gives INVALID
+   * precedence over INCOMPLETE, so an element that is already out of its
+   * declared width and fully on the wire must still be INVALID when the array
+   * behind it is cut short — and it never was, because the read stopped at the
+   * count (corelib-ts#99, generator#267/#300, Crucible F-0043).
+   *
+   * {@link skipArrayCount} reached the same conclusion one path over and states
+   * it there; this is the read-path half. Capping the *allocation* keeps all of
+   * #38's protection — a hostile count can still never drive an allocation
+   * larger than the input — while leaving the verdict to the elements: the
+   * caller's loop consumes at least one buffer byte per iteration and
+   * {@link readVarint} throws at end of buffer, so a short array still ends as
+   * INCOMPLETE, just decided by the bytes rather than by the count word.
+   *
+   * Assigning past the initial length would grow the array, and cannot happen:
+   * that needs more elements than there are bytes to carry them. On valid input
+   * `count <= remaining`, so this allocates exactly `count` as before.
+   *
+   * The tighter fixlen bound (count * elemSize) still rejects at the header, in
+   * {@link arrayFixlenHeader} — an fp element has no declared-width bound to
+   * decide, so there is nothing for it to preempt.
+   */
+  private arrayAlloc<T>(count: number): T[] {
+    return new Array<T>(Math.min(count, this.n - this.p));
   }
 
   /**
