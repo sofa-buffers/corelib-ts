@@ -135,6 +135,34 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
   the buffer is the owner's, `setBuffer` on such a stream reports `ARGUMENT` —
   installing a foreign one would strand the bytes already written.
 
+### Changed
+
+- **The two whole-buffer decoders share one byte-reading core** (#114). The pull
+  `Cursor` (`src/decode/cursor.ts`) and the contiguous push decoder
+  (`src/decode/fast.ts`) each carried a verbatim copy of the same unrolled,
+  `bigint`-free LEB128 reader plus the helpers around it — a 72-line identical
+  run, of which 55 lines were the reader itself, and two shorter runs covering
+  the zero-copy `take` and the fp32/fp64 readers. Every varint-level decode fix
+  (#82, #88, #99/#100, #113) had to be applied to both copies by hand, and one
+  applied to a single copy is invisible to review: the shared vectors feed both
+  surfaces the same well-formed bytes, so only a hostile varint tells them apart.
+  Both decoders now extend `BufferReader` (`src/decode/reader.ts`), which owns
+  the buffer, the cursor, the varint reader and the half-combining helpers.
+  Internal only — no public API, wire behaviour or memory behaviour changes. The
+  resumable streaming decoder keeps its own reader: by contract it suspends
+  mid-varint at a chunk boundary, so it is a different algorithm rather than a
+  third copy.
+
+  Inheritance rather than free functions over shared registers, because this
+  repo's profile is maxspeed and that is measured: routing the reader through a
+  module-level function (buffer, length and position in, position out, halves
+  published module-side) cost **+8%** `Ir/op` on `decode: u64 array (1000)` and
+  **+15%** on `decode: typical message` under Callgrind — the reader is the
+  innermost loop of every decode and its callers consume the halves in the same
+  breath. Keeping every access a plain field access on `this` holds the numbers
+  flat: over the pull and push paths, `-0.2%` / `+0.02%` on the array workloads
+  and `+0.3%` / `+0.8%` on the small-message ones.
+
 ### Deprecated
 
 - **`new OStream()` with no arguments** (#108) — a one-release alias for
@@ -460,6 +488,17 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Tests
 
+- `varint-reader-shared.test.ts` guards the single varint reader (#114) at both
+  levels the duplication could fail at. Structurally: the bounds-checked unrolled
+  reader has exactly one definition across `src/decode/`, and no verbatim block
+  of code survives between `cursor.ts` and `fast.ts` — both assertions fail
+  immediately on a re-pasted copy, which the previous suite could not see at all.
+  Behaviourally: the pull and push surfaces are fed the same adversarial varints
+  — the 64-bit boundary, `u64` max, bit 64 set, an eleventh byte, and truncation
+  at every prefix length from one to nine bytes — and must return the same value
+  or the same error code. That is the drift a one-sided fix produces, and the
+  shared vectors cannot catch it because both surfaces see the same well-formed
+  bytes there.
 - `small-buffer-encode.test.ts` is CORELIB_PLAN §7.2 item 4: it drives a corpus
   covering every fixed-width writer through caller buffers of 1, 2, 3, 5, 8, 16
   and 64 bytes and asserts the concatenated flushes are byte-identical to the
