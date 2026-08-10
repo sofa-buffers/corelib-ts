@@ -60,7 +60,7 @@ full type declarations.
 | Reserve-offset | `new OStream(buf, offset)` leaves room at the front for a lower-layer header, saving a copy. The offset belongs to that installation and is consumed by the flush that hands the unit over; `setBuffer(buf, offset)` from inside the sink re-arms it, for header room in every packet. |
 | Caller-owned buffers | The encoder allocates no output buffer and grows none: it writes into yours, and asks the `BufferOwner` you named for the next one when it fills. `growingOStream()` is that owner ready-made. |
 | Explicit endianness | IEEE-754 values are read / written little-endian via `DataView`, identical on every engine. |
-| Pluggable acceleration | The encoder's bulk array paths run through a swappable `Kernel`; the default is pure TypeScript. |
+| Pluggable acceleration | The encoder's bulk array paths run through a swappable `Kernel`, and that interface is the entire seam: `setKernel(yourKernel)`. **No accelerated backend exists today** — the kernel is the pure-TypeScript one on every host unless you build and install your own (native addon or WASM); the library ships no loader for one. |
 
 ## Usage
 

@@ -1,7 +1,7 @@
 /**
  * The acceleration seam: the default kernel is the JS one, a replacement kernel
- * produces byte-identical output (so a native/WASM build is a drop-in), bad
- * kernels are rejected, and a missing native addon falls back silently.
+ * produces byte-identical output (so an out-of-tree native/WASM build is a
+ * drop-in), and bad kernels are rejected.
  */
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -11,8 +11,6 @@ import {
   decode,
   getKernel,
   jsKernel,
-  loadNativeKernel,
-  loadWasmKernel,
   setKernel,
 } from "../src/index.js";
 import { bytesToHex } from "./helpers/hex.js";
@@ -62,24 +60,32 @@ describe("kernel registry", () => {
   });
 });
 
-describe("optional native acceleration", () => {
-  it("falls back silently when the native addon is absent", async () => {
-    const installed = await loadNativeKernel();
-    expect(installed).toBe(false);
-    expect(getKernel().name).toBe("js");
-  });
+/**
+ * The whole installation path for an accelerated build, as a caller writes it
+ * (#115): the library ships no loader — the caller brings the module, builds a
+ * {@link Kernel} over its exports, and hands it to `setKernel`. Nothing about
+ * the encoder above the seam changes, and the bytes do not either.
+ */
+describe("installing an out-of-tree accelerated kernel", () => {
+  it("takes a kernel built over WASM instance exports and keeps the bytes identical", async () => {
+    const baseline = encodeArrays();
 
-  it("instantiates a WASM kernel from module bytes", async () => {
-    const factory = (): Kernel => ({ ...jsKernel, name: "wasm-stub" });
-    expect(await loadWasmKernel(EMPTY_WASM, factory)).toBe(true);
+    const { instance } = await WebAssembly.instantiate(EMPTY_WASM, {});
+    const fromExports = (exports: WebAssembly.Exports): Kernel => {
+      expect(exports).toBeDefined();
+      return { ...jsKernel, name: "wasm-stub" };
+    };
+
+    setKernel(fromExports(instance.exports));
     expect(getKernel().name).toBe("wasm-stub");
+    expect(encodeArrays()).toBe(baseline);
   });
 
-  it("instantiates a WASM kernel from a compiled module", async () => {
-    const mod = new WebAssembly.Module(EMPTY_WASM);
-    const factory = (): Kernel => ({ ...jsKernel, name: "wasm-mod" });
-    expect(await loadWasmKernel(mod, factory)).toBe(true);
-    expect(getKernel().name).toBe("wasm-mod");
+  it("restores the JS kernel when the caller puts it back", () => {
+    setKernel({ ...jsKernel, name: "native-stub" });
+    expect(getKernel().name).toBe("native-stub");
+    setKernel(jsKernel);
+    expect(getKernel()).toBe(jsKernel);
   });
 });
 

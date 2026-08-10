@@ -172,6 +172,32 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
   so it never reports `BUFFER_FULL` and refuses `setBuffer`, exactly as
   `growingOStream()` does.
 
+### Removed
+
+- **`loadNativeKernel()`, `loadWasmKernel()` and `WasmKernelFactory` — loaders
+  for acceleration backends that do not exist** (#115). `loadNativeKernel()`
+  tried to `require("@sofa-buffers/corelib-native")`, a package this
+  `package.json` never declared (there is no `optionalDependencies` block) and
+  the org never published, so on every host it took its `catch { return false }`
+  path — its one test asserted exactly that. `loadWasmKernel()` was three lines
+  of `WebAssembly.instantiate` sugar in front of `setKernel(factory(exports))`
+  for a WASM build that its own doc comment claimed "is shipped separately", and
+  that likewise does not exist; nothing in the library was "wired through" it.
+  Both shipped in the ESM, CJS and IIFE bundles as public API and were the two
+  least-covered files in the repo.
+
+  The acceleration seam is unchanged and is now stated plainly in the README and
+  in `src/backend/kernel.ts`: it is the `Kernel` interface plus `setKernel()` /
+  `getKernel()` / `jsKernel`. A caller with a native addon or a WASM module
+  loads it their own way and installs the kernel they build from it — one line,
+  no loader needed — and CORELIB_PLAN §5's "the upgrade must be invisible to
+  callers" still holds, because the swap happens behind the same public API.
+  `test/kernel.test.ts` now walks that path end to end (instantiate a module,
+  build a kernel over its exports, install it, encode byte-identical output),
+  and `test/public-surface.test.ts` pins both halves of the finding: no exported
+  `load*Kernel`, and no module id anywhere in `src/` that is not relative, a
+  `node:` builtin, or a declared dependency.
+
 ### Fixed
 
 - **`leb128.decodeVarint` reported `INCOMPLETE` where the three real decode

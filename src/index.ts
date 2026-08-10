@@ -5,8 +5,9 @@
  * {@link IStream} (driving a {@link Visitor}) to decode, both chunkable so a
  * message can be far larger than any buffer. Generated message classes call
  * these primitives directly. Hot paths run through a swappable {@link Kernel}
- * ({@link setKernel}) so an optional native or WASM build can accelerate them
- * without any API change.
+ * ({@link setKernel}) so a native or WASM build — none is published today, and
+ * the library ships no loader for one — can accelerate them without any API
+ * change.
  *
  * Every public symbol is available two ways: as a flat named import, or under
  * the aggregate `sofab` namespace (`import * as sofab` is the §6 idiom, and a
