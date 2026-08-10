@@ -1,102 +1,47 @@
 /**
- * Unit coverage for the low-level varint helpers used by the whole-buffer paths
- * (the streaming decoder has its own resumable reader, tested via the vectors).
+ * The varint contract, pinned on the **shipped** surfaces.
+ *
+ * §4.1's rules — the length ladder, the 10-byte / 64-bit bound, truncation
+ * versus overflow — used to be exercised against a general `encodeVarint` /
+ * `decodeVarint` pair in `src/varint/leb128.ts` that no production path called:
+ * a fourth reader whose only job was to be kept in lockstep with the three that
+ * ship (corelib-ts#82, #88, #99/#100, #113, #131 each had to be applied to it as
+ * well). The pair is gone; the rules are asserted here through the encoder and
+ * the three decode surfaces that actually read bytes — the one place a
+ * divergence would matter.
+ *
+ * The reference LEB128 is written out locally, below: an oracle a test owns is
+ * worth more than one that shares an implementation with the code under test.
  */
 
 import { describe, expect, it } from "vitest";
-import { decodeVarint, encodeVarint, varintSize } from "../src/varint/leb128.js";
-import { zigzagDecode, zigzagEncode } from "../src/varint/zigzag.js";
 import {
   Cursor,
   DecodeStatus,
   IStream,
+  OStream,
   SofabError,
   SofabErrorCode,
   U64_MAX,
   decode,
 } from "../src/index.js";
 
-const BOUNDARIES = [0n, 1n, 127n, 128n, 16383n, 16384n, 2097151n, 2097152n, U64_MAX];
-
-describe("varint round-trip", () => {
-  it("encodes and decodes every length boundary", () => {
-    for (const value of BOUNDARIES) {
-      const buf = new Uint8Array(10);
-      const end = encodeVarint(value, buf, 0);
-      expect(end).toBe(varintSize(value));
-      const { value: decoded, pos } = decodeVarint(buf, 0);
-      expect(decoded).toBe(value);
-      expect(pos).toBe(end);
+/** Reference LEB128 of a non-negative `bigint` — the test's own oracle. */
+function varint(value: bigint): number[] {
+  const out: number[] = [];
+  for (let v = value; ; v >>= 7n) {
+    if (v < 0x80n) {
+      out.push(Number(v));
+      return out;
     }
-  });
+    out.push(Number(v & 0x7fn) | 0x80);
+  }
+}
 
-  it("reports INCOMPLETE for a truncated varint", () => {
-    const buf = Uint8Array.from([0x80, 0x80]); // continuation with no terminator
-    try {
-      decodeVarint(buf, 0);
-      throw new Error("expected throw");
-    } catch (e) {
-      expect(e).toBeInstanceOf(SofabError);
-      // Ends mid-varint: more bytes could complete it, so INCOMPLETE not INVALID.
-      expect((e as SofabError).code).toBe(SofabErrorCode.Incomplete);
-    }
-  });
-
-  it("rejects an overlong varint", () => {
-    const buf = new Uint8Array(11).fill(0x80);
-    expect(() => decodeVarint(buf, 0)).toThrow(SofabError);
-  });
-
-  // Regression for #53: an overlong (>64-bit) varint must be rejected as
-  // INVALID, not silently truncated/wrapped. The 10th byte carries only bit 63,
-  // so its payload may not exceed 0x01 and no 11th byte may follow.
-  describe("overlong (>64-bit) varint is INVALID (#53)", () => {
-    // Nine 0xff groups fill bits 0..62; the 10th byte supplies bit 63 upward.
-    const nine = () => Array(9).fill(0xff);
-
-    it("accepts the 2^64-1 maximum (10th byte = 0x01) as the control", () => {
-      const buf = Uint8Array.from([...nine(), 0x01]);
-      const { value, pos } = decodeVarint(buf, 0);
-      expect(value).toBe(U64_MAX);
-      expect(pos).toBe(10);
-    });
-
-    it("rejects the 65th bit (10th byte = 0x02)", () => {
-      const buf = Uint8Array.from([...nine(), 0x02]);
-      try {
-        decodeVarint(buf, 0);
-        throw new Error("expected throw");
-      } catch (e) {
-        expect(e).toBeInstanceOf(SofabError);
-        expect((e as SofabError).code).toBe(SofabErrorCode.InvalidMsg);
-      }
-    });
-
-    it("rejects high payload bits in the 10th byte (0x7f)", () => {
-      const buf = Uint8Array.from([...nine(), 0x7f]);
-      try {
-        decodeVarint(buf, 0);
-        throw new Error("expected throw");
-      } catch (e) {
-        expect(e).toBeInstanceOf(SofabError);
-        expect((e as SofabError).code).toBe(SofabErrorCode.InvalidMsg);
-      }
-    });
-
-    it("rejects a continuation into an 11th byte", () => {
-      // 10th byte 0x81: low bit fits bit 63 but the continuation bit demands an
-      // 11th byte, which is a >64-bit overflow.
-      const buf = Uint8Array.from([...nine(), 0x81, 0x00]);
-      try {
-        decodeVarint(buf, 0);
-        throw new Error("expected throw");
-      } catch (e) {
-        expect(e).toBeInstanceOf(SofabError);
-        expect((e as SofabError).code).toBe(SofabErrorCode.InvalidMsg);
-      }
-    });
-  });
-});
+/** Reference zig-zag `(n << 1) ^ (n >> 63)` over the `int64` domain. */
+function zigzag(value: bigint): bigint {
+  return ((value << 1n) ^ (value >> 63n)) & U64_MAX;
+}
 
 /** Run `fn` and return the SofabError code it throws (or fail loudly). */
 function codeOf(fn: () => unknown): SofabErrorCode {
@@ -109,43 +54,107 @@ function codeOf(fn: () => unknown): SofabErrorCode {
   throw new Error("expected a SofabError, but nothing was thrown");
 }
 
+/** The value bytes of a one-field message: id 0, so the header is one byte. */
+function payload(write: (os: OStream) => void): number[] {
+  const os = new OStream();
+  write(os);
+  return Array.from(os.bytes()).slice(1);
+}
+
+/** Feed `buf` to a resumable IStream one byte at a time. */
+const chunked = (buf: Uint8Array): void => {
+  const is = new IStream();
+  for (const b of buf) is.feed(Uint8Array.of(b), {});
+};
+
+/** Drive the pull decoder over `buf`, reading each field as an unsigned scalar. */
+const pull = (buf: Uint8Array): void => {
+  const c = new Cursor(buf);
+  while (c.readHeader()) c.readUnsigned();
+};
+
+const BOUNDARIES = [0n, 1n, 127n, 128n, 16383n, 16384n, 2097151n, 2097152n, U64_MAX];
+
+describe("varint round-trip", () => {
+  it("encodes every length boundary as the reference LEB128", () => {
+    for (const value of BOUNDARIES) {
+      expect(payload((os) => os.writeUnsigned(0, value))).toEqual(varint(value));
+    }
+  });
+
+  it("reads every length boundary back, on both whole-buffer surfaces", () => {
+    for (const value of BOUNDARIES) {
+      const os = new OStream();
+      os.writeUnsigned(0, value);
+      const wire = os.bytes().slice();
+
+      const c = new Cursor(wire);
+      expect(c.readHeader()).toBe(true);
+      expect(BigInt(c.readUnsigned())).toBe(value);
+
+      let seen: bigint | undefined;
+      decode(wire, { unsigned: (_id, v) => void (seen = BigInt(v)) });
+      expect(seen).toBe(value);
+    }
+  });
+
+  it("reports INCOMPLETE for a truncated varint", () => {
+    // A header varint with the continuation bit set and no terminator: more
+    // bytes could complete it, so INCOMPLETE, not INVALID.
+    const buf = Uint8Array.from([0x80, 0x80]);
+    expect(codeOf(() => decode(buf, {}))).toBe(SofabErrorCode.Incomplete);
+    expect(codeOf(() => pull(buf))).toBe(SofabErrorCode.Incomplete);
+  });
+});
+
+// Regression for #53: an overlong (>64-bit) varint must be rejected as INVALID,
+// not silently truncated/wrapped. The 10th byte carries only bit 63, so its
+// payload may not exceed 0x01 and no 11th byte may follow.
+describe("overlong (>64-bit) varint is INVALID (#53)", () => {
+  /** id 0, wire 0 (unsigned), then the given value bytes. */
+  const field = (...value: number[]): Uint8Array => Uint8Array.from([0x00, ...value]);
+  /** Nine 0xff groups fill bits 0..62; the 10th byte supplies bit 63 upward. */
+  const nine = (): number[] => Array<number>(9).fill(0xff);
+
+  it("accepts the 2^64-1 maximum (10th byte = 0x01) as the control", () => {
+    const wire = field(...nine(), 0x01);
+    const c = new Cursor(wire);
+    expect(c.readHeader()).toBe(true);
+    expect(c.readUnsigned()).toBe(U64_MAX);
+
+    let seen: bigint | undefined;
+    decode(wire, { unsigned: (_id, v) => void (seen = BigInt(v)) });
+    expect(seen).toBe(U64_MAX);
+  });
+
+  it.each([
+    ["the 65th bit (10th byte = 0x02)", [...nine(), 0x02]],
+    ["high payload bits in the 10th byte (0x7f)", [...nine(), 0x7f]],
+    // 10th byte 0x81: the low bit fits bit 63, but the continuation flag demands
+    // an 11th byte, which is past the 10-byte maximum.
+    ["a continuation into an 11th byte", [...nine(), 0x81, 0x00]],
+  ])("rejects %s on all three decode surfaces", (_what, value) => {
+    const wire = field(...value);
+    expect(codeOf(() => decode(wire, {}))).toBe(SofabErrorCode.InvalidMsg);
+    expect(codeOf(() => pull(wire))).toBe(SofabErrorCode.InvalidMsg);
+    expect(codeOf(() => chunked(wire))).toBe(SofabErrorCode.InvalidMsg);
+  });
+});
+
 // Regression for #113. §4.1 bounds the *encoding*, not the value: ten bytes that
 // all carry the continuation flag already demand an 11th, which is past the
 // 10-byte / 64-bit maximum — so they are malformed on the bytes already in hand,
 // whatever (if anything) follows. §5.2 gives that INVALID precedence over the
 // INCOMPLETE of input that merely stops there, and the verdict must not depend on
-// where the input happens to end. All four varint readers in this repo — the
-// helper here, the contiguous `decode()`, the pull `Cursor` and the resumable
-// `IStream` — must therefore return the same code for the same bytes.
+// where the input happens to end. All three decode surfaces in this repo — the
+// contiguous `decode()`, the pull `Cursor` and the resumable `IStream` — must
+// therefore return the same code for the same bytes.
 describe("ten continuation bytes then end of input are INVALID (#113)", () => {
   /** `n` bytes that all set the continuation flag and carry no payload. */
   const cont = (n: number): number[] => Array<number>(n).fill(0x80);
 
   /** id 0, wire 0 (unsigned): the value varint follows the header immediately. */
   const field = (n: number): Uint8Array => Uint8Array.from([0x00, ...cont(n)]);
-
-  /** Feed `buf` to a resumable IStream one byte at a time. */
-  const chunked = (buf: Uint8Array): void => {
-    const is = new IStream();
-    for (const b of buf) is.feed(Uint8Array.of(b), {});
-  };
-
-  const pull = (buf: Uint8Array): void => {
-    const c = new Cursor(buf);
-    while (c.readHeader()) c.readUnsigned();
-  };
-
-  it("decodeVarint reports INVALID, not INCOMPLETE", () => {
-    expect(codeOf(() => decodeVarint(Uint8Array.from(cont(10)), 0))).toBe(
-      SofabErrorCode.InvalidMsg,
-    );
-  });
-
-  it("decodeVarint still reports nine-then-EOF as INCOMPLETE (control)", () => {
-    expect(codeOf(() => decodeVarint(Uint8Array.from(cont(9)), 0))).toBe(
-      SofabErrorCode.Incomplete,
-    );
-  });
 
   it("the three decode surfaces agree on INVALID", () => {
     const ten = field(10);
@@ -165,15 +174,39 @@ describe("ten continuation bytes then end of input are INVALID (#113)", () => {
   });
 });
 
-describe("zig-zag round-trip", () => {
-  it("maps signed boundaries through the unsigned domain", () => {
-    const values = [0n, -1n, 1n, -2n, 2n, -0x8000_0000_0000_0000n, 0x7fff_ffff_ffff_ffffn];
-    for (const v of values) {
-      expect(zigzagDecode(zigzagEncode(v))).toBe(v);
+describe("zig-zag", () => {
+  const VALUES = [
+    0n,
+    -1n,
+    1n,
+    -2n,
+    2n,
+    -12345n,
+    0x7fff_ffffn,
+    -0x8000_0000n,
+    -0x8000_0000_0000_0000n,
+    0x7fff_ffff_ffff_ffffn,
+  ];
+
+  it("writes the zig-zag image of every signed boundary", () => {
+    for (const v of VALUES) {
+      // The payload of a signed field is the unsigned varint of `zigzag(v)` —
+      // asserted against the same field written through the unsigned writer, so
+      // the mapping and the encoding are pinned separately.
+      expect(payload((os) => os.writeSigned(0, v))).toEqual(varint(zigzag(v)));
+      expect(payload((os) => os.writeSigned(0, v))).toEqual(
+        payload((os) => os.writeUnsigned(0, zigzag(v))),
+      );
     }
-    expect(zigzagEncode(0n)).toBe(0n);
-    expect(zigzagEncode(-1n)).toBe(1n);
-    expect(zigzagEncode(1n)).toBe(2n);
-    expect(zigzagEncode(-0x8000_0000_0000_0000n)).toBe(U64_MAX);
+  });
+
+  it("reads every signed boundary back through it", () => {
+    for (const v of VALUES) {
+      const os = new OStream();
+      os.writeSigned(0, v);
+      const c = new Cursor(os.bytes());
+      expect(c.readHeader()).toBe(true);
+      expect(BigInt(c.readSigned())).toBe(v);
+    }
   });
 });

@@ -460,6 +460,15 @@ Who owns the bytes:
   `setBuffer` on such a stream throws `ARGUMENT`: hand a buffer of your own to a
   plain `OStream` instead. `new OStream()` with no arguments is a **deprecated**
   alias for `growingOStream()` and will be removed.
+
+  Its storage is **carved from a shared slab** while it is small enough (up to
+  4 KiB of an 8 KiB slab), the way Node's own `Buffer.allocUnsafe` pools: a
+  typed array over 64 bytes lands outside the JS heap on V8, at ~20x the
+  allocation cost, which for a short message was more than the encode itself. A
+  carve is handed out once and never recycled, so no two encoders ever share
+  bytes and no message can read another's; what it changes is *lifetime* — a
+  retained `bytes()` view keeps its slab alive, so `.slice()` (already the advice
+  for a view that outlives the next write) is also what releases it.
 - **`MIN_OUTPUT_BUFFER` = `1`.** The smallest buffer this port accepts *for
   streaming*, exported from the package so a caller can size from it. It is `1`
   because the encoder splits every atomic unit — field header, fixlen word,

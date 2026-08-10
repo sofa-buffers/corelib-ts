@@ -17,15 +17,7 @@
  */
 
 import { IStream, OStream, growingOStream } from "../src/index.js";
-import {
-  Checksum,
-  MIN_SECONDS,
-  WARMUP,
-  blackholeValue,
-  calibrateBatch,
-  cpuNow,
-  sink,
-} from "./common.js";
+import { Checksum, blackholeValue, measure, sink } from "./common.js";
 
 const PERF_STRING = "perf-benchmark-message";
 const PERF_SAMPLES = [1e6, 2e6, 3e6, 4e6, 5e6, 6e6, 7e6, 8e6];
@@ -56,18 +48,13 @@ interface Result {
   mbs: number;
 }
 
-function measure(bytes: number, body: () => void): Result {
-  for (let i = 0; i < WARMUP; i++) body();
-  const batch = calibrateBatch(body);
-  let it = 0;
-  const t0 = cpuNow();
-  let el: number;
-  do {
-    for (let k = 0; k < batch; k++) body();
-    it += batch;
-    el = cpuNow() - t0;
-  } while (el < MIN_SECONDS);
-  return { iterations: it, nsOp: (el / it) * 1e9, mbs: (bytes * it) / el / 1e6 };
+function run(bytes: number, body: () => void): Result {
+  const { iterations, seconds } = measure(body);
+  return {
+    iterations,
+    nsOp: (seconds / iterations) * 1e9,
+    mbs: (bytes * iterations) / seconds / 1e6,
+  };
 }
 
 function report(what: string, r: Result, bytes: number): void {
@@ -87,12 +74,12 @@ function main(): void {
   })();
   const size = wire.length;
 
-  const enc = measure(size, () => {
+  const enc = run(size, () => {
     const os = growingOStream();
     perfEncode(os);
     sink(BigInt(os.bytesUsed));
   });
-  const dec = measure(size, () => {
+  const dec = run(size, () => {
     const c = new Checksum();
     new IStream().feed(wire, c);
     sink(c.acc);

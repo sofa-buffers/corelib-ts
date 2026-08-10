@@ -11,7 +11,16 @@
  *
  * Values are stored as raw two's-complement bits; the same `Long` serves an
  * unsigned or signed field — {@link Long.toBigInt} takes the signedness.
+ *
+ * The two `bigint` conversions below go through the shared bit-punning scratch
+ * ({@link "./varint/bits64"}) that the codec's own hot paths use, rather than
+ * through mask-and-shift `bigint` arithmetic: the split allocated four
+ * intermediate `bigint`s per call and the join two, on the very boundary this
+ * class exists to make cheap.
  */
+
+import { HI, joinI64, joinU64, LO, S_I64, S_U32 } from "./varint/bits64.js";
+
 export class Long {
   /** Low 32 bits (unsigned). */
   readonly low: number;
@@ -37,9 +46,14 @@ export class Long {
     return new Long(low, high);
   }
 
-  /** Split a `bigint` into its low/high 32-bit halves (two's complement). */
+  /**
+   * Split a `bigint` into its low/high 32-bit halves (two's complement). The
+   * `BigInt64Array` store *is* `ToBigInt64` — reduction modulo 2^64 — so an
+   * out-of-range value keeps exactly the halves the masks kept (bits64).
+   */
   static fromBigInt(value: bigint): Long {
-    return new Long(Number(value & 0xffff_ffffn) >>> 0, Number((value >> 32n) & 0xffff_ffffn) >>> 0);
+    S_I64[0] = value;
+    return new Long(S_U32[LO]!, S_U32[HI]!);
   }
 
   /** From an integer `number` (`|n| < 2^53`); sign handled via `bigint` once. */
@@ -55,9 +69,7 @@ export class Long {
 
   /** Materialise as a `bigint`. `signed` reads the high bit as two's complement. */
   toBigInt(signed = false): bigint {
-    let r = (BigInt(this.high >>> 0) << 32n) | BigInt(this.low >>> 0);
-    if (signed && (this.high & 0x8000_0000) !== 0) r -= 0x1_0000_0000_0000_0000n;
-    return r;
+    return signed ? joinI64(this.low, this.high) : joinU64(this.low, this.high);
   }
 
   /** Decimal string (`signed` interprets the high bit as two's complement). */

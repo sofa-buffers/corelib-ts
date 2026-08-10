@@ -368,54 +368,52 @@ export class OStream {
 
   /** Write a UTF-8 string field. */
   writeString(id: number, text: string): void {
-    // Fast path (a buffer whose owner enlarges it on demand): scan the UTF-8
-    // byte length, write the fixlen header, then encode the characters straight
-    // into the output buffer. This skips `TextEncoder.encode`'s per-call setup
-    // + throwaway array + second copy — the encoder's dominant cost on
-    // string-heavy messages. An owner that declines the reserve drops through
-    // to the chunk-draining route below, which needs no contiguous room.
-    if (this.canGrow) {
-      // Pure ASCII — the overwhelmingly common case for keys, identifiers and
-      // short text — needs neither of the general helpers: the UTF-8 byte length
-      // is the character count, so the header can go out after one scan and the
-      // payload is a straight character-to-byte copy. `utf8Length` /
-      // `utf8Write` below remain the single implementation of everything else,
-      // including all surrogate handling; this only short-circuits the case
-      // where both of them would reduce to exactly this loop.
-      const n = text.length;
-      let a = 0;
-      while (a < n && text.charCodeAt(a) < 0x80) a++;
-      if (a === n) {
-        if (n > FIXLEN_MAX) {
-          throw argumentError(`fixlen length ${n} exceeds ${FIXLEN_MAX}`);
-        }
-        this.fixlenHead(id, n, FixlenSubtype.String);
-        if (this.tryEnsure(n)) {
-          const buf = this.buf;
-          const p = this.pos;
-          for (let k = 0; k < n; k++) buf[p + k] = text.charCodeAt(k);
-          this.pos = p + n;
-          return;
-        }
-        this.writeRaw(encodeUtf8(text));
-        return;
+    // Fast path: scan the UTF-8 byte length, write the fixlen header, then encode
+    // the characters straight into the output buffer. This skips
+    // `TextEncoder.encode`'s per-call setup + throwaway array + second copy — the
+    // encoder's dominant cost on string-heavy messages. It needs the payload to
+    // fit contiguously where the cursor stands, which {@link reserveBulk}
+    // answers for *any* buffer; where it does not, the chunk-draining `writeRaw`
+    // route below takes over, needing no contiguous room at all.
+    //
+    // Pure ASCII — the overwhelmingly common case for keys, identifiers and
+    // short text — needs neither of the general helpers: the UTF-8 byte length
+    // is the character count, so the header can go out after one scan and the
+    // payload is a straight character-to-byte copy. `utf8Length` / `utf8Write`
+    // below remain the single implementation of everything else, including all
+    // surrogate handling; this only short-circuits the case where both of them
+    // would reduce to exactly this loop.
+    const n = text.length;
+    let a = 0;
+    while (a < n && text.charCodeAt(a) < 0x80) a++;
+    if (a === n) {
+      if (n > FIXLEN_MAX) {
+        throw argumentError(`fixlen length ${n} exceeds ${FIXLEN_MAX}`);
       }
-
-      const byteLen = utf8Length(text);
-      if (byteLen > FIXLEN_MAX) {
-        throw argumentError(`fixlen length ${byteLen} exceeds ${FIXLEN_MAX}`);
-      }
-      this.fixlenHead(id, byteLen, FixlenSubtype.String);
-      if (this.tryEnsure(byteLen)) {
-        this.pos = utf8Write(text, this.buf, this.pos);
+      this.fixlenHead(id, n, FixlenSubtype.String);
+      if (this.reserveBulk(n)) {
+        const buf = this.buf;
+        const p = this.pos;
+        for (let k = 0; k < n; k++) buf[p + k] = text.charCodeAt(k);
+        this.pos = p + n;
         return;
       }
       this.writeRaw(encodeUtf8(text));
       return;
     }
-    // Streaming path: the payload may outgrow a fixed caller buffer, so keep the
-    // chunk-draining `writeRaw` route (needs the bytes materialised up front).
-    this.writeFixlen(id, encodeUtf8(text), FixlenSubtype.String);
+
+    // Sized (and surrogate-validated) before the header goes out, so an
+    // unencodable string still throws with nothing written.
+    const byteLen = utf8Length(text);
+    if (byteLen > FIXLEN_MAX) {
+      throw argumentError(`fixlen length ${byteLen} exceeds ${FIXLEN_MAX}`);
+    }
+    this.fixlenHead(id, byteLen, FixlenSubtype.String);
+    if (this.reserveBulk(byteLen)) {
+      this.pos = utf8Write(text, this.buf, this.pos);
+      return;
+    }
+    this.writeRaw(encodeUtf8(text));
   }
 
   /** Write a blob (arbitrary bytes) field. */
@@ -984,13 +982,27 @@ export class OStream {
   /**
    * Reserve `n` contiguous bytes for a bulk write — the whole payload of an
    * array or a string, written in one pass into a buffer that cannot move under
-   * it. Only worth attempting where the buffer's owner enlarges it on demand
-   * ({@link canGrow}); every caller has an element-by-element route to fall back
-   * on, which is what an owner that declines gets. On a buffer with neither an
-   * owner nor a sink {@link tryEnsure} reports `BUFFER_FULL`, which is the right
-   * answer there: nothing else can make room.
+   * it. Every caller has an element-at-a-time route to fall back on when this
+   * says no, producing the identical bytes, so a `false` here is never an error.
+   *
+   * The room already at the cursor counts on **any** buffer, which is what makes
+   * the one-shot `new OStream(buf)` case — a caller buffer sized from the
+   * schema's `MAX_SIZE`, the shape CORELIB_PLAN §5.1 puts first — as fast as the
+   * accumulating one: it used to be gated on {@link canGrow} alone, so a message
+   * encoded into a caller's own buffer took `TextEncoder` for every string and
+   * the element loop for every array — measured at 1.9 µs against 0.16 µs for
+   * the same five-field message once the bulk routes were open to it.
+   *
+   * Beyond that room only an *owner* may be asked, and deliberately so. A bulk
+   * array reserve asks for the **worst case** (10 bytes per element), which an
+   * owner simply allocates, while a fixed caller buffer that cannot take the
+   * worst case may still hold the real encoding comfortably — so demanding it
+   * there would turn a message that fits into a spurious `BUFFER_FULL`. Asking
+   * only when an owner can answer keeps {@link tryEnsure}'s throw out of a path
+   * whose `false` is a legitimate answer.
    */
   private reserveBulk(n: number): boolean {
+    if (this.buf.length - this.pos >= n) return true;
     return this.canGrow && this.tryEnsure(n);
   }
 
@@ -1047,6 +1059,55 @@ export class OStream {
 }
 
 /**
+ * Bytes per slab the accumulator carves its buffers out of (see
+ * {@link accumulatorBuffer}). Node's own `Buffer.allocUnsafe` pool is 8 KiB for
+ * the same reason and the same trade-off.
+ */
+const SLAB_BYTES = 8192;
+
+/**
+ * The largest buffer taken from a slab. Half a slab, so a carve can never leave
+ * most of a fresh slab unusable, and a request bigger than this gets storage of
+ * its own — where one allocation per message is amortised by the message anyway.
+ */
+const SLAB_MAX_TAKE = SLAB_BYTES >>> 1;
+
+let slab: Uint8Array | null = null;
+/** How much of {@link slab} has been handed out; never given back. */
+let slabUsed = 0;
+
+/**
+ * Storage for the accumulator {@link growingOStream} builds: `n` bytes, carved
+ * from a shared slab.
+ *
+ * V8 keeps a typed array's bytes inside the JS heap only up to **64 bytes**; one
+ * byte more and the backing store is an external allocation, which on Node 24
+ * measures ~1.4 µs — against ~60 ns for a slab carve, and against the ~300 ns it
+ * takes to *encode* a small message. That single allocation was 45% of the
+ * profile of `encode: typical message` and the reason the workload ran at 15 MB/s
+ * while decode ran at 28. Carving amortises it over a whole slab.
+ *
+ * A carved region is handed out **once** and never recycled, so this changes
+ * nothing an encoder or its caller can observe: two accumulators never share
+ * bytes, and a slab is fresh (zero-filled) storage, so no previous message's
+ * bytes can be read out of one. What it does change is lifetime — a retained
+ * `bytes()` view keeps its whole slab alive, exactly as a retained
+ * `Buffer.allocUnsafe` slice does — which is why {@link OStream.bytes} already
+ * documents `.slice()` for a view that must outlive the encode.
+ */
+function accumulatorBuffer(n: number): Uint8Array {
+  if (n > SLAB_MAX_TAKE) return new Uint8Array(n);
+  let s = slab;
+  if (s === null || s.length - slabUsed < n) {
+    s = slab = new Uint8Array(SLAB_BYTES);
+    slabUsed = 0;
+  }
+  const from = slabUsed;
+  slabUsed = from + n;
+  return s.subarray(from, slabUsed);
+}
+
+/**
  * The doubling accumulator {@link growingOStream} installs: hand back a buffer
  * twice the size (or as much more as the reserve needs) with the message copied
  * in. Module-level and stateless — everything it needs is in its arguments — so
@@ -1055,7 +1116,7 @@ export class OStream {
 const growOwner: BufferOwner = (current, used, needed) => {
   let cap = current.length * 2;
   if (cap < used + needed) cap = used + needed;
-  const next = new Uint8Array(cap);
+  const next = accumulatorBuffer(cap);
   next.set(current.subarray(0, used));
   return next;
 };
@@ -1098,5 +1159,5 @@ export function growingOStream(initialCapacity = DEFAULT_CAPACITY): OStream {
   if (!Number.isInteger(initialCapacity) || initialCapacity < 1) {
     throw argumentError(`initial capacity ${initialCapacity} must be a positive integer`);
   }
-  return new OStream(new Uint8Array(initialCapacity), 0, undefined, growOwner);
+  return new OStream(accumulatorBuffer(initialCapacity), 0, undefined, growOwner);
 }

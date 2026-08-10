@@ -10,15 +10,7 @@
  */
 
 import { IStream, OStream, growingOStream } from "../src/index.js";
-import {
-  Checksum,
-  MIN_SECONDS,
-  WARMUP,
-  blackholeValue,
-  calibrateBatch,
-  cpuNow,
-  sink,
-} from "./common.js";
+import { Checksum, blackholeValue, measure, sink } from "./common.js";
 
 const N = 1000;
 const GOLDEN = 0x9e37_79b9_7f4a_7c15n;
@@ -44,18 +36,9 @@ function encodeTypical(os: OStream): void {
 }
 
 /** Run `body` for ~1 s of CPU time after warmup; return MB/s for `bytes`. */
-function measure(bytes: number, body: () => void): number {
-  for (let i = 0; i < WARMUP; i++) body();
-  const batch = calibrateBatch(body);
-  let it = 0;
-  const t0 = cpuNow();
-  let el: number;
-  do {
-    for (let k = 0; k < batch; k++) body();
-    it += batch;
-    el = cpuNow() - t0;
-  } while (el < MIN_SECONDS);
-  return (bytes * it) / el / 1e6;
+function throughput(bytes: number, body: () => void): number {
+  const { iterations, seconds } = measure(body);
+  return (bytes * iterations) / seconds / 1e6;
 }
 
 /** The four workloads, sharing one-time setup; keyed by the names the
@@ -136,7 +119,7 @@ function main(): void {
   console.log("Workload".padEnd(26) + " " + "MB/s".padStart(12));
   console.log("--------".padEnd(26) + " " + "----".padStart(12));
   for (const key of w.order) {
-    console.log(row(LABELS[key]!, measure(w.bytes[key]!, w.run[key]!)));
+    console.log(row(LABELS[key]!, throughput(w.bytes[key]!, w.run[key]!)));
   }
   console.log("");
   console.log("MB = 1e6 bytes. ~1s CPU-time loop per workload.");

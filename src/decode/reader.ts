@@ -48,7 +48,6 @@ const TWO32 = 0x1_0000_0000; // 2^32, for combining the 32-bit halves
  */
 export abstract class BufferReader {
   protected readonly buf: Uint8Array;
-  protected readonly view: DataView;
   protected readonly n: number;
   protected p = 0;
 
@@ -56,10 +55,32 @@ export abstract class BufferReader {
   protected lo = 0;
   protected hi = 0;
 
+  /**
+   * The `DataView` the float readers convert through — built on **first use**,
+   * not in the constructor.
+   *
+   * `new DataView(buffer, offset, length)` measures ~115 ns on Node 24, which is
+   * a tenth of a small message's whole decode, and a message with no `fp32` /
+   * `fp64` field never touches it: every other wire type is read straight off
+   * the `Uint8Array`. One decoder is constructed per message on both whole-buffer
+   * surfaces (`decode()` and `Cursor`), so that was a fixed per-message toll for
+   * a member most messages do not use. The `??=` below is one already-loaded
+   * field test per float read, paid only by the messages that have floats.
+   */
+  private fpView: DataView | null = null;
+
   constructor(buf: Uint8Array) {
     this.buf = buf;
     this.n = buf.length;
-    this.view = new DataView(buf.buffer, buf.byteOffset, buf.length);
+  }
+
+  /** The float-conversion view over the source buffer (see {@link fpView}). */
+  private floats(): DataView {
+    return (this.fpView ??= new DataView(
+      this.buf.buffer,
+      this.buf.byteOffset,
+      this.buf.length,
+    ));
   }
 
   /** Hand back a zero-copy view of the next `len` bytes, advancing the cursor. */
@@ -76,7 +97,7 @@ export abstract class BufferReader {
     const p = this.p;
     if (p + 4 > this.n) throw incompleteError("truncated fp32");
     this.p = p + 4;
-    return this.view.getFloat32(p, true);
+    return this.floats().getFloat32(p, true);
   }
 
   /** Read the next 8 bytes as a little-endian fp64, advancing the cursor. */
@@ -84,7 +105,7 @@ export abstract class BufferReader {
     const p = this.p;
     if (p + 8 > this.n) throw incompleteError("truncated fp64");
     this.p = p + 8;
-    return this.view.getFloat64(p, true);
+    return this.floats().getFloat64(p, true);
   }
 
   // --- varint reading -----------------------------------------------------
