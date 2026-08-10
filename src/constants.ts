@@ -81,6 +81,29 @@ export const I64_MAX = 0x7fff_ffff_ffff_ffffn;
 export const VARINT_MAX_BYTES = 10;
 
 /**
+ * The smallest output buffer this port accepts **for streaming** (CORELIB_PLAN
+ * §5.1, normative): the number a caller sizes a streaming buffer from.
+ *
+ * `1`, because the encoder splits every *atomic unit* — a field header varint, a
+ * fixlen word, an element count, a scalar or array element varint, an `fp32` /
+ * `fp64` element — across a flush, so no write needs contiguous room and the
+ * bytes produced are identical at any buffer size. (A port that required atomic
+ * units to land contiguously would declare the largest run it reserves instead;
+ * §5.1 caps any declaration at `20`.)
+ *
+ * It binds a buffer installed **with** a flush sink, at construction and at
+ * every mid-stream `OStream.setBuffer`: such a buffer must satisfy
+ * `buffer.length - offset >= MIN_OUTPUT_BUFFER` and is rejected right there
+ * with `SofabErrorCode.Argument`, never partway through a message.
+ *
+ * A buffer installed **without** a sink is subject to no minimum: no flush can
+ * occur, so nothing can be split, and the buffer either holds the whole message
+ * or reports `SofabErrorCode.BufferFull`. That is the one-shot `MAX_SIZE` case
+ * and it stays exact — a two-byte message encodes into a two-byte buffer.
+ */
+export const MIN_OUTPUT_BUFFER = 1;
+
+/**
  * Maximum nested-sequence depth (§4.9 / §6.2). An encoder must not open more
  * than this many nested sequences, and a decoder must reject a message that
  * nests deeper with an `InvalidMessage` error rather than risk unbounded

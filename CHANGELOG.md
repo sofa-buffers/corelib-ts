@@ -37,6 +37,26 @@ While the version is below `1.0.0`, breaking changes bump the **minor** version.
   message` 12,619 → 12,652 Ir/op (+0.3%) and `decode: u64 array (1000)` 723,050
   → 720,764 (unchanged within noise — one header for a thousand elements).
 
+- **`MIN_OUTPUT_BUFFER` — the declared, documented and enforced streaming buffer
+  minimum** (#107). CORELIB_PLAN §5.1 requires every port to expose a constant
+  naming the smallest output buffer it accepts for streaming, so a caller can
+  *size* a buffer from the API instead of discovering the floor at runtime. This
+  port declares **`1`**: it splits every atomic unit — field header, fixlen word,
+  element count, a scalar or array element varint, an `fp32` / `fp64` element —
+  across a flush, which `test/small-buffer-encode.test.ts` proves at size 1 over
+  the whole writer corpus. The constant is exported from the package root (and
+  from the `sofab` namespace) and stated in the README's *Memory handling*
+  section. It is now also **enforced where a buffer is handed over**: a buffer
+  installed **with** a flush sink must satisfy `buffer.length - offset >=
+  MIN_OUTPUT_BUFFER`, at construction and at every mid-stream `setBuffer`, and a
+  smaller window throws `SofabError` with code `ARGUMENT` there — previously a
+  zero-usable-byte streaming buffer was accepted and failed partway through the
+  message with `BUFFER_FULL` instead, which §5.1 forbids. A rejected `setBuffer`
+  changes nothing: the encoder keeps writing into the buffer it already had. A
+  buffer installed **without** a sink is deliberately left unrestricted — no
+  flush can occur, so nothing can be split, and the one-shot `MAX_SIZE` path
+  stays exact down to a zero-length buffer.
+
 ### Performance
 
 Encoder and decoder throughput work. No wire-format, API or behavioural change —

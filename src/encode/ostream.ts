@@ -10,9 +10,12 @@
  *   `flush` sink and continues — so the buffer can be arbitrarily smaller than
  *   the message, **down to a single byte** (CORELIB_PLAN §5.1): no single write
  *   requires contiguous room, a value larger than the buffer is split across
- *   flushes, and the bytes produced are identical either way. `offset` reserves
- *   room at the front for a lower-layer header. Without a `flush` sink there is
- *   nowhere to drain to, so the buffer must hold the whole message.
+ *   flushes, and the bytes produced are identical either way — which is why this
+ *   port declares {@link MIN_OUTPUT_BUFFER} = 1, the floor a buffer installed
+ *   *with* a sink must clear. `offset` reserves room at the front for a
+ *   lower-layer header, and it is `length - offset` that must clear the floor.
+ *   Without a `flush` sink there is nowhere to drain to, so no minimum applies
+ *   and the buffer must hold the whole message.
  *
  * Generated code typically writes one field per message field; the methods map
  * one-to-one onto the wire types. Problems throw {@link SofabError}.
@@ -30,6 +33,7 @@ import {
   FixlenSubtype,
   ID_MAX,
   MAX_DEPTH,
+  MIN_OUTPUT_BUFFER,
   VARINT_MAX_BYTES,
   WireType,
 } from "../constants.js";
@@ -68,6 +72,28 @@ const DEFAULT_CAPACITY = 256;
  * image (`|v| * 2`) must stay an exact integer, i.e. `≤ 2^53`.
  */
 const SIGNED_FAST_MAX = 0x10_0000_0000_0000; // 2^52
+
+/**
+ * Validate a caller-supplied output buffer *where it is handed over* — at
+ * construction and at every mid-stream {@link OStream.setBuffer} (CORELIB_PLAN
+ * §5.1). The offset must land inside the buffer, and, **only** when a flush sink
+ * is installed, the usable window must be at least {@link MIN_OUTPUT_BUFFER}
+ * bytes: a streaming buffer that cannot take a single byte would otherwise fail
+ * partway through a message via the buffer-full path instead of here. Without a
+ * sink there is no minimum — no flush can occur, so nothing can be split, and
+ * the exact-`MAX_SIZE` case must stay exact.
+ */
+function checkHandover(buffer: Uint8Array, offset: number, streaming: boolean): void {
+  if (offset < 0 || offset > buffer.length) {
+    throw argumentError(`offset ${offset} out of range`);
+  }
+  if (streaming && buffer.length - offset < MIN_OUTPUT_BUFFER) {
+    throw argumentError(
+      `output buffer with a flush sink has ${buffer.length - offset} usable ` +
+        `byte(s), below MIN_OUTPUT_BUFFER (${MIN_OUTPUT_BUFFER})`,
+    );
+  }
+}
 
 /**
  * Encoder for the SofaBuffers wire format. Each `write*` method appends one
@@ -122,9 +148,7 @@ export class OStream {
       this.flushSink = undefined;
       this.canGrow = true;
     } else {
-      if (offset < 0 || offset > buffer.length) {
-        throw argumentError(`offset ${offset} out of range`);
-      }
+      checkHandover(buffer, offset, flush !== undefined);
       this.buf = buffer;
       this.start = offset;
       this.pos = offset;
@@ -162,11 +186,14 @@ export class OStream {
    * without interruption. `offset` reserves space at the front of the new
    * buffer. Any not-yet-flushed bytes in the old buffer are dropped, so
    * {@link flush} first (the flush callback fires before you swap).
+   *
+   * On a stream that has a flush sink the new buffer must leave at least
+   * {@link MIN_OUTPUT_BUFFER} usable bytes (`buffer.length - offset`); a smaller
+   * one is rejected here, with {@link SofabErrorCode.Argument}, leaving the
+   * encoder on the buffer it already had. A sink-less stream has no minimum.
    */
   setBuffer(buffer: Uint8Array, offset = 0): void {
-    if (offset < 0 || offset > buffer.length) {
-      throw argumentError(`offset ${offset} out of range`);
-    }
+    checkHandover(buffer, offset, this.flushSink !== undefined);
     this.buf = buffer;
     this.start = offset;
     this.pos = offset;

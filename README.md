@@ -305,6 +305,19 @@ Who owns the bytes:
   caller-owned buffer and never grows; when it fills it drains a view to the
   `flush` sink (valid only during that callback) and, with no sink, throws
   `BUFFER_FULL`.
+- **`MIN_OUTPUT_BUFFER` = `1`.** The smallest buffer this port accepts *for
+  streaming*, exported from the package so a caller can size from it. It is `1`
+  because the encoder splits every atomic unit — field header, fixlen word,
+  element count, a scalar or array element varint, an `fp32` / `fp64` element —
+  across a flush, so a message of any size encodes through a one-byte buffer and
+  the bytes produced are identical at every size. It binds a buffer installed
+  **with** a sink, at construction and at every mid-stream `setBuffer`:
+  `buf.length - offset` must be at least `MIN_OUTPUT_BUFFER`, and a smaller
+  window is rejected right there with `ARGUMENT` — never partway through a
+  message — leaving the encoder on the buffer it already had. A buffer installed
+  **without** a sink has no minimum: no flush can occur, so nothing can be split.
+  That is the one-shot `MAX_SIZE` case and it stays exact — a two-byte message
+  encodes into a two-byte buffer.
 - **Decode (`decode()` / `Cursor` / `IStream`).** Input payload bytes are
   zero-copy: string / blob chunks and `Cursor.readBlob` are `subarray` **views**
   aliasing the input (or, for `IStream`, the chunk you fed). A visitor chunk is
