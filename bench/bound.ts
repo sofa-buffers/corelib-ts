@@ -46,13 +46,13 @@ const cases: [string, () => void, () => void][] = [
       const c = new Cursor(u64Wire);
       c.readHeader();
       const a = c.readUnsignedArray(); // no bound (old)
-      sink(BigInt(a.length));
+      sink(a.length);
     },
     () => {
       const c = new Cursor(u64Wire);
       c.readHeader();
       const a = c.readUnsignedArray(N); // schema bound (new)
-      sink(BigInt(a.length));
+      sink(a.length);
     },
   ],
   [
@@ -61,13 +61,13 @@ const cases: [string, () => void, () => void][] = [
       const c = new Cursor(fp64Wire);
       c.readHeader();
       const a = c.readFp64Array();
-      sink(BigInt(a.length));
+      sink(a.length);
     },
     () => {
       const c = new Cursor(fp64Wire);
       c.readHeader();
       const a = c.readFp64Array(N);
-      sink(BigInt(a.length));
+      sink(a.length);
     },
   ],
   [
@@ -76,13 +76,13 @@ const cases: [string, () => void, () => void][] = [
       const c = new Cursor(strWire);
       c.readHeader();
       const s = c.readString();
-      sink(BigInt(s.length));
+      sink(s.length);
     },
     () => {
       const c = new Cursor(strWire);
       c.readHeader();
       const s = c.readString(64);
-      sink(BigInt(s.length));
+      sink(s.length);
     },
   ],
 ];

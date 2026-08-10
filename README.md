@@ -563,18 +563,43 @@ a separate `docs.yml` deploys the TypeDoc API reference to GitHub Pages.
 
 ## Benchmarks
 
-Three standalone tools mirror the other-language ports so implementations can be
-compared directly:
+Three standalone tools, specified by `BENCH_SPEC.md` and mirrored in every other
+port — same datasets, same timing rules, same output grammar — so the numbers
+compare directly across languages:
 
 ```bash
-npm run perf              # per-op cost: code-cost figure plus throughput MB/s
-npm run bench             # throughput table (MB/s) for a u64 array and a mixed message
+npm run perf              # per-op cost on the 170-byte perf message
+npm run bench             # throughput table (MB/s) over the four shared datasets
 npm run bench:callgrind   # machine-independent instructions/op under Valgrind
+npm run bench:bound       # repo-local: hot-path cost of the schema-bound readers
 ```
 
-`perf` and `bench` encode the identical message as their counterparts in the
-other ports and print the same report layout. Since JS engines expose no portable
-cycle counter, `perf` uses CPU time/op as the code-cost proxy; `bench:callgrind`
-counts instructions/op under Valgrind for a fully machine-independent figure.
-Running the same tools under Node (V8) and Bun (JavaScriptCore) gives directly
-comparable numbers.
+`bench` prints ten rows over four datasets: a 1000-element `u64` array, the small
+`typical` message, an **unbounded 1 MB blob**, and a `composite` message that
+reaches what the flat ones miss — a 64-element wrapper array, 320 bytes of 1-,
+2-, 3- and 4-byte UTF-8, nesting three deep, a default-valued field the encoder
+must *not* write, and a two-byte field header. Three of the encoded sizes are
+cross-port parity checks (`perf` = 170 bytes, `blob 1MB` = 1,000,005,
+`composite` = 956); `test/bench-datasets.test.ts` holds the datasets to them, and
+`test/bench-grammar.test.ts` holds the tools to the output grammar.
+
+Every encode row writes into a **caller-supplied buffer** (CORELIB_PLAN §5.1)
+rather than the accumulator, so the rows measure this encoder and not V8's
+allocator. The `blob 1MB` rows are the ones that exercise streaming end to end:
+`one-shot` is a single contiguous write into a 1,000,005-byte buffer, `streaming`
+is the same bytes through a **4096-byte** buffer with a flush sink (~245
+flushes), and `decode: blob 1MB` is fed back in 4096-byte chunks. Read those two
+encode rows *against each other* — five bytes of that message are metadata and a
+million are payload, so their MB/s is this machine's memory bandwidth; their
+**difference** is what the divisible-run flush path costs, and it is legible only
+under `Ir/op`. BENCH_SPEC's optional `blob 1MB passthrough` row is absent: this
+port grants no pass-through permission, so every `string`/`blob` run is copied
+through the output buffer.
+
+Since JS engines expose no portable cycle counter, `perf` uses CPU time/op as the
+code-cost proxy; `bench:callgrind` counts instructions/op under Valgrind (two rep
+counts per workload, subtracted, on a `--predictable` V8) for a fully
+machine-independent figure. Running the same tools under Node (V8) and Bun
+(JavaScriptCore) gives directly comparable numbers. `tsx bench/bench.ts --smoke`
+runs every row exactly once — a liveness check for the rows, never a
+measurement.

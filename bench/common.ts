@@ -1,16 +1,22 @@
 /**
- * Shared bench plumbing: process-CPU timing and a checksum visitor.
+ * Shared bench plumbing: process-CPU timing.
  *
  * Throughput is measured against **process CPU time** (not wall-clock), the
  * Node equivalent of the C tool's `clock()`, so the numbers line up with the
  * C / C++ / Rust / C# / Java / Python benches. MB = 1e6 bytes throughout.
  */
 
-import type { Visitor } from "../src/index.js";
-
 const MIN_SECONDS = 1.0;
-const WARMUP = 200_000;
 const BATCH_SECONDS = 0.01; // clock cost lands under ~0.01% of a batch
+/**
+ * Warmup, bounded two ways: enough operations to get V8 past its tiers, and a
+ * ceiling on the CPU time spent doing it. The count alone was fine while every
+ * workload was a sub-microsecond message, but `blob 1MB` copies a megabyte per
+ * op — 200,000 of those is 200 GB of memcpy before a single number is measured,
+ * and it warms nothing the first few dozen ops did not already warm.
+ */
+const WARMUP_OPS = 200_000;
+const WARMUP_SECONDS = 0.25;
 
 /** Process CPU time in seconds (user + system), not wall-clock. */
 function cpuNow(): number {
@@ -32,6 +38,31 @@ function calibrateBatch(body: () => void): number {
   }
 }
 
+/** Run `body` until it is warm: {@link WARMUP_OPS} ops, or {@link WARMUP_SECONDS}. */
+function warmup(body: () => void): void {
+  const t0 = cpuNow();
+  for (let i = 0; i < WARMUP_OPS; i++) {
+    body();
+    if ((i & 15) === 15 && cpuNow() - t0 >= WARMUP_SECONDS) return;
+  }
+}
+
+let smoke = false;
+
+/**
+ * Switch every later {@link measure} to a **single** operation per workload.
+ *
+ * The tools run every row end to end in a second or two instead of the ~12 s the
+ * real loops take, which is what lets the test suite check that each workload
+ * still runs and still prints BENCH_SPEC's grammar. The numbers it prints are
+ * real but meaningless — one un-warmed op timed against a clock of comparable
+ * cost — so a smoke run must never be pasted anywhere as a measurement, and the
+ * tools say so in their output.
+ */
+export function setSmoke(on: boolean): void {
+  smoke = on;
+}
+
 /** What {@link measure} observed: how many times `body` ran, and for how long. */
 export interface Timing {
   iterations: number;
@@ -47,7 +78,14 @@ export interface Timing {
  * was reporting, so its rows measured mostly `process.cpuUsage`.
  */
 export function measure(body: () => void, minSeconds = MIN_SECONDS): Timing {
-  for (let i = 0; i < WARMUP; i++) body();
+  if (smoke) {
+    // One un-warmed op, timed against a clock of comparable cost: a liveness
+    // check for the row, never a measurement (see `setSmoke`).
+    const t0 = cpuNow();
+    body();
+    return { iterations: 1, seconds: Math.max(cpuNow() - t0, 1e-9) };
+  }
+  warmup(body);
   const batch = calibrateBatch(body);
   let iterations = 0;
   const t0 = cpuNow();
@@ -60,47 +98,19 @@ export function measure(body: () => void, minSeconds = MIN_SECONDS): Timing {
   return { iterations, seconds };
 }
 
-/** A decode sink that folds every value into a checksum so nothing is elided. */
-export class Checksum implements Visitor {
-  acc = 0n;
-  unsigned(id: number, v: number | bigint): void {
-    this.acc += (typeof v === "bigint" ? v : BigInt(v)) ^ BigInt(id);
-  }
-  signed(id: number, v: number | bigint): void {
-    this.acc += (typeof v === "bigint" ? v : BigInt(v)) ^ BigInt(id);
-  }
-  fp32(_id: number, v: number): void {
-    this.acc += BigInt(Math.round(v));
-  }
-  fp64(_id: number, v: number): void {
-    this.acc += BigInt(Math.trunc(v));
-  }
-  string(_id: number, _total: number, _offset: number, chunk: Uint8Array): void {
-    this.acc += BigInt(chunk.length);
-  }
-  blob(_id: number, _total: number, _offset: number, chunk: Uint8Array): void {
-    this.acc += BigInt(chunk.length);
-  }
-  arrayUnsigned(_id: number, _i: number, v: number | bigint): void {
-    this.acc += typeof v === "bigint" ? v : BigInt(v);
-  }
-  arraySigned(_id: number, _i: number, v: number | bigint): void {
-    this.acc += typeof v === "bigint" ? v : BigInt(v);
-  }
-  arrayFp32(_id: number, _i: number, v: number): void {
-    this.acc += BigInt(Math.round(v));
-  }
-  arrayFp64(_id: number, _i: number, v: number): void {
-    this.acc += BigInt(Math.trunc(v));
-  }
-}
-
-let blackhole = 0n;
-/** Consume an accumulator so the JIT cannot elide the measured work. */
-export function sink(value: bigint): void {
-  blackhole ^= value;
+let blackhole = 0;
+/**
+ * Consume an accumulator so the JIT cannot elide the measured work.
+ *
+ * A `number`, not a `bigint`: this runs once per operation, and a `bigint` XOR
+ * allocates — on a workload whose whole op is a few hundred nanoseconds that
+ * allocation is a measurable part of the row, which is precisely the kind of
+ * thing the benchmark must not be measuring.
+ */
+export function sink(value: number): void {
+  blackhole += value;
 }
 /** Read once at process exit so `blackhole` is observably live. */
-export function blackholeValue(): bigint {
+export function blackholeValue(): number {
   return blackhole;
 }
