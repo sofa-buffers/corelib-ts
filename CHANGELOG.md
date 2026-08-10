@@ -200,6 +200,30 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Fixed
 
+- **The README's generated-code example showed only the whole-buffer half**
+  (#118). CORELIB_PLAN §9.5 requires the `## Usage` "Generator" example to show
+  the generated object driven **both** ways — the one-shot `encode()` /
+  `decode()` helpers *and* the streaming `serialize` / `decoder()` path of
+  §6.1.1 — because the generated layer is the only surface most callers touch
+  and a chunked transport is exactly what the one-shot helpers cannot serve.
+  "### Code generator" was whole-buffer throughout (`marshal`, `static decode`,
+  `decodeFrom(cursor)`); `IStream` never appeared in it, and the streaming
+  section above it drives a hand-written visitor rather than a generated type,
+  so the combination a reader with a chunked transport needs was shown nowhere
+  — inviting the conclusion that generated code does not stream. The example
+  now carries both halves over one `Point`: the pull-`Cursor` one-shot as
+  before, plus a generated-style `Visitor` and the `Point.decoder()` handle
+  that owns an `IStream`, encoded through a 4-byte buffer with a `FlushSink`
+  and decoded back from those pieces to a `DecodeStatus.Complete` check. The
+  encode method is renamed `marshal` → `serialize`, the §6.1.1 name the
+  generator actually emits and the other ports' READMEs use (the opening
+  summary said "marshal / unmarshal" and now agrees). The snippet is no longer
+  prose: it lives in `test/helpers/readme-generator-example.ts`, which
+  `tsc --noEmit` type-checks and `test/readme-generator-example.test.ts`
+  executes, asserting the README block is character-for-character that module
+  and that it really does round-trip through a sink and through chunks — down
+  to one byte at a time. Documentation and tests only; no library code changed.
+
 - **The module-level doc example decoded a string chunk with a lossy
   `TextDecoder`** (#117). CORELIB_PLAN §6.4 forbids silent replacement in every
   mode — an implementation must never substitute `U+FFFD` for invalid UTF-8 —
