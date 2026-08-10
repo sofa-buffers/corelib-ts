@@ -63,7 +63,12 @@ describe("bench datasets (BENCH_SPEC)", () => {
     expect(seen).toEqual([1, 2, 3, 4, 5, 6, 7, 1, 2]); // 7 opens the sequence
   });
 
-  describe("blob 1MB", () => {
+  // A megabyte per assertion, and the coverage run instruments every byte-level
+  // loop it passes through: these four sit well inside vitest's 5 s default
+  // locally and outside it under `--coverage` on a CI runner. The timeout is
+  // generous rather than tuned — the point is that the row is exercised, and a
+  // real hang still fails.
+  describe("blob 1MB", { timeout: 60_000 }, () => {
     const blob = buildBlob();
 
     it("is 1,000,000 payload bytes of the same golden-ratio derivation", () => {
