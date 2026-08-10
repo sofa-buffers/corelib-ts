@@ -129,6 +129,31 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Fixed
 
+- **A flush re-armed the start offset instead of consuming it** (#109).
+  CORELIB_PLAN §5.1: "the start offset belongs to the installation, not to the
+  buffer" — a buffer-set begins an installation whose cursor starts at *that
+  call's* offset, and once the unit it began has been handed to the sink the
+  offset is consumed, so a sink that returns **without** installing a buffer (the
+  copied case) resumes at offset `0`. `flush()` rewound to `this.start`, which
+  only the constructor and `setBuffer` ever set, so the reservation was
+  re-established on every flush and the leading `offset` bytes were never usable
+  again: a copying sink permanently lost `offset` bytes of capacity, and the two
+  handover shapes §5.1 distinguishes — copy-and-continue versus take-and-replace
+  — became indistinguishable, leaving no way to express "header room in the first
+  unit only". With an 8-byte buffer handed over at offset 4, 16 bytes of message
+  now flush as `4, 8, 4` where they used to flush as `4, 4, 4, 4`. The
+  per-packet header-room pattern is unchanged and still the explicit one: a sink
+  that calls `setBuffer(buf, 4)` from inside the callback — the same buffer
+  counts, a buffer-set is a new installation like any other — keeps getting
+  `4, 4, 4, 4`, and `flush()` no longer overwrites the cursor that call placed.
+  No wire bytes change: the concatenation of the flushed units is byte-identical
+  either way, and to the one-shot path, which the new
+  `test/flush-installation-offset.test.ts` pins for both shapes, including a
+  value split across the consumed offset. `bytes()`, `bytesUsed` and `reset()`
+  follow the consumed offset — after a flush the stream is empty at `0` and
+  `reset()` rewinds there — while a sink-less stream, which can never flush,
+  keeps its reservation across `reset()` exactly as before.
+
 - **`OStream` allocated its own output buffer and reallocated it as the message
   grew** (#108). CORELIB_PLAN §5.1 forbids both: a corelib "MUST NOT allocate an
   output buffer … MUST NOT grow or reallocate a buffer the caller supplied", and
