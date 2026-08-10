@@ -129,6 +129,26 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Fixed
 
+- **A non-integer `number` at an integer surface escaped as a bare
+  `RangeError`** (#111). CORELIB_PLAN §6.3 fixes the closed set of result codes
+  every fallible operation reports, and a caller mistake — an id out of range, a
+  bad scalar width, a value outside the 64-bit domain — is `InvalidArgument`.
+  This port maps that set onto `SofabError.code`, and the README tells callers to
+  catch problems with `e instanceof SofabError`. The `number → bigint` converter
+  behind the 64-bit writers threw a plain `RangeError` instead, so
+  `writeUnsigned(0, 1.5)`, `writeSigned(0, 1.5)` and both integer-array writers
+  (`NaN` and `±Infinity` too, which are non-integers as well) produced a
+  code-less error that pattern never caught — the one encoder rejection in the
+  library that was not a `SofabError`. It now throws `argumentError(...)` like
+  every neighbouring check, so it carries `SofabErrorCode.Argument`; the message
+  text is unchanged. The throw sits on a path that has already left the fast lane
+  (a valid small integer never reaches the converter), so no valid encode changes
+  its bytes or its cost. `test/errors.test.ts` pins `ARGUMENT` for both scalar
+  writers and both array writers, in both the growable (bulk `Kernel`) and the
+  fixed-buffer element-at-a-time construction, plus `instanceof SofabError` on
+  the thrown value. Breaking only for a caller that matched `RangeError`
+  specifically; `instanceof Error` and the message are unchanged.
+
 - **`writeFixlen` emitted reserved subtypes and wrong-width `fp32`/`fp64`
   fixlen words** (#110). CORELIB_PLAN §4.6 closes the domain of the
   `fixlen_word`'s low three bits — `0x4`–`0x7` are **reserved** and a decoder
