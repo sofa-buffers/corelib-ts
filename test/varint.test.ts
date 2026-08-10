@@ -6,7 +6,15 @@
 import { describe, expect, it } from "vitest";
 import { decodeVarint, encodeVarint, varintSize } from "../src/varint/leb128.js";
 import { zigzagDecode, zigzagEncode } from "../src/varint/zigzag.js";
-import { SofabError, SofabErrorCode, U64_MAX } from "../src/index.js";
+import {
+  Cursor,
+  DecodeStatus,
+  IStream,
+  SofabError,
+  SofabErrorCode,
+  U64_MAX,
+  decode,
+} from "../src/index.js";
 
 const BOUNDARIES = [0n, 1n, 127n, 128n, 16383n, 16384n, 2097151n, 2097152n, U64_MAX];
 
@@ -87,6 +95,73 @@ describe("varint round-trip", () => {
         expect((e as SofabError).code).toBe(SofabErrorCode.InvalidMsg);
       }
     });
+  });
+});
+
+/** Run `fn` and return the SofabError code it throws (or fail loudly). */
+function codeOf(fn: () => unknown): SofabErrorCode {
+  try {
+    fn();
+  } catch (e) {
+    if (e instanceof SofabError) return e.code;
+    throw e;
+  }
+  throw new Error("expected a SofabError, but nothing was thrown");
+}
+
+// Regression for #113. §4.1 bounds the *encoding*, not the value: ten bytes that
+// all carry the continuation flag already demand an 11th, which is past the
+// 10-byte / 64-bit maximum — so they are malformed on the bytes already in hand,
+// whatever (if anything) follows. §5.2 gives that INVALID precedence over the
+// INCOMPLETE of input that merely stops there, and the verdict must not depend on
+// where the input happens to end. All four varint readers in this repo — the
+// helper here, the contiguous `decode()`, the pull `Cursor` and the resumable
+// `IStream` — must therefore return the same code for the same bytes.
+describe("ten continuation bytes then end of input are INVALID (#113)", () => {
+  /** `n` bytes that all set the continuation flag and carry no payload. */
+  const cont = (n: number): number[] => Array<number>(n).fill(0x80);
+
+  /** id 0, wire 0 (unsigned): the value varint follows the header immediately. */
+  const field = (n: number): Uint8Array => Uint8Array.from([0x00, ...cont(n)]);
+
+  /** Feed `buf` to a resumable IStream one byte at a time. */
+  const chunked = (buf: Uint8Array): void => {
+    const is = new IStream();
+    for (const b of buf) is.feed(Uint8Array.of(b), {});
+  };
+
+  const pull = (buf: Uint8Array): void => {
+    const c = new Cursor(buf);
+    while (c.readHeader()) c.readUnsigned();
+  };
+
+  it("decodeVarint reports INVALID, not INCOMPLETE", () => {
+    expect(codeOf(() => decodeVarint(Uint8Array.from(cont(10)), 0))).toBe(
+      SofabErrorCode.InvalidMsg,
+    );
+  });
+
+  it("decodeVarint still reports nine-then-EOF as INCOMPLETE (control)", () => {
+    expect(codeOf(() => decodeVarint(Uint8Array.from(cont(9)), 0))).toBe(
+      SofabErrorCode.Incomplete,
+    );
+  });
+
+  it("the three decode surfaces agree on INVALID", () => {
+    const ten = field(10);
+    expect(codeOf(() => decode(ten, {}))).toBe(SofabErrorCode.InvalidMsg);
+    expect(codeOf(() => pull(ten))).toBe(SofabErrorCode.InvalidMsg);
+    expect(codeOf(() => chunked(ten))).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  it("the three decode surfaces agree on INCOMPLETE for nine (control)", () => {
+    const nine = field(9);
+    expect(codeOf(() => decode(nine, {}))).toBe(SofabErrorCode.Incomplete);
+    expect(codeOf(() => pull(nine))).toBe(SofabErrorCode.Incomplete);
+    const is = new IStream();
+    let status: DecodeStatus = DecodeStatus.Complete;
+    for (const b of nine) status = is.feed(Uint8Array.of(b), {});
+    expect(status).toBe(DecodeStatus.Incomplete);
   });
 });
 

@@ -156,8 +156,10 @@ export interface VarintResult {
  * Read a varint from `buf` starting at `pos`. Reports the same two decode
  * failures the streaming path does (MESSAGE_SPEC §7): throws a
  * {@link SofabError} with code `INVALID_MSG` on overflow past 64 bits (malformed
- * regardless of what follows), and `INCOMPLETE` if the buffer ends mid-varint
- * (an unterminated varint that more bytes could complete).
+ * regardless of what follows — including nothing at all: ten continuation bytes
+ * then end of input are INVALID, not INCOMPLETE), and `INCOMPLETE` if the buffer
+ * ends mid-varint short of that bound (an unterminated varint that more bytes
+ * could still complete).
  */
 export function decodeVarint(buf: Uint8Array, pos: number): VarintResult {
   // Accumulate into two 32-bit *number* halves and materialise the `bigint`
@@ -167,8 +169,17 @@ export function decodeVarint(buf: Uint8Array, pos: number): VarintResult {
   let hi = 0;
   let bytes = 0;
   for (;;) {
-    if (pos >= buf.length) throw incompleteError("truncated varint");
+    // Overflow is decided before truncation, and deliberately so: reaching here
+    // with a full accumulator means the byte that filled it had its continuation
+    // flag set (a terminator returns below), so an 11th byte is *required* — past
+    // the 10-byte / 64-bit maximum §4.1 puts on the *encoding*, not on the value.
+    // That is settled by bytes already in hand, so §5.2 makes it INVALID even
+    // when the input stops right there; the verdict must not depend on how much
+    // of it has arrived. Same precedence as the resumable reader in
+    // `decode/state.ts` and the unrolled ones in `decode/fast.ts` and
+    // `decode/cursor.ts` (corelib-ts#113).
     if (bytes >= VARINT_MAX_BYTES) throw invalidMsgError("varint overflow");
+    if (pos >= buf.length) throw incompleteError("truncated varint");
     const byte = buf[pos++]!;
     // 10th byte carries only bit 63 below 64; any higher payload bit would
     // spill past bit 63 and is a >64-bit overflow (silently accepted before).

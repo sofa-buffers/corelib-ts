@@ -146,6 +146,26 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Fixed
 
+- **`leb128.decodeVarint` reported `INCOMPLETE` where the three real decode
+  surfaces report `INVALID`** (#113). CORELIB_PLAN §4.1 bounds the varint
+  *encoding*, not the decoded value: ten bytes that all carry the continuation
+  flag already require an eleventh, which is past the 10-byte / 64-bit maximum,
+  so they are malformed on the bytes already in hand — and §5.2 gives that
+  `INVALID` precedence over the `INCOMPLETE` of input that merely stops there.
+  The whole-buffer helper tested its truncation guard *before* its length guard,
+  so ten continuation bytes followed by end of input suspended as `INCOMPLETE`,
+  while the same bytes as a field value through `decode()`, `Cursor` and a
+  byte-at-a-time `IStream` all reported `INVALID_MSG` — two varint precedence
+  rules living in one repo, the divergent one reachable only from its own unit
+  test (`decodeVarint` has no caller in `src/` and is not part of the public
+  surface, so no decode of real input changed verdict). The two guards are now
+  ordered overflow-first, matching `decode/state.ts`, `decode/fast.ts` and
+  `decode/cursor.ts`; a varint that ends short of the bound is still
+  `INCOMPLETE`, and no valid varint changes cost or result.
+  `test/varint.test.ts` pins the ten-continuation-bytes-then-EOF case as
+  `INVALID_MSG` with nine-then-EOF as the `INCOMPLETE` control, and asserts all
+  four readers — the helper plus the three decode surfaces — agree on both.
+
 - **A non-integer `number` at an integer surface escaped as a bare
   `RangeError`** (#111). CORELIB_PLAN §6.3 fixes the closed set of result codes
   every fallible operation reports, and a caller mistake — an id out of range, a
