@@ -68,14 +68,22 @@ The codec has four use cases — serialize a message that fits in one buffer,
 serialize one too large for the buffer (streamed out in chunks), deserialize a
 whole message, and deserialize one arriving in chunks — plus the generated-code
 path that wraps them. Problems are reported by throwing `SofabError`; the cause is
-on `SofabError.code` (`ARGUMENT`, `USAGE`, `BUFFER_FULL`, `INVALID_MSG`,
-`INCOMPLETE`). The decoder splits its two failure kinds (MESSAGE_SPEC §7):
-`INVALID_MSG` is a message malformed regardless of what follows, while
-`INCOMPLETE` means the bytes merely ended *inside* a field — a truncation more
-bytes could complete, which is not an error the caller must treat as one. There
-is no finish/finalize step: every streaming `feed()` *returns* the decode outcome
-for the bytes so far (see below), so `INCOMPLETE` is reported to the caller,
-never promoted to a throw.
+on `SofabError.code` (`ARGUMENT`, `BUFFER_FULL`, `INVALID_MSG`, `INCOMPLETE`,
+`LIMIT_EXCEEDED`) — and that is the whole set. There is no "invalid usage" code
+(CORELIB_PLAN §6.3): a read whose declared type contradicts the field on the wire
+is not an error at all — the field is *skipped* like an unknown id, the
+destination is left untouched and the decode stays `COMPLETE` (MESSAGE_SPEC
+§7.3) — so every remaining caller mistake is an `ARGUMENT` error and every
+remaining malformed input is `INVALID_MSG`. The decoder splits its two failure
+kinds (MESSAGE_SPEC §7): `INVALID_MSG` is a message malformed regardless of what
+follows, while `INCOMPLETE` means the bytes merely ended *inside* a field — a
+truncation more bytes could complete, which is not an error the caller must treat
+as one. There is no finish/finalize step: every streaming `feed()` *returns* the
+decode outcome for the bytes so far (see below), so `INCOMPLETE` is reported to
+the caller, never promoted to a throw. `LIMIT_EXCEEDED` is neither: it is a
+receiver-local *policy* rejection — a field larger than a cap **you** configured
+(see [Decode limits](#decode-limits)) — and says nothing about the message's
+validity, since the same bytes decode under a looser limit.
 
 ### Serialize
 
