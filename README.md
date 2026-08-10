@@ -118,6 +118,10 @@ Every integer written — scalar **or array element** — is checked against the
 and never puts a wrapped one on the wire. The answer does not depend on how the
 encoder was constructed — a buffer that grows and a fixed streaming one reject
 exactly the same values — nor on the installed `Kernel`, which carries the same obligation.
+A `number` that is not an integer at all (a fraction, `NaN`, `±Infinity`) is the
+same kind of caller mistake and is reported the same way: `SofabError` with code
+`ARGUMENT`, never a bare `RangeError` — so the `instanceof SofabError` pattern
+above catches every encoder rejection without exception.
 
 The byte-level `writeFixlen(id, data, subtype)` is checked the same way, against
 the fixlen domain of CORELIB_PLAN §4.6: subtypes `0x4`–`0x7` are **reserved**, and

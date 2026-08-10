@@ -149,7 +149,60 @@ describe("encoder rejects bad arguments", () => {
     expect(codeOf(() => os.writeString(1, "this will not fit"))).toBe(SofabErrorCode.BufferFull);
   });
 
-  it("non-integer scalar throws RangeError", () => {
-    expect(() => new OStream().writeUnsigned(1, 1.5)).toThrow(RangeError);
+});
+
+/**
+ * A `number` that is not an integer is a caller mistake in exactly the sense
+ * CORELIB_PLAN §6.3 gives `InvalidArgument`, so it must arrive as a
+ * {@link SofabError} carrying `ARGUMENT` like every other encoder rejection —
+ * not as a bare `RangeError` that the documented
+ * `catch (e) { if (e instanceof SofabError) … }` pattern never sees
+ * (corelib-ts#111).
+ *
+ * Every integer surface is covered on **both** constructions, because the two
+ * take different code paths: a growable stream reserves the whole array and runs
+ * the bulk {@link Kernel}, while a fixed caller buffer with a sink converts one
+ * element at a time inside `OStream`.
+ */
+describe("a non-integer number is an ARGUMENT error, not a bare RangeError", () => {
+  /** A growable encoder (bulk kernel path for arrays). */
+  const grown = (): OStream => new OStream();
+  /** A fixed 1-byte caller buffer with a sink (element-at-a-time array path). */
+  const streamed = (): OStream => new OStream(new Uint8Array(1), 0, () => {});
+
+  const CASES: Array<[string, (os: OStream) => void]> = [
+    ["writeUnsigned", (os) => os.writeUnsigned(1, 1.5)],
+    ["writeSigned", (os) => os.writeSigned(1, -1.5)],
+    ["writeUnsignedArray", (os) => os.writeUnsignedArray(1, [1.5])],
+    ["writeSignedArray", (os) => os.writeSignedArray(1, [-1.5])],
+    // The largest magnitudes a fractional double can still carry (spacing is
+    // 0.5 just under 2^52), so the check cannot be a small-value-only guard.
+    ["writeUnsignedArray (large fractional)", (os) => os.writeUnsignedArray(1, [2 ** 51 + 0.5])],
+    ["writeSignedArray (large fractional)", (os) => os.writeSignedArray(1, [-(2 ** 51) - 0.5])],
+    ["writeUnsigned (NaN)", (os) => os.writeUnsigned(1, Number.NaN)],
+    ["writeSigned (Infinity)", (os) => os.writeSigned(1, Number.POSITIVE_INFINITY)],
+    ["writeUnsignedArray (NaN)", (os) => os.writeUnsignedArray(1, [Number.NaN])],
+    ["writeSignedArray (-Infinity)", (os) => os.writeSignedArray(1, [Number.NEGATIVE_INFINITY])],
+  ];
+
+  for (const [name, write] of CASES) {
+    it(`${name} rejects with ARGUMENT (growable)`, () => {
+      expect(codeOf(() => write(grown()))).toBe(SofabErrorCode.Argument);
+    });
+
+    it(`${name} rejects with ARGUMENT (fixed streaming buffer)`, () => {
+      expect(codeOf(() => write(streamed()))).toBe(SofabErrorCode.Argument);
+    });
+  }
+
+  it("the thrown error is a SofabError, so `instanceof SofabError` catches it", () => {
+    try {
+      new OStream().writeUnsigned(1, 1.5);
+      throw new Error("expected a throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(SofabError);
+      expect((e as SofabError).code).toBe(SofabErrorCode.Argument);
+      expect((e as SofabError).message).toContain("1.5");
+    }
   });
 });

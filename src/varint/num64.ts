@@ -8,6 +8,7 @@
  */
 
 import { I64_MAX, I64_MIN, U64_MAX } from "../constants.js";
+import { argumentError } from "../errors.js";
 
 // One 8-byte scratch, viewed two ways: the `DataView` performs the IEEE-754
 // conversion with an explicit little-endian flag (so the wire stays
@@ -18,11 +19,20 @@ const SCRATCH_BUF = new ArrayBuffer(8);
 const SCRATCH = new DataView(SCRATCH_BUF);
 const SCRATCH_BYTES = new Uint8Array(SCRATCH_BUF);
 
-/** Coerce a `number | bigint` to a `bigint`, rejecting non-integers. */
+/**
+ * Coerce a `number | bigint` to a `bigint`, rejecting non-integers.
+ *
+ * A fractional, `NaN` or infinite `number` at an integer surface is a caller
+ * mistake in exactly the sense of CORELIB_PLAN §6.3's `InvalidArgument`, and so
+ * is reported the way every other encoder rejection is: a {@link SofabError}
+ * carrying {@link SofabErrorCode.Argument}. It used to escape as a bare
+ * `RangeError`, which the documented `catch (e) { if (e instanceof SofabError) }`
+ * pattern never sees (corelib-ts#111).
+ */
 export function toBigInt(value: number | bigint): bigint {
   if (typeof value === "bigint") return value;
   if (!Number.isInteger(value)) {
-    throw new RangeError(`expected an integer, got ${value}`);
+    throw argumentError(`expected an integer, got ${value}`);
   }
   return BigInt(value);
 }
