@@ -23,10 +23,15 @@ function feedInChunks(bytes: Uint8Array, chunkSize: number): string {
   const out = new OStream();
   const visitor = new TranscodeVisitor(out);
   const is = new IStream();
+  // Every `feed` returns the outcome for the bytes consumed so far and needs no
+  // end step (CORELIB_PLAN §6): on a whole vector the last one must say
+  // COMPLETE, at every chunk size, and the accessor must agree with it.
+  let status: DecodeStatus = DecodeStatus.Complete;
   for (let i = 0; i < bytes.length; i += chunkSize) {
-    is.feed(bytes.subarray(i, i + chunkSize), visitor);
+    status = is.feed(bytes.subarray(i, i + chunkSize), visitor);
+    expect(status).toBe(is.status());
   }
-  is.end();
+  expect(status).toBe(DecodeStatus.Complete);
   return bytesToHex(out.bytes());
 }
 

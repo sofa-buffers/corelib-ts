@@ -12,12 +12,14 @@
  * end. Generated message classes use this directly — a class implements
  * `Visitor`, and a nested-message field returns the child instance.
  *
- * There is no finish / finalize step (MESSAGE_SPEC §7): {@link IStream.feed}
- * throws only for a *malformed* message ({@link SofabErrorCode.InvalidMsg}); a
- * message that merely ends inside a field is reported — never thrown — by
- * {@link IStream.end}, which returns {@link DecodeStatus.Incomplete} rather than
- * {@link DecodeStatus.Complete}. The caller owns end-of-input and decides
- * whether a trailing `Incomplete` is a truncation error.
+ * There is no finish / finalize step (CORELIB_PLAN §5.2 / MESSAGE_SPEC §7):
+ * {@link IStream.feed} *returns* the three-valued decode outcome for the bytes
+ * consumed so far, and {@link IStream.status} re-reads it at any time. A message
+ * that merely ends inside a field is reported — never thrown — as
+ * {@link DecodeStatus.Incomplete}; only a *malformed* message throws
+ * ({@link SofabErrorCode.InvalidMsg}), which is this port's channel for
+ * {@link DecodeStatus.Invalid}. The caller owns end-of-input and decides whether
+ * a trailing `Incomplete` is a truncation error.
  */
 
 import type {
@@ -151,10 +153,11 @@ export interface Visitor {
 /**
  * Push parser for the SofaBuffers wire format. Feed it bytes in chunks of any
  * size with {@link IStream.feed} and it drives a {@link Visitor}, one call per
- * decoded field, resuming cleanly across chunk boundaries. Call
- * {@link IStream.end} after the final chunk to read whether the message finished
- * on a field boundary. When the whole message is already in one buffer, prefer
- * the faster {@link decode}.
+ * decoded field, resuming cleanly across chunk boundaries. Every `feed` returns
+ * the decode outcome for the bytes so far — whether the message has finished on
+ * a field boundary — so no end / finalize call is needed;
+ * {@link IStream.status} re-reads that same outcome. When the whole message is
+ * already in one buffer, prefer the faster {@link decode}.
  */
 export class IStream {
   private readonly state: DecoderState;
@@ -170,36 +173,61 @@ export class IStream {
   }
 
   /**
-   * Feed a chunk of bytes, dispatching decoded fields to `visitor`. Throws
-   * {@link SofabError} (`INVALID_MSG`) only if the bytes are *malformed*;
-   * running out of bytes mid-field is not an error — it simply suspends until
-   * the next chunk (see {@link end}).
+   * Feed a chunk of bytes, dispatching decoded fields to `visitor`, and
+   * **return** the decode outcome for the bytes consumed so far (CORELIB_PLAN
+   * §6): {@link DecodeStatus.Complete} when they end exactly at a field
+   * boundary, {@link DecodeStatus.Incomplete} when they end *inside* a field (a
+   * partial varint, an unfinished payload / array, or a still-open nested
+   * sequence). Running out of bytes mid-field is not an error — the decode
+   * merely suspends until the next chunk, and the caller owns end-of-input.
    *
-   * That `INVALID_MSG` is **terminal** (§5.2): the stream latches it, so a
-   * caller that catches the throw and feeds on gets the same error again from
-   * every later call — no further byte is consumed and no visitor method is
-   * invoked. A receiver-limit rejection (`LIMIT_EXCEEDED`, {@link DecodeLimits})
-   * does *not* latch: the bytes are well-formed, and it is a policy rejection
-   * rather than the `INVALID` outcome.
+   * There is no finish / finalize step (§5.2): the status returned here *is* the
+   * answer at that byte boundary, and {@link status} re-reads the same value
+   * without consuming anything.
+   *
+   * `INVALID` travels on the error channel — this port's idiomatic surfacing of
+   * it: *malformed* bytes throw {@link SofabError} (`INVALID_MSG`) instead of
+   * returning a status. That verdict is **terminal** (§5.2): the stream latches
+   * it, so a caller that catches the throw and feeds on gets the same error
+   * again from every later call — no further byte is consumed and no visitor
+   * method is invoked — and {@link status} answers {@link DecodeStatus.Invalid}
+   * from then on. A receiver-limit rejection (`LIMIT_EXCEEDED`,
+   * {@link DecodeLimits}) does *not* latch: the bytes are well-formed, and it is
+   * a policy rejection rather than the `INVALID` outcome.
    */
-  feed(chunk: Uint8Array, visitor: Visitor): void {
+  feed(chunk: Uint8Array, visitor: Visitor): DecodeStatus {
     this.state.push(chunk, visitor);
+    return this.state.finish();
   }
 
   /**
-   * Report whether the stream ended exactly at a field boundary. Call after the
-   * final {@link feed}: returns {@link DecodeStatus.Complete} at a clean field
-   * boundary, or {@link DecodeStatus.Incomplete} if the last chunk ended inside
-   * a field (a partial varint, an unfinished payload / array, or a still-open
-   * nested sequence). Once the input has been proved malformed it returns
-   * {@link DecodeStatus.Invalid} — permanently, since `INVALID` is terminal and
-   * outranks `INCOMPLETE` (§5.2); that is the only way this reports a message
-   * {@link feed} already threw on.
+   * Re-read the outcome for the bytes fed so far — the same value the last
+   * {@link feed} returned: {@link DecodeStatus.Complete} at a clean field
+   * boundary, {@link DecodeStatus.Incomplete} if the input ends inside a field,
+   * or {@link DecodeStatus.Invalid} once it has been proved malformed —
+   * permanently, since `INVALID` is terminal and outranks `INCOMPLETE` (§5.2).
+   * `Invalid` is the one outcome {@link feed} never returns (it throws it), so
+   * this is how a caller that caught the `INVALID_MSG` reads the verdict as a
+   * status.
    *
-   * Per the finish-less spec (MESSAGE_SPEC §7) this is a pure accessor: it never
-   * throws and never promotes an incomplete decode to an error — the caller owns
-   * end-of-input and decides whether a trailing `Incomplete` is a truncation
-   * error.
+   * A convenience, never an obligation: the finish-less spec (§5.2 / MESSAGE_SPEC
+   * §7) requires no end step, and this is a pure accessor — it never throws,
+   * consumes nothing, and never promotes an incomplete decode to an error.
+   */
+  status(): DecodeStatus {
+    return this.state.finish();
+  }
+
+  /**
+   * Deprecated alias for {@link status}, kept so existing callers compile
+   * unchanged.
+   *
+   * The name is a misnomer under the finish-less spec (CORELIB_PLAN §5.2): the
+   * decoder needs no "end" step — {@link feed} already returns the outcome and
+   * {@link status} re-reads it. Behaviourally identical to {@link status}: a
+   * pure accessor that never throws.
+   *
+   * @deprecated Use {@link status} — or the value {@link feed} returns.
    */
   end(): DecodeStatus {
     return this.state.finish();

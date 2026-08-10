@@ -10,6 +10,23 @@ While the version is below `1.0.0`, breaking changes bump the **minor** version.
 
 ### Added
 
+- **`IStream.feed()` returns the three-valued decode outcome, and `IStream.status()`
+  re-reads it** (#112). CORELIB_PLAN §6 requires `feed(bytes)` to *return* the
+  `COMPLETE` / `INCOMPLETE` / `INVALID` outcome of §5.2 with **no** separate
+  `finish` / `finalize` / `end` step — "the status `feed`/`decode` returns *is*
+  the answer", computable at any byte boundary from the decoder's own state.
+  This port returned `void` and offered the outcome only through a method
+  literally named `end()`, so a finish-less decoder looked like it had a
+  mandatory finish step, and the port was the odd one out for a caller porting
+  code between languages. `feed` now returns `DecodeStatus` (`void` →
+  `DecodeStatus` is source-compatible, so existing callers and generated code
+  keep working unchanged), and `status()` is the pure accessor that re-reads the
+  same value later. `end()` remains as a **deprecated alias** of `status()`,
+  behaviourally unchanged. `INVALID` keeps travelling on the error channel — a
+  thrown `INVALID_MSG`, this port's idiomatic surfacing — and stays latched, so
+  it is the one outcome `feed` does not return and `status()` answers `Invalid`
+  for good after the throw.
+
 - **`Visitor.fieldBegin(id, wire)` — a field-header callback on the push paths**
   (#97). The visitor had no hook between a field's **header varint** and the
   value's own header word, so for a fixlen field the earliest signal was
