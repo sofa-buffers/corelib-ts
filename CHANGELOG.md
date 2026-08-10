@@ -200,6 +200,22 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Fixed
 
+- **The README stated a stale CI Node matrix** (#119). CORELIB_PLAN §9 requires
+  every version number the README states to match the repo as it stands today.
+  Both mentions of the tested Node lines read "20 / 24" while
+  `.github/workflows/ci.yml` runs `build-test` on `[20, 22, 24, 26]` — every
+  Node line still supported plus the current release — so a reader sizing their
+  runtime support against the README under-read the tested range by half and
+  could conclude 22 and 26 were untested. Both sentences now name the full
+  matrix and say what decides it, and the numbers are no longer prose somebody
+  has to remember to update: `test/readme-ci-matrix.test.ts` parses the
+  `build-test` job's `node-version` list out of `ci.yml` (sliced to that job, so
+  the deliberately narrower `smoke-node` boundary matrix cannot be mistaken for
+  it) and fails if any README mention disagrees. It also pins the README's
+  "Node.js 20+" floor to `package.json`'s `engines.node` and requires that floor
+  to be a line CI really tests. Documentation and tests only; no library code
+  changed.
+
 - **The README's generated-code example showed only the whole-buffer half**
   (#118). CORELIB_PLAN §9.5 requires the `## Usage` "Generator" example to show
   the generated object driven **both** ways — the one-shot `encode()` /
