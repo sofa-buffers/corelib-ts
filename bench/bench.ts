@@ -9,7 +9,7 @@
  * Run with: `npm run bench`
  */
 
-import { IStream, OStream } from "../src/index.js";
+import { IStream, OStream, growingOStream } from "../src/index.js";
 import {
   Checksum,
   MIN_SECONDS,
@@ -68,7 +68,7 @@ function buildWorkloads(): {
   const src = makeSrc();
 
   const encode = (write: (os: OStream) => void): Uint8Array => {
-    const os = new OStream();
+    const os = growingOStream();
     write(os);
     return os.bytes().slice();
   };
@@ -85,12 +85,12 @@ function buildWorkloads(): {
     },
     run: {
       encode_u64_array: () => {
-        const os = new OStream();
+        const os = growingOStream();
         os.writeUnsignedArray(1, src);
         sink(BigInt(os.bytesUsed));
       },
       encode_typical: () => {
-        const os = new OStream();
+        const os = growingOStream();
         encodeTypical(os);
         sink(BigInt(os.bytesUsed));
       },

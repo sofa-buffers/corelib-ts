@@ -16,7 +16,7 @@
  * Run with: `npm run perf`
  */
 
-import { IStream, OStream } from "../src/index.js";
+import { IStream, OStream, growingOStream } from "../src/index.js";
 import {
   Checksum,
   MIN_SECONDS,
@@ -81,14 +81,14 @@ function report(what: string, r: Result, bytes: number): void {
 
 function main(): void {
   const wire = (() => {
-    const os = new OStream();
+    const os = growingOStream();
     perfEncode(os);
     return os.bytes().slice();
   })();
   const size = wire.length;
 
   const enc = measure(size, () => {
-    const os = new OStream();
+    const os = growingOStream();
     perfEncode(os);
     sink(BigInt(os.bytesUsed));
   });

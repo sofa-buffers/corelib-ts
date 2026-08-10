@@ -4,7 +4,7 @@
  * Two paths turn strings into UTF-8:
  *
  * - {@link utf8Length} / {@link utf8Write} — an allocation-free, two-pass writer
- *   used by the encoder's in-memory fast path. `writeString` needs the byte
+ *   used by the encoder's contiguous-write fast path. `writeString` needs the byte
  *   length *before* the payload (it goes into the fixlen length word), so the
  *   length is scanned first and the bytes are then written straight into the
  *   output buffer. This avoids `TextEncoder.encode`'s per-call WHATWG setup cost

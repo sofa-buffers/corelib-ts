@@ -100,7 +100,54 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
   straight character-to-byte copy. Non-ASCII is untouched, including every
   surrogate rule.
 
+- **`growingOStream()` and `BufferOwner` — the caller that owns the buffer**
+  (#108). CORELIB_PLAN §5.1 gives the encoder one buffer-ownership model: every
+  buffer it writes into is caller-supplied. A message without a schema-derived
+  bound still has to end up somewhere, and §5.1 puts that on the caller — "the
+  generated-object layer allocates; the corelib does not" — so the encoder now
+  takes an optional fourth constructor argument, a `BufferOwner`, and asks it for
+  the **next** buffer when the one it was handed fills:
+  `owner(current, used, needed)` returns a buffer of at least `used + needed`
+  bytes holding the first `used` of the old one, or `undefined` to decline (which
+  reports `BUFFER_FULL`, or splits the value across flushes where a sink is
+  installed). A replacement too short for `used + needed` counts as declining —
+  an out-of-range store on a `Uint8Array` is silently dropped, so accepting one
+  would lose bytes without an error. `growingOStream(initialCapacity?)` is that
+  owner ready-made, a doubling accumulator: `bytes()` is the whole message, no
+  write reports `BUFFER_FULL`, and `reset()` keeps the buffer it grew to. Because
+  the buffer is the owner's, `setBuffer` on such a stream reports `ARGUMENT` —
+  installing a foreign one would strand the bytes already written.
+
+### Deprecated
+
+- **`new OStream()` with no arguments** (#108) — a one-release alias for
+  `growingOStream()`, kept so downstream code (the sofabgen TypeScript backend
+  among it) keeps building, and removed after that. It is the accumulator, not a
+  second ownership model inside `OStream`: the object it returns owns its buffer,
+  so it never reports `BUFFER_FULL` and refuses `setBuffer`, exactly as
+  `growingOStream()` does.
+
 ### Fixed
+
+- **`OStream` allocated its own output buffer and reallocated it as the message
+  grew** (#108). CORELIB_PLAN §5.1 forbids both: a corelib "MUST NOT allocate an
+  output buffer … MUST NOT grow or reallocate a buffer the caller supplied", and
+  §13 asks for "no output buffer at all; the generated layer does, and hands one
+  in like any other caller". `new OStream()` allocated 256 bytes and doubled them
+  on demand, which is one buffer-ownership model too many — and the two mixed:
+  handing such a stream a buffer of your own with `setBuffer` left the growable
+  flag set, so the very next oversized write **reallocated away from the caller's
+  buffer**, leaving it part-written while the message ended up somewhere else,
+  with no error anywhere. The growth path now belongs to the caller
+  (`BufferOwner`, above); `OStream` itself allocates nothing, enlarges nothing,
+  and every buffer it writes into came from the caller. Encoded bytes are
+  unchanged — the accumulator produces byte-identical output to a fixed caller
+  buffer with a sink at every capacity, which is what the new
+  `test/buffer-ownership.test.ts` pins, together with the mid-stream hand-over
+  that used to reallocate. Throughput is unchanged (`npm run bench`, encode:
+  typical message and u64 array within run-to-run noise of `main`): the
+  accumulator is an ordinary `OStream`, not a subclass, so nothing on the write
+  path changed shape.
 
 - **An array element outside the 64-bit value domain was silently reduced modulo
   2^64 by the in-memory encoder, while the streaming one rejected it** (#106).

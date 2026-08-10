@@ -14,9 +14,9 @@
  *
  * @example Encode then decode
  * ```ts
- * import { OStream, decode, type Visitor } from "@sofa-buffers/corelib";
+ * import { growingOStream, decode, type Visitor } from "@sofa-buffers/corelib";
  *
- * const os = new OStream();
+ * const os = growingOStream();
  * os.writeUnsigned(1, 42);
  * os.writeString(2, "hi");
  *
@@ -30,7 +30,7 @@
  * @example The `sofab` namespace
  * ```ts
  * import * as sofab from "@sofa-buffers/corelib";
- * const os = new sofab.OStream();
+ * const os = sofab.growingOStream();
  * ```
  */
 

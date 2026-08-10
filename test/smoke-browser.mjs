@@ -54,8 +54,8 @@ if (failures === 0) {
   check("defines the global 'SofaBuffers'", vm.runInContext(`typeof SofaBuffers === "object"`, sandbox));
 
   const ok = vm.runInContext(`(() => {
-    const { OStream, decode } = SofaBuffers;
-    const os = new OStream();
+    const { growingOStream, decode } = SofaBuffers;
+    const os = growingOStream();
     os.writeUnsigned(1, 42);
     os.writeUnsigned(2, 2n ** 60n);
     os.writeString(3, "sofa🛋");
