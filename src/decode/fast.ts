@@ -130,6 +130,14 @@ class FastDecoder {
           const len = this.upper();
           if (sub > FixlenSubtype.Blob) throw invalidMsgError(`invalid fixlen subtype ${sub}`);
           if (len > FIXLEN_MAX) throw invalidMsgError("fixlen length out of range");
+          // §6.2.1 confines a receiver cap to a schema-UNBOUNDED field, and the
+          // pull Cursor honors that by taking the schema bound as an argument
+          // (corelib-ts#105). This push surface is driven by wire type alone —
+          // it never learns the schema — so it cannot tell the two categories
+          // apart and applies the cap to every field. A caller that needs the
+          // §6.2.1 distinction on a bounded field decodes it through Cursor, or
+          // leaves the cap unset here and enforces the schema bound itself from
+          // Visitor.fixlenBegin / arrayBegin, which carry the declared size.
           if (sub === FixlenSubtype.String && len > this.maxStringLen) {
             throw limitExceededError(`string length ${len} exceeds maxStringLen ${this.maxStringLen}`);
           }
@@ -242,7 +250,13 @@ class FastDecoder {
 
   // --- field helpers ------------------------------------------------------
 
-  /** Read and validate an array count word (0..ARRAY_MAX; §4.7/§4.8). */
+  /**
+   * Read and validate an array count word (0..ARRAY_MAX; §4.7/§4.8).
+   *
+   * The cap is applied to every array here: this push surface takes no schema
+   * count, so it cannot make the §6.2.1 schema-bounded/unbounded distinction the
+   * pull {@link Cursor} makes — see the Fixlen case above (corelib-ts#105).
+   */
   private arrayCount(): number {
     this.readVarint();
     const count = this.num();

@@ -537,7 +537,14 @@ export class Cursor {
     if (schemaCount !== undefined && count > schemaCount) {
       throw invalidMsgError("array count above schema capacity");
     }
-    if (count > this.maxArrayCount) {
+    // §6.2.1: a receiver cap governs SCHEMA-UNBOUNDED fields only. There the
+    // sender alone dictates the receiver's allocation, which is exactly what
+    // the cap exists to bound. A schema-bounded field has no such freedom: the
+    // check above already decided its validity, and layering a capacity policy
+    // on top would let two receivers with the same schema and different caps
+    // disagree about it (§6.3: LimitExceeded is "never raised for a field the
+    // schema bounds"). Costs one `undefined` test on an already-loaded argument.
+    if (schemaCount === undefined && count > this.maxArrayCount) {
       throw limitExceededError(
         `array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`,
       );
@@ -642,10 +649,12 @@ export class Cursor {
     }
     // Opt-in length cap (corelib-ts#38), enforced at the header before the
     // payload is taken. wantSub tells string from blob, so the right limit
-    // applies to each.
+    // applies to each — and §6.2.1 confines it to a schema-UNBOUNDED field: a
+    // `maxlen` in the schema already governs this length, and a receiver-local
+    // capacity policy must not overrule it (see arrayCount, corelib-ts#105).
     const limit =
       wantSub === FixlenSubtype.String ? this.maxStringLen : this.maxBlobLen;
-    if (len > limit) {
+    if (schemaMaxlen === undefined && len > limit) {
       const what = wantSub === FixlenSubtype.String ? "string" : "blob";
       const name =
         wantSub === FixlenSubtype.String ? "maxStringLen" : "maxBlobLen";
@@ -683,8 +692,12 @@ export class Cursor {
     // subtype turns out to be" (§4.8) — it bounds the *format*, not this field.
     if (count > ARRAY_MAX) throw invalidMsgError("array count out of range");
     // Likewise the receiver cap: §6.2.1 requires it at the count header, before
-    // the allocation it exists to prevent.
-    if (count > this.maxArrayCount) {
+    // the allocation it exists to prevent — but only for a schema-UNBOUNDED
+    // array. When the schema bounds this field the cap does not apply at all
+    // (corelib-ts#105), so it must not fire here either: it sits before the
+    // element word while the schema check must sit after it (§4.8, below), and
+    // an unconditional cap would pre-empt that INVALID with a LIMIT_EXCEEDED.
+    if (schemaCount === undefined && count > this.maxArrayCount) {
       throw limitExceededError(
         `array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`,
       );

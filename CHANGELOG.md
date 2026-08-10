@@ -82,6 +82,31 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Fixed
 
+- **Receiver-side limits (`maxArrayCount` / `maxStringLen` / `maxBlobLen`) were
+  applied to schema-bounded fields, which §6.2.1 forbids** (#105). A `max_dyn_*`
+  limit exists because a schema-*unbounded* field lets the sender dictate the
+  receiver's allocation; a schema bound removes that freedom, so CORELIB_PLAN
+  §6.2.1 states the limits "**MUST NOT** be applied to a field the schema already
+  bounds. There the schema bound governs and its violation is `INVALID`", and
+  §6.3 that `LimitExceeded` is "never raised for a field the schema bounds".
+  `Cursor` took the schema bound and then applied the cap unconditionally, so a
+  deployment with a global cap rejected well-formed messages whose fields the
+  schema bounds *above* it — `readString(100)` on a 10-byte string under
+  `{ maxStringLen: 4 }` threw `LIMIT_EXCEEDED`, and two receivers with the same
+  schema and different limits disagreed about a bounded field, which §6.2.1 rules
+  out. Each cap in `fixlenLen`, `arrayCount` and `arrayFixlenHeader` is now gated
+  on the absence of the schema bound, so a bounded string, blob, varint array or
+  fixlen array decodes normally however tight the cap. The schema check keeps its
+  position and its `INVALID` verdict, and the fixlen-array path gains the second
+  half of that: its cap sat at the count word, *before* the element word the §4.8
+  order puts the schema check after (#104), so an over-`count` fp array under a
+  tighter cap reported `LIMIT_EXCEEDED` where `INVALID` is required — precedence
+  `INVALID > LIMIT_EXCEEDED > INCOMPLETE` now holds there too. Unbounded fields
+  are unchanged, on every path, including a field skipped past on an unknown id
+  (no schema bound by construction). The push surfaces (`decode()`, `IStream`)
+  are driven by wire type and are never told a schema bound, so they still apply
+  the caps to every field; that limitation is now recorded in the code and the
+  README. Cost is one `undefined` test on an already-loaded argument.
 - **A fixlen array's schema `count` was applied before its `fixlen_word`, so a
   message cut between the two words was `INVALID` where `INCOMPLETE` is
   required** (#104). CORELIB_PLAN §4.8 fixes the decode order — `element_count`
