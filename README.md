@@ -119,6 +119,15 @@ and never puts a wrapped one on the wire. The answer does not depend on how the
 encoder was constructed — a buffer that grows and a fixed streaming one reject
 exactly the same values — nor on the installed `Kernel`, which carries the same obligation.
 
+The byte-level `writeFixlen(id, data, subtype)` is checked the same way, against
+the fixlen domain of CORELIB_PLAN §4.6: subtypes `0x4`–`0x7` are **reserved**, and
+an `fp32` / `fp64` payload is **exactly** 4 / 8 bytes. Either mistake throws
+`ARGUMENT` before a byte is written, because a decoder must reject the resulting
+`fixlen_word` as malformed (`INVALID_MSG`) — the encoder does not emit bytes it
+would refuse to read. `String` and `Blob` still take any length up to
+`FIXLEN_MAX` (`0x7fffffff`), and the typed `writeFp32` / `writeFp64` /
+`writeString` are correct by construction and pay nothing for this.
+
 ### Serialize stream
 
 Constructed over a caller-owned buffer with a `FlushSink`, `OStream` drains that

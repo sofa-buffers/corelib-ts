@@ -423,9 +423,42 @@ export class OStream {
     this.writeFixlen(id, data, FixlenSubtype.Blob);
   }
 
-  /** Write a fixed-length field of the given subtype from raw bytes. */
+  /**
+   * Write a fixed-length field of the given subtype from raw bytes.
+   *
+   * This is the byte-level entry point — the one writer that takes the subtype
+   * from the caller rather than picking it — so the payload is checked
+   * **against that subtype** before a byte is written, and it cannot emit a
+   * `fixlen_word` a conformant decoder must reject (`ARGUMENT`, §6.3):
+   *
+   * * subtypes `0x4`–`0x7` are **reserved** — a decoder must treat a field
+   *   carrying one as malformed (`INVALID`, §4.6/§5.2);
+   * * `Fp32` / `Fp64` payloads are **exactly** 4 / 8 bytes — any other declared
+   *   length for those subtypes is malformed, rejected the moment the word is
+   *   read (§4.6);
+   * * `String` / `Blob` take any length up to `FIXLEN_MAX`.
+   *
+   * The typed writers ({@link writeFp32}, {@link writeFp64},
+   * {@link writeString}) are correct by construction and go straight to the
+   * header; only {@link writeBlob}, whose subtype is unconstrained anyway,
+   * shares this path.
+   */
   writeFixlen(id: number, data: Uint8Array, subtype: FixlenSubtype): void {
-    if (data.length > FIXLEN_MAX) {
+    // One predicted-false unsigned compare folds "reserved" and "negative" into
+    // a single test; the integer check (also what rules out `NaN`, which
+    // `>>> 0` turns into 0) rides on its short-circuit.
+    if ((subtype as number) >>> 0 > FixlenSubtype.Blob || !Number.isInteger(subtype)) {
+      throw argumentError(`fixlen subtype ${subtype} is reserved (§4.6: 0x0..0x3)`);
+    }
+    if (subtype === FixlenSubtype.Fp32 || subtype === FixlenSubtype.Fp64) {
+      const want = subtype === FixlenSubtype.Fp32 ? 4 : 8;
+      if (data.length !== want) {
+        throw argumentError(
+          `fixlen ${subtype === FixlenSubtype.Fp32 ? "fp32" : "fp64"} payload must be ` +
+            `exactly ${want} bytes, got ${data.length}`,
+        );
+      }
+    } else if (data.length > FIXLEN_MAX) {
       throw argumentError(`fixlen length ${data.length} exceeds ${FIXLEN_MAX}`);
     }
     this.fixlenHead(id, data.length, subtype);

@@ -129,6 +129,27 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Fixed
 
+- **`writeFixlen` emitted reserved subtypes and wrong-width `fp32`/`fp64`
+  fixlen words** (#110). CORELIB_PLAN §4.6 closes the domain of the
+  `fixlen_word`'s low three bits — `0x4`–`0x7` are **reserved** and a decoder
+  **must** reject a field carrying one — and fixes an `fp32`/`fp64` payload at
+  **exactly** 4 / 8 bytes, any other declared length being malformed the moment
+  the word is read. `writeFixlen` validated only the length ceiling, so
+  `writeFixlen(0, Uint8Array.of(1), 6 as never)` produced `02 0e 01` and
+  `writeFixlen(0, Uint8Array.of(1,2,3), Fp32)` produced a 3-byte `fp32` — bytes
+  this library's *own* decoder answers `INVALID_MSG` for. The wrong-width case
+  is reachable from the documented bit-exact transcode path
+  (`Cursor.readFp32Raw()` → `writeFixlen(id, raw, Fp32)`): a caller handing over
+  a wrongly sized slice got silently malformed output instead of an error. Both
+  are now refused with `ARGUMENT` (§6.3, symmetric with the decoder's verdict as
+  the strict-UTF-8 pair is) before any byte reaches the buffer, matching
+  `corelib-rs`'s `write_fixlen`. `String`/`Blob` of any length up to
+  `FIXLEN_MAX` are unaffected, and the typed `writeFp32` / `writeFp64` /
+  `writeString` writers are correct by construction and do not go through the
+  check, so no valid encode changes its bytes or its cost.
+  `test/fixlen-encode-domain.test.ts` pins the rejected and accepted domains and
+  the property behind them: whatever `writeFixlen` accepts, a decoder accepts.
+
 - **A flush re-armed the start offset instead of consuming it** (#109).
   CORELIB_PLAN §5.1: "the start offset belongs to the installation, not to the
   buffer" — a buffer-set begins an installation whose cursor starts at *that
