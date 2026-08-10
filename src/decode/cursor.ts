@@ -15,10 +15,12 @@
  * caller), which is what lets V8 inline the whole decode into a flat loop — the
  * same technique protobuf's generated `decode(reader)` uses.
  *
- * It shares {@link "./fast"}'s number-first varint core verbatim: each varint is
- * accumulated into two 32-bit JS *numbers* (`lo`/`hi`) and a `bigint` is
- * materialised only for a 64-bit *value* that does not fit in `2^53-1` (never for
- * ids, lengths or counts). String / blob payloads are returned as a single
+ * It shares {@link "./fast"}'s number-first varint core — the same code, not a
+ * copy of it: both extend {@link BufferReader} ({@link "./reader"},
+ * corelib-ts#114). Each varint is accumulated into two 32-bit JS *numbers*
+ * (`lo`/`hi`) and a `bigint` is materialised only for a 64-bit *value* that does
+ * not fit in `2^53-1` (never for ids, lengths or counts). String / blob payloads
+ * are returned as a single
  * zero-copy `subarray` view. It reports the same three-valued outcome as the
  * push path (MESSAGE_SPEC §7): malformed input throws a {@link SofabError} with
  * code `INVALID_MSG`, and a read that runs off the end of the buffer mid-field
@@ -39,11 +41,9 @@ import {
   limitExceededError,
 } from "../errors.js";
 import { Long } from "../long.js";
-import { joinU64 } from "../varint/bits64.js";
-import { zigzagDecodeLoHi } from "../varint/zigzag.js";
 import type { DecodeLimits } from "./limits.js";
+import { BufferReader } from "./reader.js";
 
-const TWO32 = 0x1_0000_0000; // 2^32, for combining the 32-bit halves
 // Strict UTF-8 (MESSAGE_SPEC §8, CORELIB_PLAN §6.4): JavaScript strings are a
 // Unicode string type, so this target is always strict — the decoder builds the
 // string with the fatal TextDecoder, which throws on any invalid-UTF-8 payload
@@ -64,7 +64,7 @@ const _utf8 = new TextDecoder("utf-8", { fatal: true });
  * over-limit field throws {@link SofabError} (`LIMIT_EXCEEDED`) at its header,
  * before it is materialized. Omit for no caps (the default).
  */
-export class Cursor {
+export class Cursor extends BufferReader {
   /** Field id of the header last accepted by {@link readHeader}. */
   id = 0;
   /** Wire type of the header last accepted by {@link readHeader}. */
@@ -94,20 +94,11 @@ export class Cursor {
    */
   fixSub = -1;
 
-  private readonly buf: Uint8Array;
-  private readonly view: DataView;
-  private readonly n: number;
-  private p = 0;
-
   // Opt-in decode limits (corelib-ts#38). An unset limit is Infinity — no cap,
   // today's behavior. Enforced at the count / length header, before allocation.
   private readonly maxArrayCount: number;
   private readonly maxStringLen: number;
   private readonly maxBlobLen: number;
-
-  // Last varint, as two unsigned 32-bit halves (see readVarint).
-  private lo = 0;
-  private hi = 0;
 
   // Number of nested sequences currently open (0 = root). Incremented when
   // readHeader accepts a SequenceStart, decremented when it consumes the matching
@@ -117,9 +108,7 @@ export class Cursor {
   private depth = 0;
 
   constructor(buf: Uint8Array, limits?: DecodeLimits) {
-    this.buf = buf;
-    this.n = buf.length;
-    this.view = new DataView(buf.buffer, buf.byteOffset, buf.length);
+    super(buf);
     this.maxArrayCount = limits?.maxArrayCount ?? Infinity;
     this.maxStringLen = limits?.maxStringLen ?? Infinity;
     this.maxBlobLen = limits?.maxBlobLen ?? Infinity;
@@ -731,151 +720,5 @@ export class Cursor {
       throw incompleteError("truncated fixlen array");
     }
     return count;
-  }
-
-  /** Hand back a zero-copy view of the next `len` bytes, advancing the cursor. */
-  private take(len: number): Uint8Array {
-    const start = this.p;
-    const end = start + len;
-    if (end > this.n) throw incompleteError("truncated fixlen payload");
-    this.p = end;
-    return this.buf.subarray(start, end);
-  }
-
-  private rawFp32(): number {
-    const p = this.p;
-    if (p + 4 > this.n) throw incompleteError("truncated fp32");
-    this.p = p + 4;
-    return this.view.getFloat32(p, true);
-  }
-
-  private rawFp64(): number {
-    const p = this.p;
-    if (p + 8 > this.n) throw incompleteError("truncated fp64");
-    this.p = p + 8;
-    return this.view.getFloat64(p, true);
-  }
-
-  // --- varint reading (shared verbatim with ./fast) -----------------------
-
-  /**
-   * The last varint as an unsigned value, number-first: a `number` when it fits
-   * exactly (`≤ 2^53-1`), a `bigint` only beyond that — built by punning the two
-   * halves through the shared scratch, so one `bigint` is allocated where the
-   * shift-and-or form allocated four ({@link "../varint/bits64"}).
-   */
-  private unsignedValue(): number | bigint {
-    const hi = this.hi >>> 0;
-    return hi <= 0x1fffff ? hi * TWO32 + (this.lo >>> 0) : joinU64(this.lo >>> 0, hi);
-  }
-
-  /** The last zig-zag varint as a signed value, number-first. */
-  private signedValue(): number | bigint {
-    const hi = this.hi >>> 0;
-    if (hi <= 0x1fffff) {
-      const r = hi * TWO32 + (this.lo >>> 0); // raw zig-zag, ≤ 2^53-1
-      return r % 2 === 0 ? r / 2 : -(r + 1) / 2;
-    }
-    return zigzagDecodeLoHi(this.lo >>> 0, hi);
-  }
-
-  /**
-   * The last varint's value as a JS number — exact for ids/lengths/counts.
-   *
-   * `hi` is accumulated with 32-bit bitwise ops, so a varint with **bit 63** set
-   * lands on its sign bit and reads back negative. Coerce it unsigned, exactly
-   * as {@link upper} already does: without the `>>> 0` the result is a large
-   * negative number, which is not `> ARRAY_MAX` and not `> maxArrayCount`, so a
-   * hostile count slips past every guard and its element loop runs zero times —
-   * a message truncated inside that array is then reported COMPLETE
-   * (corelib-ts#88). One bit, fully attacker-controlled, and an *accept*.
-   *
-   * Past 2^53 the sum is no longer exact, but every value up there is far beyond
-   * the ARRAY_MAX ceiling this feeds and is only ever compared against it.
-   */
-  private num(): number {
-    return (this.hi >>> 0) * TWO32 + (this.lo >>> 0);
-  }
-
-  /** The last varint with its low 3 tag bits stripped (`value >> 3`). */
-  private upper(): number {
-    return (this.hi >>> 0) * (TWO32 / 8) + (this.lo >>> 3);
-  }
-
-  /**
-   * Decode one LEB128 varint at the cursor into {@link lo} / {@link hi} (each an
-   * unsigned 32-bit half), advancing {@link p}. Throws on truncation or a value
-   * spilling past 64 bits (>10 bytes). Unrolled, number-only — no `bigint`.
-   */
-  private readVarint(): void {
-    const buf = this.buf;
-    const n = this.n;
-    let p = this.p;
-    let b: number;
-    let lo: number;
-    let hi = 0;
-
-    if (p >= n) throw incompleteError("truncated varint");
-    b = buf[p++]!;
-    lo = b & 0x7f;
-    if (b < 0x80) return this.set(lo, 0, p);
-
-    if (p >= n) throw incompleteError("truncated varint");
-    b = buf[p++]!;
-    lo |= (b & 0x7f) << 7;
-    if (b < 0x80) return this.set(lo, 0, p);
-
-    if (p >= n) throw incompleteError("truncated varint");
-    b = buf[p++]!;
-    lo |= (b & 0x7f) << 14;
-    if (b < 0x80) return this.set(lo, 0, p);
-
-    if (p >= n) throw incompleteError("truncated varint");
-    b = buf[p++]!;
-    lo |= (b & 0x7f) << 21;
-    if (b < 0x80) return this.set(lo, 0, p);
-
-    // 5th byte straddles the 32-bit boundary: 4 bits to lo, 3 bits to hi.
-    if (p >= n) throw incompleteError("truncated varint");
-    b = buf[p++]!;
-    lo |= (b & 0x0f) << 28;
-    hi = (b >> 4) & 0x07;
-    if (b < 0x80) return this.set(lo, hi, p);
-
-    if (p >= n) throw incompleteError("truncated varint");
-    b = buf[p++]!;
-    hi |= (b & 0x7f) << 3;
-    if (b < 0x80) return this.set(lo, hi, p);
-
-    if (p >= n) throw incompleteError("truncated varint");
-    b = buf[p++]!;
-    hi |= (b & 0x7f) << 10;
-    if (b < 0x80) return this.set(lo, hi, p);
-
-    if (p >= n) throw incompleteError("truncated varint");
-    b = buf[p++]!;
-    hi |= (b & 0x7f) << 17;
-    if (b < 0x80) return this.set(lo, hi, p);
-
-    if (p >= n) throw incompleteError("truncated varint");
-    b = buf[p++]!;
-    hi |= (b & 0x7f) << 24;
-    if (b < 0x80) return this.set(lo, hi, p);
-
-    // 10th byte: only bit 63 (1 payload bit) remains below 64; any higher
-    // payload bit, or a continuation into an 11th byte, is a >64-bit overflow.
-    if (p >= n) throw incompleteError("truncated varint");
-    b = buf[p++]!;
-    if (((b & 0x7f) >> 1) !== 0) throw invalidMsgError("varint overflow");
-    hi |= (b & 0x7f) << 31;
-    if (b < 0x80) return this.set(lo, hi, p);
-
-    throw invalidMsgError("varint overflow");
-  }
-
-  private set(lo: number, hi: number, p: number): void {
-    this.lo = lo;
-    this.hi = hi;
-    this.p = p;
   }
 }
