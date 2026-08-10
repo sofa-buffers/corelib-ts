@@ -8,6 +8,35 @@ While the version is below `1.0.0`, breaking changes bump the **minor** version.
 
 ## [Unreleased]
 
+### Added
+
+- **`Visitor.fieldBegin(id, wire)` — a field-header callback on the push paths**
+  (#97). The visitor had no hook between a field's **header varint** and the
+  value's own header word, so for a fixlen field the earliest signal was
+  `fixlenBegin`, which needs the *complete* fixlen word: a message ending inside
+  that word delivered no event at all and a visitor could not latch a bound the
+  header alone had already decided. The pull path has no such gap —
+  `Cursor.readHeader()` publishes `id` / `wire` and peeks `fixSub` one byte into
+  the word — which is exactly why the two disagreed. Crucible F-0061
+  `r3_wrapper_reopen_overindex_trunc.bin` (11 bytes, `probe.string_array` at id
+  200 with `count: 5`) re-opens the wrapper (MESSAGE_SPEC §7.4), announces
+  element id 161 and then ends one byte into its fixlen word: whole-buffer
+  `INVALID` through the cursor, chunked `INCOMPLETE` through the visitor at every
+  chunk size. CORELIB_PLAN §5.2 gives `INVALID` precedence over `INCOMPLETE` for
+  input already known to be malformed, and §6.4 / MESSAGE_SPEC §7.2 forbid a
+  chunk boundary changing the outcome — and the violation here is fully
+  established by bytes that arrived, since `8a 0a` is a complete varint. The hook
+  fires on both push paths (contiguous and chunked), exactly once per field, in
+  every scope and for every wire type, before the value and before the value's
+  own header word; throwing from it rejects the field, as from `fixlenBegin`.
+  The sequence-*end* marker is not announced — it closes a scope rather than
+  opening a field and its id is discarded, the same answer `readHeader()` gives
+  by returning `false` for it. Optional like every other visitor method, so no
+  existing visitor changes behaviour, and it costs one predicted property test
+  per field header: measured with `bench/run_callgrind.sh`, `decode: typical
+  message` 12,619 → 12,652 Ir/op (+0.3%) and `decode: u64 array (1000)` 723,050
+  → 720,764 (unchanged within noise — one header for a thousand elements).
+
 ### Performance
 
 Encoder and decoder throughput work. No wire-format, API or behavioural change —

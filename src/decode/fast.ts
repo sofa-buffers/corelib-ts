@@ -105,6 +105,12 @@ class FastDecoder {
         continue;
       }
 
+      // Announce the header before the value — and before the value's own header
+      // word — so a bound the header alone decides (an element id past the
+      // schema count) is taken at the same point on both decode paths, and even
+      // when the word behind it is truncated away (see Visitor.fieldBegin).
+      top.fieldBegin?.(id, type as WireType);
+
       switch (type) {
         case WireType.Unsigned: {
           this.readVarint();

@@ -165,6 +165,13 @@ export class DecoderState {
             break;
           }
           this.id = id;
+          // Announce the header before the value — and before the value's own
+          // header word. A message that ends inside that word (a fixlen length
+          // word, an array count word) delivers no later event at all, so a
+          // bound the header alone decides has to be taken here or not at all,
+          // and the chunked verdict would otherwise fall short of the
+          // whole-buffer one (§5.2 / §6.4; see Visitor.fieldBegin).
+          this.cur.fieldBegin?.(id, type as WireType);
           this.dispatch(type);
           break;
         }

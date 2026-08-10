@@ -178,6 +178,21 @@ class My implements Visitor {
 decode(bytes, new My());
 ```
 
+`fieldBegin(id, wire)` is announced first for every field — right after the header
+varint, before the value and before the value's *own* header word (a fixlen length
+word, an array count word, a nested sequence's fields). It is the push twin of
+`Cursor.readHeader()`, and it is where a check the header alone decides belongs: a
+wrapper-array element whose id is past the schema `count` needs no length, no
+count and no payload, and a message that ends inside the word behind that header
+fires no later callback at all — so without it the same bytes were `INVALID`
+through the cursor and `INCOMPLETE` through the visitor, which §5.2 forbids.
+Throwing from it rejects the field, as from `fixlenBegin`. The sequence-*end*
+marker gets no `fieldBegin`: it closes a scope rather than opening a field, the
+same answer `readHeader()` gives by returning `false` for it. Checks that need
+more than `id` and `wire` stay on the later, more informative hook — a fixlen
+subtype on `fixlenBegin`, a declared length or element count on `fixlenBegin` /
+`arrayBegin`.
+
 ### Deserialize stream
 
 `IStream` resumes across chunk boundaries, so feed it whatever the transport hands

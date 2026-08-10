@@ -20,7 +20,12 @@
  * whether a trailing `Incomplete` is a truncation error.
  */
 
-import type { ArrayKind, DecodeStatus, FixlenSubtype } from "../constants.js";
+import type {
+  ArrayKind,
+  DecodeStatus,
+  FixlenSubtype,
+  WireType,
+} from "../constants.js";
 import { decodeContiguous } from "./fast.js";
 import type { DecodeLimits } from "./limits.js";
 import { DecoderState } from "./state.js";
@@ -36,6 +41,37 @@ import { DecoderState } from "./state.js";
  * a time between {@link Visitor.arrayBegin} and {@link Visitor.arrayEnd}.
  */
 export interface Visitor {
+  /**
+   * A field **header**: its `id` and `wire` type, announced the moment the
+   * header varint is complete — before the value, and before the value's own
+   * header word (a fixlen length word, an array count word, the fields of a
+   * nested sequence).
+   *
+   * The push twin of {@link Cursor.readHeader}, and it exists because the two
+   * paths must agree. Whatever the header alone decides has to be decidable
+   * here: a wrapper-array element whose id is past the schema `count`
+   * (MESSAGE_SPEC §7.1/§5.1) is such a verdict — `id >= count` needs no length,
+   * no count and no payload. Without this hook the earliest signal for a fixlen
+   * element was {@link fixlenBegin}, which needs the *complete* fixlen word, so
+   * a message ending inside that word delivered no event at all and degraded to
+   * `INCOMPLETE` — while the same bytes through {@link Cursor.readHeader} are
+   * `INVALID`. CORELIB_PLAN §5.2 gives INVALID precedence over INCOMPLETE for
+   * input already known to be malformed, and §6.4 forbids a chunk boundary
+   * changing the outcome (corelib-ts#97).
+   *
+   * Called exactly once per field, in every scope, for every wire type — the
+   * sequence *end* marker excepted: it closes a scope rather than opening a
+   * field and its id is discarded, which is the same answer the pull twin gives
+   * by returning `false` from {@link Cursor.readHeader} instead of publishing a
+   * header. For a nested sequence it fires on the *enclosing* visitor, before
+   * {@link sequenceBegin}.
+   *
+   * Throwing from it rejects the field, exactly as from {@link fixlenBegin}.
+   * Checks that need more than `id` and `wire` still belong on the later, more
+   * informative hook: a fixlen *subtype* mismatch on {@link fixlenBegin}, a
+   * declared length or element count on {@link fixlenBegin} / {@link arrayBegin}.
+   */
+  fieldBegin?(id: number, wire: WireType): void;
   /**
    * An unsigned integer field. Number-first: `value` is a `number` when it fits
    * exactly (`≤ 2^53-1`, covering ids, u8..u32 and small u64s) and a `bigint`
