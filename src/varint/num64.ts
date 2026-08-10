@@ -7,7 +7,6 @@
  * free (the `littleEndian` argument is passed explicitly everywhere).
  */
 
-import { I64_MAX, I64_MIN, U64_MAX } from "../constants.js";
 import { argumentError } from "../errors.js";
 
 // One 8-byte scratch, viewed two ways: the `DataView` performs the IEEE-754

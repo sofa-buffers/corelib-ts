@@ -76,6 +76,78 @@ While the version is below `1.0.0`, breaking changes bump the **minor** version.
 
 ### Performance
 
+A pass on **what a message costs before a byte is coded** — the allocations each
+encode and decode makes on the way in. No wire-format, API or behavioural change:
+the shared vectors (now also encoded through a plain caller buffer, see *Tests*),
+the round-trip and chunked suites and the byte-exactness guarantees are unchanged.
+
+| Tool | Workload | before | after | |
+|---|---|---|---|---|
+| `run_callgrind.sh` | `encode: typical message` | 10,627 Ir/op | 8,037 Ir/op | **−24.4%** |
+| `npm run bench` | `encode: typical message` | 15.19 MB/s | 58.61 MB/s | **+286%** |
+| `npm run bench` | `encode: u64 array (1000)` | 300.94 MB/s | 316.38 MB/s | **+5.1%** |
+| `npm run perf` | serialize (170-byte message) | 3,184 ns/op | 1,312 ns/op | **−58.8%** |
+
+The decode rows of those tools all run through `IStream`, whose code is
+untouched, and Callgrind — which is deterministic — reports them unchanged to the
+instruction (`decode: typical message` 12,719 → 12,719, `decode: u64 array`
+720,804 → 720,869). The whole-buffer decode wins below are invisible to
+`bench` / `perf`, which have no `decode()` / `Cursor` row, and are measured one
+row per process, best of four:
+
+| Workload | before | after | |
+|---|---|---|---|
+| `growingOStream()` + 5 fields | 2,200 ns | 314 ns | **−85.7%** |
+| `new OStream(buf)` + 5 fields | 1,945 ns | 158 ns | **−91.9%** |
+| `Cursor` over a float-free message | 393 ns | 280 ns | **−28.9%** |
+| `decode()` over a float-free message | 482 ns | 403 ns | **−16.5%** |
+| `Long.fromBigInt` ×256 | 25.2 µs | 4.0 µs | **−84.0%** |
+| `Long.toBigInt` ×256 | 21.7 µs | 12.6 µs | **−41.8%** |
+| `IStream` over the same message (untouched path) | 455 ns | 464 ns | +1.9% |
+
+- **The accumulator's buffers are carved from a shared slab.** V8 keeps a typed
+  array's bytes inside the JS heap only up to **64 bytes**; one byte more and the
+  backing store is an external allocation — measured on Node 24 at ~1.4 µs
+  against ~60 ns, several times the cost of encoding a short message.
+  `growingOStream()`'s 256-byte default was therefore 45% of the profile of
+  `encode: typical message`, and the reason that workload ran at a sixth of the
+  decode throughput. Requests up to 4 KiB now come out of an 8 KiB slab, exactly
+  as Node's own `Buffer.allocUnsafe` pools; larger ones still get storage of
+  their own, where one allocation is amortised by the message anyway. A carve is
+  handed out **once** and never recycled, so nothing observable changes: two
+  encoders never share bytes, and a slab is fresh, zero-filled storage. What does
+  change is lifetime — a retained `bytes()` view keeps its slab alive, so
+  `.slice()`, already the documented way to outlive the next write, is also what
+  releases it.
+- **A caller-supplied buffer now takes the bulk writers too.** The one-shot
+  `new OStream(buf)` shape §5.1 puts first — a buffer sized from the schema's
+  `MAX_SIZE`, no owner, no sink — was excluded from every bulk route by a
+  `canGrow` gate, so it ran `TextEncoder.encode` (plus its throwaway array and
+  second copy) for every string and the element-at-a-time loop for every array —
+  1.9 µs against 0.16 µs for the same five-field message once the bulk routes are
+  open to it, a 12x difference that nothing about the buffer required. The gate now
+  asks the question that actually decides it — *is the payload's room already
+  there?* — which can be true on any buffer, and only reaches for an owner beyond
+  that. It has to: a bulk array reserve asks for the **worst case** (10 bytes per
+  element), and demanding that of a fixed buffer would turn a message that fits
+  into a spurious `BUFFER_FULL`, so a `false` here stays what it always was — a
+  fallback to the element-at-a-time route, not an error.
+- **The whole-buffer decoders build their `DataView` on first use.**
+  `new DataView(buffer, offset, length)` costs ~115 ns on Node 24, and it was
+  built in the `BufferReader` constructor — once per `decode()` and per `Cursor`,
+  i.e. once per message — for a member only the `fp32` / `fp64` readers touch. A
+  message with no float field never allocates it now, and one that has floats
+  pays a single already-loaded field test per float read.
+- **`Long` converts through the shared bit-punning scratch.** `Long.fromBigInt`
+  ran `Number(v & 0xffff_ffffn)` plus a shift (four intermediate `bigint`s) and
+  `toBigInt` a shift-and-or (two), on the very boundary the class exists to make
+  cheap — while `src/varint/bits64.ts` has done both with one typed-array store
+  and two number loads since the pass below. Truncation is identical: a
+  `BigInt64Array` store *is* `ToBigInt64`, reduction modulo 2^64, which is what
+  the masks computed.
+
+Earlier in this release, and unchanged by the above:
+
 Encoder and decoder throughput work. No wire-format, API or behavioural change —
 the shared vectors, the round-trip and chunked suites, and the byte-exactness
 guarantees are all unchanged; only the instruction cost of getting there moved.
@@ -137,6 +209,14 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Changed
 
+- **The bench tools time through one loop** (`bench/common.ts`). `bench.ts`,
+  `perf.ts` and `bound.ts` each carried a copy, and `bound.ts`'s had drifted into
+  reading the clock once per *operation* — at ~1 µs a read, several times the cost
+  of the sub-microsecond decodes it reports, so its rows measured mostly
+  `process.cpuUsage`. Its `decode: string (43 bytes)` row went from 0.32 to 0.92
+  Mops/s on the same code the moment the shared, batch-calibrating `measure()`
+  replaced it. No workload, value or report layout changed in any of the three.
+
 - **The two whole-buffer decoders share one byte-reading core** (#114). The pull
   `Cursor` (`src/decode/cursor.ts`) and the contiguous push decoder
   (`src/decode/fast.ts`) each carried a verbatim copy of the same unrolled,
@@ -173,6 +253,21 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
   `growingOStream()` does.
 
 ### Removed
+
+- **The `bigint` varint and zig-zag helpers — a fourth varint reader with no
+  caller.** `encodeVarint`, `varintSize`, `decodeVarint` / `VarintResult`,
+  `zigzagEncode` and `zigzagDecode` were internal (never part of the public
+  surface) and had no production caller left: every shipped path holds a 64-bit
+  value as two 32-bit halves and goes through the `…LoHi` / `…Num` writers, while
+  every decode surface reads varints in the shape its own control flow needs.
+  What survived was a *general* reader that shipped in every bundle, ran nowhere,
+  and had to be kept in lockstep with the three that do — corelib-ts#82, #88,
+  #99/#100, #113 and #131 each had to be applied to it as well, and a rule
+  applied to it alone would have been invisible. The §4.1 rules it carried are
+  now asserted where they matter, on the encoder and the three decode surfaces
+  (see *Tests*), against a reference LEB128 the test owns.
+- **`validateKernel` is no longer exported** from `src/backend/kernel.ts`: it is
+  what `setKernel` calls, and nothing else ever called it.
 
 - **`loadNativeKernel()`, `loadWasmKernel()` and `WasmKernelFactory` — loaders
   for acceleration backends that do not exist** (#115). `loadNativeKernel()`
@@ -587,6 +682,24 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
   start a fresh varint while a half-read one was still in the accumulator.
 
 ### Tests
+
+- **Every shared vector is now encoded through a plain caller buffer as well**,
+  at two sizes: exactly the reference length — the `MAX_SIZE` shape, which cannot
+  take a worst-case array reserve, so the element-at-a-time fallback runs — and
+  with 4 KiB of slack, where the bulk string / array writers run throughout. The
+  vector suite only ever drove the accumulator, so the buffer shape CORELIB_PLAN
+  §5.1 puts first had no byte-exact coverage at all; both routes through the
+  encoder are now pinned to the same reference bytes (163 further assertions).
+- **`test/varint.test.ts` drives the shipped surfaces.** It exercised the deleted
+  `encodeVarint` / `decodeVarint` pair — the only thing keeping them alive — and
+  now asserts the same §4.1 rules (the length ladder, the 10-byte / 64-bit bound,
+  truncation vs. overflow, the zig-zag mapping) through `OStream`, `decode()`,
+  `Cursor` and `IStream`, against a reference LEB128 written out in the test. The
+  overlong-varint cases are now checked on *all three* decode surfaces rather
+  than on the helper alone.
+- **The accumulator's slab is pinned in `buffer-ownership.test.ts`**: a retained
+  `bytes()` view is not disturbed by later encodes on other streams, and no two
+  accumulators share bytes.
 
 - `readme-error-codes.test.ts` checks the README's error-code prose against
   `src/errors.ts` instead of against itself (#116): the documented list must name

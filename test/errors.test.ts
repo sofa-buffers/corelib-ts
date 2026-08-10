@@ -16,7 +16,6 @@ import {
   decode,
 } from "../src/index.js";
 import { ID_MAX } from "../src/constants.js";
-import { encodeVarint } from "../src/varint/leb128.js";
 
 /** Run `fn` and return the SofabError code it throws (or fail). */
 function codeOf(fn: () => void): string {
@@ -31,6 +30,22 @@ function codeOf(fn: () => void): string {
 
 function bytes(...n: number[]): Uint8Array {
   return Uint8Array.from(n);
+}
+
+/**
+ * LEB128 bytes of a non-negative `bigint`, written here rather than taken from
+ * the library: these tests build headers the encoder *refuses* to write, so the
+ * bytes have to come from somewhere it does not gate.
+ */
+function varint(value: bigint): number[] {
+  const out: number[] = [];
+  for (let v = value; ; v >>= 7n) {
+    if (v < 0x80n) {
+      out.push(Number(v));
+      return out;
+    }
+    out.push(Number(v & 0x7fn) | 0x80);
+  }
 }
 
 describe("decoder rejects malformed input", () => {
@@ -59,9 +74,9 @@ describe("decoder rejects malformed input", () => {
   });
 
   it("field id out of range", () => {
-    const buf = new Uint8Array(8);
-    const n = encodeVarint((BigInt(ID_MAX + 1) << 3n) | 0n, buf, 0);
-    expect(codeOf(() => decode(buf.subarray(0, n), {}))).toBe(SofabErrorCode.InvalidMsg);
+    // (id << 3) | wire 0, one past the id ceiling.
+    const buf = bytes(...varint(BigInt(ID_MAX + 1) << 3n));
+    expect(codeOf(() => decode(buf, {}))).toBe(SofabErrorCode.InvalidMsg);
   });
 
 });

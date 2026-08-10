@@ -74,7 +74,7 @@ export function getKernel(): Kernel {
 }
 
 /** Throws if `kernel` is missing a required method — used by {@link setKernel}. */
-export function validateKernel(kernel: Kernel): void {
+function validateKernel(kernel: Kernel): void {
   const required: (keyof Kernel)[] = [
     "encodeUnsignedVarints",
     "encodeSignedVarints",

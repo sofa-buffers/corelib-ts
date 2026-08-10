@@ -12,7 +12,7 @@
  */
 
 import { Cursor, OStream, growingOStream } from "../src/index.js";
-import { MIN_SECONDS, WARMUP, cpuNow, sink } from "./common.js";
+import { measure, sink } from "./common.js";
 
 const N = 1000;
 const GOLDEN = 0x9e37_79b9_7f4a_7c15n;
@@ -33,17 +33,9 @@ const fp64Wire = encode((os) => os.writeFp64Array(1, fp64src));
 const strWire = encode((os) => os.writeString(1, str));
 
 /** Run `body` for ~1 s of CPU time after warmup; return millions of ops/s. */
-function measure(body: () => void): number {
-  for (let i = 0; i < WARMUP; i++) body();
-  let it = 0;
-  const t0 = cpuNow();
-  let el: number;
-  do {
-    body();
-    it++;
-    el = cpuNow() - t0;
-  } while (el < MIN_SECONDS);
-  return it / el / 1e6;
+function rate(body: () => void): number {
+  const { iterations, seconds } = measure(body);
+  return iterations / seconds / 1e6;
 }
 
 // Each pair decodes identical wire; only the reader argument differs.
@@ -98,7 +90,7 @@ const cases: [string, () => void, () => void][] = [
 const REPEATS = 5; // take the best of N runs per variant to cut scheduler noise
 function best(body: () => void): number {
   let m = 0;
-  for (let i = 0; i < REPEATS; i++) m = Math.max(m, measure(body));
+  for (let i = 0; i < REPEATS; i++) m = Math.max(m, rate(body));
   return m;
 }
 

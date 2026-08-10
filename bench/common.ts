@@ -8,12 +8,12 @@
 
 import type { Visitor } from "../src/index.js";
 
-export const MIN_SECONDS = 1.0;
-export const WARMUP = 200_000;
-export const BATCH_SECONDS = 0.01; // clock cost lands under ~0.01% of a batch
+const MIN_SECONDS = 1.0;
+const WARMUP = 200_000;
+const BATCH_SECONDS = 0.01; // clock cost lands under ~0.01% of a batch
 
 /** Process CPU time in seconds (user + system), not wall-clock. */
-export function cpuNow(): number {
+function cpuNow(): number {
   const u = process.cpuUsage();
   return (u.user + u.system) / 1e6;
 }
@@ -24,12 +24,40 @@ export function cpuNow(): number {
  * about a microsecond per call — sampling it once per operation would make
  * cheap workloads measure mostly the timer. Doubles as extra warmup.
  */
-export function calibrateBatch(body: () => void): number {
+function calibrateBatch(body: () => void): number {
   for (let batch = 1; ; batch *= 2) {
     const t0 = cpuNow();
     for (let k = 0; k < batch; k++) body();
     if (cpuNow() - t0 >= BATCH_SECONDS) return batch;
   }
+}
+
+/** What {@link measure} observed: how many times `body` ran, and for how long. */
+export interface Timing {
+  iterations: number;
+  seconds: number;
+}
+
+/**
+ * Run `body` for at least {@link MIN_SECONDS} of process CPU time after warmup,
+ * in calibrated batches, and report what was observed. Every tool in this
+ * directory times through this one loop: they had a copy each, and one of them
+ * (`bound.ts`) had drifted into reading the clock once per *operation* — which,
+ * at ~1 µs a read, is several times the cost of the sub-microsecond decodes it
+ * was reporting, so its rows measured mostly `process.cpuUsage`.
+ */
+export function measure(body: () => void, minSeconds = MIN_SECONDS): Timing {
+  for (let i = 0; i < WARMUP; i++) body();
+  const batch = calibrateBatch(body);
+  let iterations = 0;
+  const t0 = cpuNow();
+  let seconds: number;
+  do {
+    for (let k = 0; k < batch; k++) body();
+    iterations += batch;
+    seconds = cpuNow() - t0;
+  } while (seconds < minSeconds);
+  return { iterations, seconds };
 }
 
 /** A decode sink that folds every value into a checksum so nothing is elided. */

@@ -161,6 +161,30 @@ describe("growingOStream (the caller that owns the buffer)", () => {
     expect(os.bytes()).toEqual(reference());
   });
 
+  it("hands every accumulator storage of its own, slab-carved or not", () => {
+    // The accumulator carves its buffers out of a shared slab (V8 puts a typed
+    // array over 64 bytes outside the JS heap, at ~20x the allocation cost). A
+    // carve is handed out once and never recycled, so this must stay invisible:
+    // two live accumulators may not share a byte, and a `bytes()` view — which is
+    // documented as valid until the *next write on that stream* — must not be
+    // rewritten by an encode on another stream.
+    const first = growingOStream();
+    write(first);
+    const view = first.bytes();
+    const snapshot = Array.from(view);
+
+    const others = [growingOStream(), growingOStream(64), growingOStream(9000)];
+    for (const os of others) {
+      os.writeString(1, "a different message entirely, written after the first");
+      os.writeUnsignedArray(2, Array.from({ length: 200 }, (_, i) => i));
+    }
+
+    expect(Array.from(view)).toEqual(snapshot);
+    for (const os of others) {
+      expect(os.bytes().some((b, i) => b !== view[i])).toBe(true);
+    }
+  });
+
   it("keeps a message written across many growths byte-identical to a one-shot one", () => {
     const oneShot = growingOStream(1 << 16);
     write(oneShot);
