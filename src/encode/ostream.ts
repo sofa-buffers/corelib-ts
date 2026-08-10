@@ -164,6 +164,15 @@ export class OStream {
   private pending: number[] | null = null;
   /** Valid entries in {@link OStream.pending}. */
   private nPending = 0;
+  /**
+   * How many buffer installations {@link OStream.setBuffer} has made. Only ever
+   * compared for equality across the flush callback, which is how
+   * {@link OStream.flush} tells "the sink copied and returned" from "the sink
+   * took the buffer and installed a replacement" — the one distinction §5.1
+   * rests the handover contract on, and the one that decides whether the start
+   * offset was consumed or re-armed.
+   */
+  private installs = 0;
   private kernel!: Kernel;
 
   /**
@@ -211,11 +220,31 @@ export class OStream {
     return this.buf.subarray(this.start, this.pos);
   }
 
-  /** Drain buffered bytes to the flush sink (no-op without one). */
+  /**
+   * Drain buffered bytes to the flush sink (no-op without one).
+   *
+   * A sink that returns **without** installing a buffer has copied what it was
+   * handed, so the encoder keeps writing into the same buffer — resuming at
+   * offset **0**. The start offset belongs to the *installation*, not to the
+   * buffer (CORELIB_PLAN §5.1): the buffer-set that armed it — the constructor
+   * or {@link OStream.setBuffer} — reserved room in the unit it began, and
+   * handing that unit over consumes the reservation. A sink that wants header
+   * room in *every* unit re-arms it by calling `setBuffer(buf, offset)` from
+   * inside the callback, a new installation like any other; a bare return must
+   * not do it implicitly, or the leading bytes would be capacity the rest of the
+   * stream could never use and the two shapes would be indistinguishable.
+   */
   flush(): void {
     if (this.flushSink && this.pos > this.start) {
+      const installed = this.installs;
       this.flushSink(this.buf.subarray(this.start, this.pos));
-      this.pos = this.start;
+      // A `setBuffer` from inside the callback *is* the new installation and has
+      // already placed the cursor at its own offset; only a bare return leaves
+      // the old installation in place, and that one is the consumed case.
+      if (this.installs === installed) {
+        this.start = 0;
+        this.pos = 0;
+      }
     }
   }
 
@@ -226,6 +255,12 @@ export class OStream {
    * without interruption. `offset` reserves space at the front of the new
    * buffer. Any not-yet-flushed bytes in the old buffer are dropped, so
    * {@link flush} first (the flush callback fires before you swap).
+   *
+   * Every call is a **new installation**, and its `offset` applies to the unit
+   * it begins and is consumed when that unit is flushed (CORELIB_PLAN §5.1).
+   * Passing the buffer the encoder already has is an installation like any
+   * other: that is how a sink gets header room in *every* flushed unit — one
+   * framing header per packet — where returning bare would resume at `0`.
    *
    * On a stream that has a flush sink the new buffer must leave at least
    * {@link MIN_OUTPUT_BUFFER} usable bytes (`buffer.length - offset`); a smaller
@@ -250,6 +285,9 @@ export class OStream {
     this.buf = buffer;
     this.start = offset;
     this.pos = offset;
+    // Counted *after* the checks: a rejected buffer is not an installation, and
+    // a flush in progress must still see the one it handed over (§5.1).
+    this.installs++;
   }
 
   /**

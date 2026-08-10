@@ -57,7 +57,7 @@ full type declarations.
 | Fast whole-buffer decode | With the whole message in one buffer, `decode()` (push) and `Cursor` (pull) advance a single cursor. |
 | Full 64-bit fidelity | Scalars round-trip the entire `uint64` / `int64` range: `number` when exact, `bigint` beyond `2^53-1` (`Long` offers a `bigint`-free array path). |
 | Generated-code friendly | The pull `Cursor` gives a monomorphic `readHeader()` + typed `read*` loop; the push `Visitor` has all-optional methods. |
-| Reserve-offset | `new OStream(buf, offset)` leaves room at the front for a lower-layer header, saving a copy. |
+| Reserve-offset | `new OStream(buf, offset)` leaves room at the front for a lower-layer header, saving a copy. The offset belongs to that installation and is consumed by the flush that hands the unit over; `setBuffer(buf, offset)` from inside the sink re-arms it, for header room in every packet. |
 | Caller-owned buffers | The encoder allocates no output buffer and grows none: it writes into yours, and asks the `BufferOwner` you named for the next one when it fills. `growingOStream()` is that owner ready-made. |
 | Explicit endianness | IEEE-754 values are read / written little-endian via `DataView`, identical on every engine. |
 | Pluggable acceleration | The encoder's bulk array paths run through a swappable `Kernel`; the default is pure TypeScript. |
@@ -328,6 +328,21 @@ Who owns the bytes:
   no sink it throws `BUFFER_FULL`. `bytes()` returns a **view** of what is in the
   buffer — with a sink, only the not-yet-flushed tail — so `.slice()` it if it
   must outlive the next write.
+- **The `offset` belongs to the installation, not to the buffer** (§5.1). It
+  reserves room at the front of the unit the buffer-set begins — the constructor
+  or `setBuffer` — and handing that unit to the sink **consumes** it: a sink that
+  returns without installing a buffer has *copied*, so the encoder keeps writing
+  into the same buffer and resumes at `0`, with the whole buffer usable from
+  there. A sink that wants header room in **every** flushed unit — one framing
+  header per packet — re-arms it by calling `setBuffer(buf, offset)` from inside
+  the callback; passing the buffer it already has counts, a buffer-set is a new
+  installation like any other. A sink that *takes* the buffer (hands it to a
+  transport, queues it, gives it to DMA) must install a replacement before
+  returning, for the same reason: returning bare says "reuse the storage".
+  Either way the bytes are the same — only the unit sizes differ. `reset()` and
+  `bytes()` follow the current installation, so after a flush they are relative
+  to `0`; on a sink-less stream, which can never flush, the reservation stands
+  for the life of the encode.
 - **Encode into memory (`growingOStream()`, `BufferOwner`).** The allocating
   half is the caller's role (§5.1: "the generated-object layer allocates; the
   corelib does not"), and a caller that owns its storage names a `BufferOwner`:
