@@ -82,6 +82,35 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Fixed
 
+- **An array element outside the 64-bit value domain was silently reduced modulo
+  2^64 by the in-memory encoder, while the streaming one rejected it** (#106).
+  CORELIB_PLAN §6.2 fixes the domains at `0 .. 2^64 - 1` (unsigned) and
+  `-2^63 .. 2^63 - 1` (signed) and §6.3 makes anything outside them an
+  out-of-range argument — `InvalidArgument`, not a wrapped value. `OStream`'s
+  array writers have two implementations: the growable `new OStream()` branch
+  hands the whole array to the bulk `Kernel`, and the fixed-caller-buffer branch
+  writes element by element. Only the second range-checked, so
+  `writeUnsignedArray(0, [-1n, 2n ** 64n])` put `18446744073709551615` and `0`
+  on the wire in-memory and threw `ARGUMENT` when streaming — the identical
+  call, two answers, decided by which constructor the caller used, and the
+  unchecked one is the default the generated `marshal()` path builds. `number`
+  elements were affected the same way: the kernel's number fast path is gated on
+  `v >= 0`, so a negative number fell into the wrapping branch. The JS kernel now
+  performs the very check the streaming path does — the `splitU64` / `splitI64`
+  scratch round-trip, whose reload-and-compare *is* the range test — and throws
+  `argumentError` when it fails, so both modes reject exactly the same values and
+  no wrapped element ever reaches the wire. The obligation is written into the
+  `Kernel` contract, since a kernel is the only code that ever sees the elements;
+  the `number` fast paths are already gated on the domain and pay nothing.
+  Signed arrays also stop materialising `bigint`s for the zig-zag: with the
+  halves already in the scratch, `encodeZigzagVarintLoHi` computes the same
+  mapping on them and allocates nothing, which more than pays for the check.
+  Measured with `bench/run_callgrind.sh`, `encode: u64 array (1000)` 259,888 →
+  342,606 Ir/op (+32% — V8's `bigint` comparison is instruction-heavy out of
+  proportion to its time: the same array costs ~4% more CPU time, and the scalar
+  writers have always paid this check), `encode: typical message` 10,368 →
+  10,462 (+0.9%), both decode rows unchanged. A 1000-element signed `bigint`
+  array encodes ~3.8× faster (best-of-9 CPU time, 90.2 → 23.7 µs).
 - **Receiver-side limits (`maxArrayCount` / `maxStringLen` / `maxBlobLen`) were
   applied to schema-bounded fields, which §6.2.1 forbids** (#105). A `max_dyn_*`
   limit exists because a schema-*unbounded* field lets the sender dictate the

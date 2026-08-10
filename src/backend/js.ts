@@ -7,10 +7,11 @@
  * kernel can later override it via {@link setKernel}.
  */
 
-import { HI, LO, S_U32, S_U64 } from "../varint/bits64.js";
-import { encodeVarintLoHi, encodeVarintNum } from "../varint/leb128.js";
+import { argumentError } from "../errors.js";
+import { HI, LO, S_U32, splitI64, splitU64 } from "../varint/bits64.js";
+import { encodeVarintNum } from "../varint/leb128.js";
 import { packFp32, packFp64, toBigInt } from "../varint/num64.js";
-import { zigzagEncode } from "../varint/zigzag.js";
+import { encodeZigzagVarintLoHi } from "../varint/zigzag.js";
 import type { Kernel } from "./kernel.js";
 
 // Largest signed magnitude whose zig-zag (|v|*2) stays an exact integer.
@@ -33,12 +34,15 @@ export const jsKernel: Kernel = {
         pos = encodeVarintNum(v, out, pos);
         continue;
       }
-      // A `bigint` element: one scratch store reduces it mod 2^64 and yields
-      // both halves, which is exactly the truncation the mask-and-shift split
-      // performed — at ~1/28th the cost (bits64). Out-of-range elements keep
-      // wrapping here rather than throwing, as before; the non-growable path
-      // in OStream is the one that range-checks.
-      S_U64[0] = toBigInt(v);
+      // Anything else goes through the unsigned 64-bit scratch, whose store
+      // yields both halves at ~1/28th the cost of a mask-and-shift split
+      // (bits64) *and* range-checks in the same breath: `splitU64` reloads the
+      // stored value and compares, which differs from the input exactly when it
+      // was negative or ≥ 2^64. An element outside the domain (§6.2) is a caller
+      // mistake and must be rejected, not reduced modulo 2^64 — the same answer
+      // the element-at-a-time streaming path in OStream gives (#106).
+      const b = toBigInt(v);
+      if (!splitU64(b)) throw argumentError(`unsigned value ${b} out of range`);
       let lo = S_U32[LO]!;
       const hi = S_U32[HI]!;
       // The body of `encodeVarintLoHi`, inlined. This is the one place the
@@ -81,10 +85,14 @@ export const jsKernel: Kernel = {
       if (typeof v === "number" && v >= -SIGNED_FAST_MAX && v <= SIGNED_FAST_MAX && Number.isInteger(v)) {
         pos = encodeVarintNum(v >= 0 ? v * 2 : -v * 2 - 1, out, pos);
       } else {
-        // zigzagEncode's `& U64_MAX` already reduces to 64 bits, so the split
-        // below is exact and the wire bytes are unchanged.
-        S_U64[0] = zigzagEncode(toBigInt(v));
-        pos = encodeVarintLoHi(S_U32[LO]!, S_U32[HI]!, out, pos);
+        // As in encodeUnsignedVarints, the signed scratch round-trip is both
+        // the §6.2 domain check and the split: an element outside
+        // `-2^63 .. 2^63 - 1` is rejected rather than wrapped (#106). Zig-zag
+        // then runs on the two halves, producing the very same bytes as
+        // `zigzagEncode` in `bigint` with nothing allocated.
+        const b = toBigInt(v);
+        if (!splitI64(b)) throw argumentError(`signed value ${b} out of range`);
+        pos = encodeZigzagVarintLoHi(S_U32[LO]!, S_U32[HI]!, out, pos);
       }
     }
     return pos;

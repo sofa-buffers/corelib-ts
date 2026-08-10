@@ -89,6 +89,14 @@ os.writeString(3, "hi");
 const bytes = os.bytes();          // Uint8Array view of the finished message
 ```
 
+Every integer written — scalar **or array element** — is checked against the
+64-bit value domains (CORELIB_PLAN §6.2): unsigned `0 .. 2^64 - 1`, signed
+`-2^63 .. 2^63 - 1`. Anything outside them is a caller mistake and throws
+`SofabError` with code `ARGUMENT`; the encoder never reduces a value modulo 2^64
+and never puts a wrapped one on the wire. The answer does not depend on how the
+encoder was constructed — the in-memory and streaming modes reject exactly the
+same values — nor on the installed `Kernel`, which carries the same obligation.
+
 ### Serialize stream
 
 Constructed over a caller-owned buffer with a `FlushSink`, `OStream` drains that
