@@ -200,6 +200,25 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Fixed
 
+- **The module-level doc example decoded a string chunk with a lossy
+  `TextDecoder`** (#117). CORELIB_PLAN §6.4 forbids silent replacement in every
+  mode — an implementation must never substitute `U+FFFD` for invalid UTF-8 —
+  and names JavaScript's default `TextDecoder` as exactly the lossy platform
+  primitive to avoid. The `@example` on `src/index.ts`, the first snippet a
+  TypeDoc reader sees, materialized a visitor `string` chunk with
+  `new TextDecoder()`, so the pattern it taught turns `ff fe` into two
+  replacement characters while reporting the message `COMPLETE`, where the same
+  bytes through `Cursor.readString` are `INVALID_MSG`. The example now builds a
+  fatal decoder (`new TextDecoder("utf-8", { fatal: true })`), and the contract
+  behind that choice is stated where it belongs: on `Visitor.string` itself and
+  in the README's decode-ownership list — visitor chunks are raw, unvalidated
+  wire bytes that may end mid-code-point, validation happens where a string is
+  *materialized*, and on the push path the caller doing the materializing owns
+  it. `test/doc-utf8-decoder.test.ts` lints every `new TextDecoder(...)` in the
+  shipped docs (`src/**` TSDoc and the README) for `fatal: true` and pins the
+  behaviour that makes it matter. Documentation and tests only; no library code
+  changed.
+
 - **The README's error-code list named a code that does not exist and omitted
   one that does** (#116). The "Usage" paragraph is the one place a caller learns
   which values `SofabError.code` can take, and it listed `USAGE` — a name

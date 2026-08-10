@@ -21,9 +21,14 @@
  * os.writeUnsigned(1, 42);
  * os.writeString(2, "hi");
  *
+ * // A visitor string chunk is raw, unvalidated wire bytes, so whoever
+ * // materializes it owns the UTF-8 check: the *fatal* decoder is required —
+ * // the default one silently substitutes U+FFFD, which §6.4 forbids.
+ * const utf8 = new TextDecoder("utf-8", { fatal: true });
+ *
  * const sink: Visitor = {
  *   unsigned: (id, v) => { if (id === 1) console.log("n", v); },
- *   string:   (id, _t, _o, c) => console.log("s", new TextDecoder().decode(c)),
+ *   string:   (id, _t, _o, c) => console.log("s", utf8.decode(c)),
  * };
  * decode(os.bytes(), sink);
  * ```

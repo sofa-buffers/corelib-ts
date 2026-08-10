@@ -408,6 +408,15 @@ Who owns the bytes:
   valid **only during that callback**; a `Cursor` view lasts as long as the source
   buffer lives. Scalars are delivered by value. Copy (`.slice()`) or decode
   (`Cursor.readString` decodes for you) to retain a payload.
+- **String validity is checked where a string is materialized.** JavaScript
+  strings are a Unicode type, so this port is always strict: `Cursor.readString`
+  builds the string with a fatal `TextDecoder` and rejects invalid UTF-8 as
+  `INVALID_MSG`. A visitor `string` chunk is *raw wire bytes* and is not
+  validated — it may even end mid-code-point — so a visitor that materializes one
+  itself owns that check and must use `new TextDecoder("utf-8", { fatal: true })`.
+  The default `TextDecoder` silently substitutes `U+FFFD`, which the format
+  forbids in either direction; the encoder likewise refuses an unpaired surrogate
+  with `ARGUMENT` rather than replacing it.
 
 ### Decode limits
 
