@@ -33,6 +33,3 @@ export { Cursor } from "./decode/cursor.js";
 export { getKernel, setKernel } from "./backend/kernel.js";
 export type { Kernel } from "./backend/kernel.js";
 export { jsKernel } from "./backend/js.js";
-export { loadNativeKernel } from "./backend/native.js";
-export { loadWasmKernel } from "./backend/wasm.js";
-export type { WasmKernelFactory } from "./backend/wasm.js";

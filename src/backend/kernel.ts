@@ -4,9 +4,12 @@
  * The encoder's bulk array paths run through a {@link Kernel} — a small set of
  * self-contained, buffer-oriented transforms over a region the caller has
  * already sized. The default {@link "./js"} kernel is pure TypeScript and works
- * everywhere; a C++ (N-API) or WebAssembly build can implement the same
- * interface and be swapped in with {@link setKernel} for a speed-up, with **no
- * change to the public API**. The boundary is deliberately *bulk* (a whole
+ * everywhere, and is the active kernel unless the caller replaces it: no
+ * accelerated build is published, and this interface is the entire seam for one
+ * (#115). A C++ (N-API) or WebAssembly build implements the same interface and
+ * is swapped in with {@link setKernel} — the caller loads its own module and
+ * hands over the kernel it builds — for a speed-up with **no change to the
+ * public API**. The boundary is deliberately *bulk* (a whole
  * array per call, into guaranteed capacity) so the cost of crossing into native
  * code is amortised — never one call per element.
  */
