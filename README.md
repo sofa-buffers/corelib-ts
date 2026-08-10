@@ -73,8 +73,9 @@ on `SofabError.code` (`ARGUMENT`, `USAGE`, `BUFFER_FULL`, `INVALID_MSG`,
 `INVALID_MSG` is a message malformed regardless of what follows, while
 `INCOMPLETE` means the bytes merely ended *inside* a field — a truncation more
 bytes could complete, which is not an error the caller must treat as one. There
-is no finish/finalize step: a streaming decode reports `INCOMPLETE` from `end()`
-(see below), never by promoting it to a throw.
+is no finish/finalize step: every streaming `feed()` *returns* the decode outcome
+for the bytes so far (see below), so `INCOMPLETE` is reported to the caller,
+never promoted to a throw.
 
 ### Serialize
 
@@ -239,9 +240,11 @@ subtype on `fixlenBegin`, a declared length or element count on `fixlenBegin` /
 ### Deserialize stream
 
 `IStream` resumes across chunk boundaries, so feed it whatever the transport hands
-you — from any source — and read the outcome from `end()`. String / blob payloads
-arrive as one or more chunks tagged with the field's `total` length and byte
-`offset`:
+you — from any source — and read the outcome from what `feed()` **returns**: the
+three-valued status for the bytes consumed so far (CORELIB_PLAN §5.2/§6). There is
+no end / finalize step; `status()` re-reads that same value whenever you want it
+later. String / blob payloads arrive as one or more chunks tagged with the field's
+`total` length and byte `offset`:
 
 ```ts
 import { IStream, DecodeStatus, type Visitor } from "@sofa-buffers/corelib";
@@ -253,19 +256,28 @@ const visitor: Visitor = {
 };
 
 const is = new IStream();
-for await (const chunk of source) is.feed(chunk, visitor); // any async byte source
-// end() is a pure accessor — it never throws and never promotes an incomplete
-// decode to an error (MESSAGE_SPEC §7). The caller owns end-of-input.
-if (is.end() !== DecodeStatus.Complete) {
+let status = DecodeStatus.Complete;               // zero bytes end on a boundary
+for await (const chunk of source) {
+  status = is.feed(chunk, visitor);               // any async byte source
+}
+// feed() never throws for a merely incomplete decode and never promotes one to
+// an error (MESSAGE_SPEC §7). The caller owns end-of-input.
+if (status !== DecodeStatus.Complete) {
   // stream ended inside a field (INCOMPLETE) — wait for more bytes, or treat
   // the truncation as an error if this really was the end of input.
 }
 ```
 
+`status()` returns exactly what the last `feed()` returned, for a caller that
+would rather ask later than thread the value through — it is a pure accessor and
+never changes the verdict. (`end()` is a deprecated alias of `status()`, kept so
+existing code compiles; the spec's decoder has no "end" step.)
+
 `INVALID` is **terminal** (CORELIB_PLAN §5.2): no later bytes can make malformed
-input valid. A stream that has thrown `INVALID_MSG` from `feed` is therefore
+input valid. `INVALID` is the one outcome `feed()` does not return: it travels on
+the error channel, as a thrown `INVALID_MSG`. A stream that has thrown it is
 poisoned for good — every further `feed` re-throws it without consuming a byte or
-calling the visitor, and `end()` answers `INVALID` however many well-formed
+calling the visitor, and `status()` answers `INVALID` however many well-formed
 chunks follow. So a caller that catches the throw and keeps going still gets a
 truthful verdict:
 
@@ -278,7 +290,7 @@ try {
 } catch (e) {
   if ((e as SofabError).code !== SofabErrorCode.InvalidMsg) throw e;
 }
-is.end(); // INVALID — never COMPLETE, never INCOMPLETE
+is.status(); // INVALID — never COMPLETE, never INCOMPLETE
 ```
 
 A receiver-side cap (`LIMIT_EXCEEDED`, see [Decode limits](#decode-limits)) does

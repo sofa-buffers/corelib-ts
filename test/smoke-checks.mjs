@@ -124,10 +124,13 @@ export function runChecks(api, label) {
   check("nested-sequence field routed to child visitor", got.nested === 99);
 
   // --- chunked (streaming) decode, one byte at a time ---
-  check("streaming decode reaches end() cleanly", (() => {
+  check("streaming feed() returns COMPLETE on the last byte", (() => {
     const is = new IStream();
-    for (let i = 0; i < bytes.length; i++) is.feed(bytes.subarray(i, i + 1), {});
-    try { is.end(); return true; } catch { return false; }
+    let last;
+    for (let i = 0; i < bytes.length; i++) last = is.feed(bytes.subarray(i, i + 1), {});
+    // No end step: the status feed() returns *is* the answer (CORELIB_PLAN
+    // §5.2); status() — and its deprecated end() alias — re-read the same value.
+    return last === "COMPLETE" && is.status() === "COMPLETE" && is.end() === "COMPLETE";
   })());
 
   return failures;

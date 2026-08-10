@@ -124,10 +124,12 @@ export const MAX_DEPTH = 255;
  * - `Invalid` — the bytes are malformed regardless of what follows. **Terminal**
  *   (CORELIB_PLAN §5.2): no later bytes can undo it.
  *
- * {@link IStream.end} returns `Complete` or `Incomplete` while the stream is
- * healthy; an `Invalid` message throws from {@link IStream.feed} *and* latches
- * there, so `end()` reports `Invalid` from then on and every further `feed`
- * re-throws without consuming input. The one-shot {@link decode} /
+ * {@link IStream.feed} *returns* `Complete` or `Incomplete` while the stream is
+ * healthy — the caller needs no end step (CORELIB_PLAN §6) — and
+ * {@link IStream.status} re-reads that same value at any point. An `Invalid`
+ * message throws from `feed` *and* latches there, so `status()` reports
+ * `Invalid` from then on and every further `feed` re-throws without consuming
+ * input. The one-shot {@link decode} /
  * {@link Cursor} path signals `Incomplete` and `Invalid` by throwing a
  * {@link SofabError} whose `code` is {@link SofabErrorCode.Incomplete} or
  * {@link SofabErrorCode.InvalidMsg}, and `Complete` by returning normally.
