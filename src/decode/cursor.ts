@@ -659,7 +659,8 @@ export class Cursor {
   /**
    * Read an array fixlen element header (count + element type); returns the
    * count. When a `schemaCount` is given, a count above it is a schema-bound
-   * violation and is rejected as `INVALID` — see below.
+   * violation and is rejected as `INVALID` — but only once the element word has
+   * arrived and agreed, per the §4.8 decode order below.
    */
   private arrayFixlenHeader(
     wantSub: number,
@@ -678,15 +679,11 @@ export class Cursor {
     // (corelib-ts#51, follow-up to #49).
     this.readVarint();
     const count = this.num();
+    // The format ceiling belongs to the count word and fires there "whatever the
+    // subtype turns out to be" (§4.8) — it bounds the *format*, not this field.
     if (count > ARRAY_MAX) throw invalidMsgError("array count out of range");
-    // §5.2/§7 (corelib-ts#69): as in {@link arrayCount}, a count above the
-    // field's schema capacity is INVALID and dominates both the LIMIT_EXCEEDED
-    // cap and the truncated-array INCOMPLETE guard below. A coincident malformed
-    // element word is likewise INVALID, so the outcome is unaffected by checking
-    // the count before the element word is read.
-    if (schemaCount !== undefined && count > schemaCount) {
-      throw invalidMsgError("array count above schema capacity");
-    }
+    // Likewise the receiver cap: §6.2.1 requires it at the count header, before
+    // the allocation it exists to prevent.
     if (count > this.maxArrayCount) {
       throw limitExceededError(
         `array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`,
@@ -697,6 +694,21 @@ export class Cursor {
     const size = this.upper();
     if (sub !== wantSub || size !== wantSize) {
       throw invalidMsgError("invalid fixlen array element type");
+    }
+    // §4.8 normative decode order — both words, then the subtype, then the
+    // *schema* bound (MESSAGE_SPEC §7.1). It cannot move any earlier: the two
+    // words answer to different authorities, and until the element word has
+    // shown the subtype the decoder does not yet know the field is this array at
+    // all — a contradicting subtype means the bytes were never this field's
+    // value, so their element count is not this field's count. §4.8 calls the
+    // consequence intended: a message ending *between* the two words is
+    // INCOMPLETE, not INVALID, even when the count already exceeds the schema
+    // capacity, because those bytes are not malformed regardless of what follows
+    // (§5.2). Checking here keeps that, and still dominates the truncated-array
+    // INCOMPLETE guard below, which is what corelib-ts#69 was about
+    // (corelib-ts#104).
+    if (schemaCount !== undefined && count > schemaCount) {
+      throw invalidMsgError("array count above schema capacity");
     }
     // Part A hardening (corelib-ts#38): now the element size is known, a fixlen
     // array needs count * size payload bytes; a count claiming more than the

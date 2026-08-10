@@ -53,6 +53,29 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Fixed
 
+- **A fixlen array's schema `count` was applied before its `fixlen_word`, so a
+  message cut between the two words was `INVALID` where `INCOMPLETE` is
+  required** (#104). CORELIB_PLAN §4.8 fixes the decode order — `element_count`
+  under the *format* ceiling `ARRAY_MAX`, then the `fixlen_word`, then the
+  subtype, and only then the *schema* `count` (MESSAGE_SPEC §7.1) — because the
+  two words answer to different authorities: until the element word has shown the
+  subtype, a decoder does not know the field is this array at all, and a
+  contradicting subtype means its element count was never this field's count.
+  §4.8 calls the consequence intended: "a message that ends **between** the two
+  words is `INCOMPLETE`, not `INVALID`, even when the `element_count` already
+  exceeds the schema `count`". `Cursor.arrayFixlenHeader` ran the schema check at
+  the count word, so `05 05 80` (count 5 against a schema `count` of 2, element
+  word truncated after its first byte), `05 05 a0` and `05 05` all threw
+  `INVALID_MSG` — disagreeing with `decode()` / `IStream`, which report
+  `INCOMPLETE` for the same bytes. The check now sits after the element word and
+  its subtype/size validation, for `readFp32Array`, `readFp32ArrayRaw` and
+  `readFp64Array`. Everything the count word does decide is unmoved: `ARRAY_MAX`
+  still fires there "whatever the subtype turns out to be" (§4.8), and the
+  `maxArrayCount` receiver cap still fires there, before the allocation §6.2.1
+  requires it to prevent. A complete, agreeing element word still yields
+  `INVALID` for an over-count array — including when the payload behind it is
+  truncated (#69) — and integer arrays (§4.7) are untouched: they carry no second
+  word, so their count word is the deciding word.
 - **`IStream` never latched `INVALID`, so `end()` could answer `COMPLETE` after
   a malformed feed** (#103). CORELIB_PLAN §5.2 makes `INVALID` *terminal* — "the
   bytes are malformed regardless of what follows … no — terminal" — and forbids
