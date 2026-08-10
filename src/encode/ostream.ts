@@ -1,21 +1,28 @@
 /**
  * The SofaBuffers encoder.
  *
- * `OStream` writes fields into a byte buffer. Two modes:
+ * `OStream` writes fields into a **caller-supplied** byte buffer — the corelib
+ * allocates no output buffer and never grows or reallocates one it was handed
+ * (CORELIB_PLAN §5.1). Two ways to drive it:
  *
- * - **In-memory** (`new OStream()`): an auto-growing buffer; call
- *   {@link OStream.bytes} for the finished message.
- * - **Streaming** (`new OStream(buffer, offset?, flush?)`): writes into a
- *   caller-provided buffer and, when it fills, hands the produced bytes to the
- *   `flush` sink and continues — so the buffer can be arbitrarily smaller than
- *   the message, **down to a single byte** (CORELIB_PLAN §5.1): no single write
- *   requires contiguous room, a value larger than the buffer is split across
- *   flushes, and the bytes produced are identical either way — which is why this
- *   port declares {@link MIN_OUTPUT_BUFFER} = 1, the floor a buffer installed
- *   *with* a sink must clear. `offset` reserves room at the front for a
- *   lower-layer header, and it is `length - offset` that must clear the floor.
- *   Without a `flush` sink there is nowhere to drain to, so no minimum applies
- *   and the buffer must hold the whole message.
+ * - **One-shot** (`new OStream(buffer, offset?)`): the buffer must hold the
+ *   whole message — the size a caller derives from the generated `MAX_SIZE` —
+ *   and a buffer that fills reports `BUFFER_FULL` rather than growing.
+ * - **Streaming** (`new OStream(buffer, offset?, flush?)`): when the buffer
+ *   fills, the produced bytes go to the `flush` sink and encoding continues —
+ *   so the buffer can be arbitrarily smaller than the message, **down to a
+ *   single byte** (§5.1): no single write requires contiguous room, a value
+ *   larger than the buffer is split across flushes, and the bytes produced are
+ *   identical either way — which is why this port declares
+ *   {@link MIN_OUTPUT_BUFFER} = 1, the floor a buffer installed *with* a sink
+ *   must clear. `offset` reserves room at the front for a lower-layer header,
+ *   and it is `length - offset` that must clear the floor. Without a `flush`
+ *   sink there is nowhere to drain to, so no minimum applies.
+ *
+ * Where the message has no schema-derived bound, the allocating half is the
+ * caller's, and {@link growingOStream} builds that caller ready-made: an encoder
+ * over a buffer supplied — and replaced as the message grows — by a
+ * {@link BufferOwner} of its own.
  *
  * Generated code typically writes one field per message field; the methods map
  * one-to-one onto the wire types. Problems throw {@link SofabError}.
@@ -63,8 +70,14 @@ import {
 } from "../varint/num64.js";
 import { encodeZigzagVarintLoHi } from "../varint/zigzag.js";
 import { encodeUtf8, utf8Length, utf8Write } from "./fixlen.js";
-import type { FlushSink } from "./sink.js";
+import type { BufferOwner, FlushSink } from "./sink.js";
 
+/**
+ * Capacity {@link growingOStream} starts from when the caller names none. Only
+ * a starting point: its owner replaces the buffer with a bigger one as the
+ * message grows, so this trades an initial allocation against the number of
+ * replacements, and decides nothing about the bytes.
+ */
 const DEFAULT_CAPACITY = 256;
 
 /**
@@ -97,18 +110,36 @@ function checkHandover(buffer: Uint8Array, offset: number, streaming: boolean): 
 
 /**
  * Encoder for the SofaBuffers wire format. Each `write*` method appends one
- * field and maps one-to-one onto a wire type. Construct it in-memory (an
- * auto-growing buffer, read back with {@link OStream.bytes}) or in streaming
- * mode over a caller-provided buffer that drains to a {@link FlushSink} as it
- * fills, so the message can outgrow the buffer. Invalid arguments and a full
- * buffer with no sink throw {@link SofabError}.
+ * field and maps one-to-one onto a wire type. It writes into the buffer the
+ * caller supplies and into no other: it allocates none of its own and grows
+ * none it was given (CORELIB_PLAN §5.1). Hand it a buffer that holds the whole
+ * message, or one that drains to a {@link FlushSink} as it fills so the message
+ * can outgrow it. Invalid arguments and a full buffer with no sink throw
+ * {@link SofabError}. To let the buffer follow the message instead, encode into
+ * the accumulator {@link growingOStream} builds.
  */
 export class OStream {
-  private buf: Uint8Array;
-  private pos: number;
-  private start: number;
+  // The `!` on the state fields below is the deprecated no-argument
+  // constructor: it returns the accumulator `growingOStream()` builds instead of
+  // `this`, so it is the one path through the constructor that leaves them
+  // unassigned — and the object it leaves behind is discarded unused.
+  private buf!: Uint8Array;
+  private pos!: number;
+  private start!: number;
   private readonly flushSink: FlushSink | undefined;
-  private readonly canGrow: boolean;
+  /**
+   * Who to ask for the next buffer once this one is full — the caller that owns
+   * the storage this encode runs on (CORELIB_PLAN §5.1). Absent on a plain
+   * caller buffer, which is then written exactly as it was handed over.
+   */
+  private readonly owner: BufferOwner | undefined;
+  /**
+   * Whether asking that owner is certain to produce room, so a bulk reserve can
+   * be relied on. Not a mode of the encoder: it only picks between two
+   * implementations of the same bytes — a bulk one that reserves the worst case
+   * up front and a streaming one that emits element by element.
+   */
+  private readonly canGrow!: boolean;
   private depth = 0;
   /**
    * Ids of the innermost open sequences whose header has not been written yet
@@ -133,28 +164,36 @@ export class OStream {
   private pending: number[] | null = null;
   /** Valid entries in {@link OStream.pending}. */
   private nPending = 0;
-  private kernel: Kernel;
+  private kernel!: Kernel;
 
-  /** In-memory encoder backed by an auto-growing buffer. */
+  /**
+   * @deprecated The corelib allocates no output buffer (CORELIB_PLAN §5.1):
+   * this form is a one-release alias for {@link growingOStream} and will be
+   * removed. Supply a buffer — `new OStream(buf, offset?, flush?)` — or, where
+   * the message has no schema-derived bound, call `growingOStream()`, the
+   * caller that owns a buffer on your behalf.
+   */
   constructor();
-  /** Streaming encoder over a caller buffer, optionally draining to `flush`. */
-  constructor(buffer: Uint8Array, offset?: number, flush?: FlushSink);
-  constructor(buffer?: Uint8Array, offset = 0, flush?: FlushSink) {
-    this.kernel = getKernel();
+  /**
+   * Encoder over a caller buffer, optionally draining to `flush` as it fills
+   * and, where the caller owns storage it can enlarge, asking `owner` for the
+   * next buffer instead of reporting `BUFFER_FULL`.
+   */
+  constructor(buffer: Uint8Array, offset?: number, flush?: FlushSink, owner?: BufferOwner);
+  constructor(buffer?: Uint8Array, offset = 0, flush?: FlushSink, owner?: BufferOwner) {
     if (buffer === undefined) {
-      this.buf = new Uint8Array(DEFAULT_CAPACITY);
-      this.start = 0;
-      this.pos = 0;
-      this.flushSink = undefined;
-      this.canGrow = true;
-    } else {
-      checkHandover(buffer, offset, flush !== undefined);
-      this.buf = buffer;
-      this.start = offset;
-      this.pos = offset;
-      this.flushSink = flush;
-      this.canGrow = false;
+      // The allocating half is the caller's, and `growingOStream()` builds that
+      // caller: nothing below this line ever allocates or grows a buffer.
+      return growingOStream();
     }
+    this.kernel = getKernel();
+    checkHandover(buffer, offset, flush !== undefined);
+    this.buf = buffer;
+    this.start = offset;
+    this.pos = offset;
+    this.flushSink = flush;
+    this.owner = owner;
+    this.canGrow = owner !== undefined;
   }
 
   /** Bytes currently held in the buffer (since construction or the last flush). */
@@ -163,9 +202,10 @@ export class OStream {
   }
 
   /**
-   * The encoded message so far, as a view into the working buffer.
-   * Meaningful for the in-memory mode; in streaming mode it is only the
-   * not-yet-flushed tail. The view is valid until the next write.
+   * The encoded message so far, as a view into the working buffer. On a stream
+   * whose buffer follows the message ({@link growingOStream}) that is the whole
+   * message; with a flush sink it is only the not-yet-flushed tail. The view is
+   * valid until the next write.
    */
   bytes(): Uint8Array {
     return this.buf.subarray(this.start, this.pos);
@@ -191,8 +231,21 @@ export class OStream {
    * {@link MIN_OUTPUT_BUFFER} usable bytes (`buffer.length - offset`); a smaller
    * one is rejected here, with {@link SofabErrorCode.Argument}, leaving the
    * encoder on the buffer it already had. A sink-less stream has no minimum.
+   *
+   * A stream whose buffer comes from a {@link BufferOwner} — everything
+   * {@link growingOStream} builds — rejects this outright: its owner supplies
+   * buffers through the grow hook and expects the message so far to still be in
+   * the one it last handed over, so installing a foreign buffer would strand
+   * those bytes. Encode into a plain `new OStream(buffer, offset, flush?)` to
+   * own the buffer yourself.
    */
   setBuffer(buffer: Uint8Array, offset = 0): void {
+    if (this.owner !== undefined) {
+      throw argumentError(
+        "this stream's buffer belongs to its BufferOwner; use " +
+          "new OStream(buffer, offset, flush) to encode into a buffer of your own",
+      );
+    }
     checkHandover(buffer, offset, this.flushSink !== undefined);
     this.buf = buffer;
     this.start = offset;
@@ -277,10 +330,12 @@ export class OStream {
 
   /** Write a UTF-8 string field. */
   writeString(id: number, text: string): void {
-    // Fast path (in-memory, growable buffer): scan the UTF-8 byte length, write
-    // the fixlen header, then encode the characters straight into the output
-    // buffer. This skips `TextEncoder.encode`'s per-call setup + throwaway array
-    // + second copy — the encoder's dominant cost on string-heavy messages.
+    // Fast path (a buffer whose owner enlarges it on demand): scan the UTF-8
+    // byte length, write the fixlen header, then encode the characters straight
+    // into the output buffer. This skips `TextEncoder.encode`'s per-call setup
+    // + throwaway array + second copy — the encoder's dominant cost on
+    // string-heavy messages. An owner that declines the reserve drops through
+    // to the chunk-draining route below, which needs no contiguous room.
     if (this.canGrow) {
       // Pure ASCII — the overwhelmingly common case for keys, identifiers and
       // short text — needs neither of the general helpers: the UTF-8 byte length
@@ -297,11 +352,14 @@ export class OStream {
           throw argumentError(`fixlen length ${n} exceeds ${FIXLEN_MAX}`);
         }
         this.fixlenHead(id, n, FixlenSubtype.String);
-        this.ensure(n);
-        const buf = this.buf;
-        const p = this.pos;
-        for (let k = 0; k < n; k++) buf[p + k] = text.charCodeAt(k);
-        this.pos = p + n;
+        if (this.tryEnsure(n)) {
+          const buf = this.buf;
+          const p = this.pos;
+          for (let k = 0; k < n; k++) buf[p + k] = text.charCodeAt(k);
+          this.pos = p + n;
+          return;
+        }
+        this.writeRaw(encodeUtf8(text));
         return;
       }
 
@@ -310,8 +368,11 @@ export class OStream {
         throw argumentError(`fixlen length ${byteLen} exceeds ${FIXLEN_MAX}`);
       }
       this.fixlenHead(id, byteLen, FixlenSubtype.String);
-      this.ensure(byteLen);
-      this.pos = utf8Write(text, this.buf, this.pos);
+      if (this.tryEnsure(byteLen)) {
+        this.pos = utf8Write(text, this.buf, this.pos);
+        return;
+      }
+      this.writeRaw(encodeUtf8(text));
       return;
     }
     // Streaming path: the payload may outgrow a fixed caller buffer, so keep the
@@ -338,8 +399,7 @@ export class OStream {
   /** Write an array of unsigned integers (each a varint). */
   writeUnsignedArray(id: number, values: ArrayLike<number | bigint>): void {
     this.arrayHead(id, WireType.ArrayUnsigned, values.length);
-    if (this.canGrow) {
-      this.ensure(values.length * VARINT_MAX_BYTES);
+    if (this.reserveBulk(values.length * VARINT_MAX_BYTES)) {
       this.pos = this.kernel.encodeUnsignedVarints(values, this.buf, this.pos);
     } else {
       // Streaming (fixed caller buffer): each element is range-checked and
@@ -360,8 +420,7 @@ export class OStream {
   /** Write an array of signed integers (each zig-zag + varint). */
   writeSignedArray(id: number, values: ArrayLike<number | bigint>): void {
     this.arrayHead(id, WireType.ArraySigned, values.length);
-    if (this.canGrow) {
-      this.ensure(values.length * VARINT_MAX_BYTES);
+    if (this.reserveBulk(values.length * VARINT_MAX_BYTES)) {
       this.pos = this.kernel.encodeSignedVarints(values, this.buf, this.pos);
     } else {
       // See writeUnsignedArray: range-check and split in one round-trip, halves
@@ -382,9 +441,8 @@ export class OStream {
    */
   writeUnsignedArrayLong(id: number, values: readonly Long[]): void {
     this.arrayHead(id, WireType.ArrayUnsigned, values.length);
-    if (this.canGrow) {
+    if (this.reserveBulk(values.length * VARINT_MAX_BYTES)) {
       // One contiguous reserve, then a flat loop over a buffer that cannot move.
-      this.ensure(values.length * VARINT_MAX_BYTES);
       let pos = this.pos;
       const buf = this.buf;
       for (let i = 0; i < values.length; i++) {
@@ -413,8 +471,7 @@ export class OStream {
    */
   writeSignedArrayLong(id: number, values: readonly Long[]): void {
     this.arrayHead(id, WireType.ArraySigned, values.length);
-    if (this.canGrow) {
-      this.ensure(values.length * VARINT_MAX_BYTES);
+    if (this.reserveBulk(values.length * VARINT_MAX_BYTES)) {
       let pos = this.pos;
       const buf = this.buf;
       for (let i = 0; i < values.length; i++) {
@@ -440,8 +497,7 @@ export class OStream {
     // loop below simply runs zero times: the field is [ header ][ count = 0 ]
     // [ fixlen_word ] with no elements.
     this.putVarintNum(4 * 8 + FixlenSubtype.Fp32);
-    if (this.canGrow) {
-      this.ensure(values.length * 4);
+    if (this.reserveBulk(values.length * 4)) {
       this.pos = this.kernel.packFp32Array(values, this.buf, this.pos);
     } else {
       for (let i = 0; i < values.length; i++) this.putFp32(values[i]!);
@@ -474,8 +530,7 @@ export class OStream {
     // loop below simply runs zero times: the field is [ header ][ count = 0 ]
     // [ fixlen_word ] with no elements.
     this.putVarintNum(8 * 8 + FixlenSubtype.Fp64);
-    if (this.canGrow) {
-      this.ensure(values.length * 8);
+    if (this.reserveBulk(values.length * 8)) {
       this.pos = this.kernel.packFp64Array(values, this.buf, this.pos);
     } else {
       for (let i = 0; i < values.length; i++) this.putFp64(values[i]!);
@@ -846,10 +901,7 @@ export class OStream {
     if (this.buf.length - this.pos >= n) return true;
     this.flush();
     if (this.buf.length - this.pos >= n) return true;
-    if (this.canGrow) {
-      this.growTo(this.pos + n);
-      return true;
-    }
+    if (this.grow(n)) return true;
     if (this.flushSink === undefined) {
       throw bufferFullError(
         `output buffer full: need ${n} more bytes, have ${this.buf.length - this.pos}`,
@@ -859,11 +911,24 @@ export class OStream {
   }
 
   /**
+   * Reserve `n` contiguous bytes for a bulk write — the whole payload of an
+   * array or a string, written in one pass into a buffer that cannot move under
+   * it. Only worth attempting where the buffer's owner enlarges it on demand
+   * ({@link canGrow}); every caller has an element-by-element route to fall back
+   * on, which is what an owner that declines gets. On a buffer with neither an
+   * owner nor a sink {@link tryEnsure} reports `BUFFER_FULL`, which is the right
+   * answer there: nothing else can make room.
+   */
+  private reserveBulk(n: number): boolean {
+    return this.canGrow && this.tryEnsure(n);
+  }
+
+  /**
    * Ensure `n` contiguous bytes are free at `pos`; returns `pos` for chaining.
    *
-   * The remaining callers are the ones a split cannot help: the growable
-   * encoder's bulk reserves, where {@link tryEnsure} always succeeds, and the
-   * one-byte sequence-end marker, which is indivisible.
+   * The only remaining caller is the one-byte sequence-end marker, which is
+   * indivisible: there is no smaller piece to split it into, so a buffer that
+   * cannot take it has nothing left to report but `BUFFER_FULL`.
    */
   private ensure(n: number): number {
     if (!this.tryEnsure(n)) {
@@ -881,22 +946,86 @@ export class OStream {
       this.flush();
       room = this.buf.length - this.pos;
       if (room === 0) {
-        if (this.canGrow) {
-          this.growTo(this.pos + want);
-          room = this.buf.length - this.pos;
-        } else {
-          throw bufferFullError("output buffer full");
-        }
+        if (!this.grow(want)) throw bufferFullError("output buffer full");
+        room = this.buf.length - this.pos;
       }
     }
     return Math.min(room, want);
   }
 
-  private growTo(needed: number): void {
-    let cap = this.buf.length * 2;
-    if (cap < needed) cap = needed;
-    const next = new Uint8Array(cap);
-    next.set(this.buf.subarray(0, this.pos));
+  /**
+   * Ask the buffer's **owner** for a buffer with room for `n` more bytes at
+   * `pos`; `true` once one is installed. The corelib allocates no output buffer
+   * of its own and never enlarges the one it was handed (CORELIB_PLAN §5.1), so
+   * where the caller named no owner the answer is always `no` and what does not
+   * fit is flushed or reported instead.
+   *
+   * A replacement too short for `pos + n` is treated as a refusal: the encoder
+   * never writes past the end of a buffer it was given, and an out-of-range
+   * write on a `Uint8Array` is silently dropped rather than caught, so this test
+   * is what keeps a mistaken owner from losing bytes.
+   */
+  private grow(n: number): boolean {
+    const owner = this.owner;
+    if (owner === undefined) return false;
+    const next = owner(this.buf, this.pos, n);
+    if (next === undefined || next.length - this.pos < n) return false;
     this.buf = next;
+    return true;
   }
+}
+
+/**
+ * The doubling accumulator {@link growingOStream} installs: hand back a buffer
+ * twice the size (or as much more as the reserve needs) with the message copied
+ * in. Module-level and stateless — everything it needs is in its arguments — so
+ * an accumulating encoder costs no closure and no extra object.
+ */
+const growOwner: BufferOwner = (current, used, needed) => {
+  let cap = current.length * 2;
+  if (cap < used + needed) cap = used + needed;
+  const next = new Uint8Array(cap);
+  next.set(current.subarray(0, used));
+  return next;
+};
+
+/**
+ * An {@link OStream} whose **buffer follows the message** — the ready-made form
+ * of the caller CORELIB_PLAN §5.1 puts the allocation in.
+ *
+ * §5.1 is explicit that the corelib allocates no output buffer: "the
+ * generated-object layer allocates; the corelib does not", installing storage it
+ * sized from the schema and driving the encoder "over a buffer it supplies like
+ * any other caller". Where the schema bounds the message, that storage is one
+ * `MAX_SIZE` buffer and a plain `new OStream(buf)` is the whole story. Where it
+ * does not, sizing from a ceiling would truncate the first message that exceeds
+ * it, so the caller keeps a buffer of its own and enlarges it as the message
+ * grows. This builds that caller — an encoder over a buffer supplied, and
+ * replaced when it fills, by the doubling {@link BufferOwner} below — so that
+ * neither generated code nor a hand-written one-shot encode has to write it
+ * again.
+ *
+ * It is the one-liner for the 90% case, where the message comfortably fits in
+ * memory:
+ *
+ * ```ts
+ * const os = growingOStream();
+ * os.writeUnsigned(1, 42);
+ * const wire = os.bytes();   // the whole message, as a view valid until the next write
+ * ```
+ *
+ * {@link OStream.bytes} is therefore the **whole** message here rather than a
+ * not-yet-flushed tail, and no write reports `BUFFER_FULL`. The buffer belongs
+ * to the owner, so {@link OStream.setBuffer} is refused on such a stream: a
+ * caller that wants to supply the buffer wants a plain `new OStream(buffer)`.
+ *
+ * @param initialCapacity bytes to start from; the buffer is replaced with a
+ * bigger one whenever the message outgrows it, so this only trades an initial
+ * allocation against the number of replacements and never limits the message.
+ */
+export function growingOStream(initialCapacity = DEFAULT_CAPACITY): OStream {
+  if (!Number.isInteger(initialCapacity) || initialCapacity < 1) {
+    throw argumentError(`initial capacity ${initialCapacity} must be a positive integer`);
+  }
+  return new OStream(new Uint8Array(initialCapacity), 0, undefined, growOwner);
 }

@@ -11,7 +11,7 @@
  * throughputs side by side. Run with: `npm run bench:bound` / `tsx bench/bound.ts`.
  */
 
-import { Cursor, OStream } from "../src/index.js";
+import { Cursor, OStream, growingOStream } from "../src/index.js";
 import { MIN_SECONDS, WARMUP, cpuNow, sink } from "./common.js";
 
 const N = 1000;
@@ -19,7 +19,7 @@ const GOLDEN = 0x9e37_79b9_7f4a_7c15n;
 const MASK64 = (1n << 64n) - 1n;
 
 function encode(write: (os: OStream) => void): Uint8Array {
-  const os = new OStream();
+  const os = growingOStream();
   write(os);
   return os.bytes().slice();
 }

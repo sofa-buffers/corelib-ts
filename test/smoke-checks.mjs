@@ -14,7 +14,7 @@
  * @returns {number} number of failed checks (0 = all good)
  */
 export function runChecks(api, label) {
-  const { OStream, IStream, decode } = api;
+  const { OStream, growingOStream, IStream, decode } = api;
 
   let failures = 0;
   function check(name, cond) {
@@ -29,11 +29,14 @@ export function runChecks(api, label) {
 
   console.log(`\n[${label}]`);
 
-  check("exports the public API", typeof OStream === "function" && typeof IStream === "function" && typeof decode === "function");
+  check(
+    "exports the public API",
+    typeof OStream === "function" && typeof growingOStream === "function" && typeof IStream === "function" && typeof decode === "function",
+  );
   if (failures > 0) return failures; // nothing below can run
 
   // --- encode a message exercising every wire type ---
-  const os = new OStream();
+  const os = growingOStream();
   os.writeUnsigned(1, 42); // small -> number on decode
   os.writeUnsigned(2, 2n ** 60n); // large -> bigint on decode
   os.writeSigned(3, -7);
@@ -72,7 +75,7 @@ export function runChecks(api, label) {
   if (stringBytes) got.str7 = new TextDecoder().decode(stringBytes);
 
   check("round-trips byte-for-byte (decode -> re-encode)", (() => {
-    const out = new OStream();
+    const out = growingOStream();
     const transcode = {
       unsigned: (id, v) => out.writeUnsigned(id, v),
       signed: (id, v) => out.writeSigned(id, v),

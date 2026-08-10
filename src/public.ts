@@ -22,8 +22,8 @@ export {
 export { SofabError, SofabErrorCode } from "./errors.js";
 
 export { Long } from "./long.js";
-export { OStream } from "./encode/ostream.js";
-export type { FlushSink } from "./encode/sink.js";
+export { OStream, growingOStream } from "./encode/ostream.js";
+export type { BufferOwner, FlushSink } from "./encode/sink.js";
 
 export { IStream, decode } from "./decode/istream.js";
 export type { Visitor } from "./decode/istream.js";
