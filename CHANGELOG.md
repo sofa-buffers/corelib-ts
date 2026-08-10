@@ -746,6 +746,45 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
   no-callbacks-after-poisoning guarantee, and the two controls that must stay
   unaffected: a well-formed stream still reaching `COMPLETE` / `INCOMPLETE`, and
   a `LIMIT_EXCEEDED` rejection not poisoning the stream.
+- `utf8-late-offset.test.ts` closes the coverage gap the shared `invalid_utf8`
+  vectors leave open: every one of them puts its string at buffer offset 2 with a
+  1–4 byte payload, so a validator given a *length* where an exclusive *end
+  index* was wanted still rejects them and a full conformance run stays green
+  while the check is broken (that is how a `.length`-for-`end` bug survived
+  conformance in a sibling port). The whole negative suite is replayed behind a
+  96-byte pad, so each payload starts at an offset **at or beyond its own
+  length**, and again through a `Uint8Array` at a non-zero `byteOffset` into a
+  larger `ArrayBuffer`. The controls are what make it a validation test rather
+  than a blanket-rejection test: a *valid* string at the same late offset decodes
+  to the exact text, a skipped invalid one is not validated at all (§6.4) and
+  stays `COMPLETE`, streaming chunks still report field-relative offsets, and a
+  late invalid payload cut short is `INCOMPLETE`, not `INVALID`.
+- `istream.malformed.test.ts` gives the resumable decoder the malformed-input
+  coverage the vectors cannot: an `array<fixlen>` element word that is neither
+  `fp32`/4 nor `fp64`/8 (including on an empty array, where that word is the only
+  carrier of the element kind), a fixlen length word above `FIXLEN_MAX` — which
+  must be `INVALID` even though its payload is missing, with the `FIXLEN_MAX`
+  control one count lower staying `INCOMPLETE` — and a varint past the 10-byte /
+  64-bit bound fed at *every* split point, which is what forces the resumable
+  ladder and the ten-bytes-in-hand fast path to agree (§5.2 / §6.4: a chunk
+  boundary must not change the verdict). Also the varint length ladder 1..10 read
+  identically whole, one byte at a time and by `decode()`, and an unclosed
+  sequence reported as `INCOMPLETE` on all three surfaces.
+- `encode-guards.test.ts` covers the encoder's caller-side contract, which no
+  vector can reach: buffer handover validated where it happens (§5.1 — an offset
+  outside the buffer rejected at the constructor and at `setBuffer`, with the
+  rejected call leaving the encoder on its old buffer), `element_count` above
+  `ARRAY_MAX` and an fp32 raw payload that is not a whole number of elements
+  refused before a byte is written, the indivisible one-byte sequence-end marker
+  reporting `BUFFER_FULL`, an unmatched end unable to underflow the depth counter
+  past `MAX_DEPTH`, and the per-element 64-bit range check on the *streaming*
+  array route — a second implementation of the bulk kernel's, previously
+  untested.
+- `utf8-writer.test.ts` drives `utf8Length` / `utf8Write` directly. `writeString`
+  sizes before it writes, so the writer's own unpaired-surrogate rejections are
+  unreachable through the public API — and that is the point: they are the second
+  half of a two-pass invariant, and dropping the pre-pass would start emitting
+  `U+FFFD` (which §8 forbids) with the public suite still green.
 
 ## [0.10.0] - 2026-08-01
 

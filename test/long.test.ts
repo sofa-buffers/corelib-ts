@@ -25,6 +25,25 @@ describe("Long", () => {
     expect(Long.fromValue(42n).toBigInt()).toBe(42n);
     expect(Long.fromValue(42).toBigInt()).toBe(42n);
   });
+
+  it("fromNumber truncates toward zero rather than rounding", () => {
+    expect(Long.fromNumber(3.9).toBigInt()).toBe(3n);
+    expect(Long.fromNumber(-3.9).toBigInt(true)).toBe(-3n);
+  });
+
+  it("toString reads the high bit as two's complement only when asked", () => {
+    // The one place a Long's *interpretation* shows: the same 64 bits are
+    // 2^64-1 unsigned and -1 signed, and a Long carries no signedness of its own.
+    const allOnes = Long.fromBigInt(0xffff_ffff_ffff_ffffn);
+    expect(allOnes.toString()).toBe("18446744073709551615");
+    expect(allOnes.toString(true)).toBe("-1");
+
+    expect(Long.fromBigInt(I64[0]!).toString(true)).toBe("-9223372036854775807");
+    expect(Long.fromBigInt(0n).toString()).toBe("0");
+    expect(Long.fromBigInt(0x7fff_ffff_ffff_ffffn).toString(true)).toBe(
+      "9223372036854775807",
+    );
+  });
 });
 
 describe("*ArrayLong wire compatibility", () => {
