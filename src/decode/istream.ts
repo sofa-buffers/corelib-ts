@@ -138,6 +138,13 @@ export class IStream {
    * {@link SofabError} (`INVALID_MSG`) only if the bytes are *malformed*;
    * running out of bytes mid-field is not an error — it simply suspends until
    * the next chunk (see {@link end}).
+   *
+   * That `INVALID_MSG` is **terminal** (§5.2): the stream latches it, so a
+   * caller that catches the throw and feeds on gets the same error again from
+   * every later call — no further byte is consumed and no visitor method is
+   * invoked. A receiver-limit rejection (`LIMIT_EXCEEDED`, {@link DecodeLimits})
+   * does *not* latch: the bytes are well-formed, and it is a policy rejection
+   * rather than the `INVALID` outcome.
    */
   feed(chunk: Uint8Array, visitor: Visitor): void {
     this.state.push(chunk, visitor);
@@ -148,12 +155,15 @@ export class IStream {
    * final {@link feed}: returns {@link DecodeStatus.Complete} at a clean field
    * boundary, or {@link DecodeStatus.Incomplete} if the last chunk ended inside
    * a field (a partial varint, an unfinished payload / array, or a still-open
-   * nested sequence).
+   * nested sequence). Once the input has been proved malformed it returns
+   * {@link DecodeStatus.Invalid} — permanently, since `INVALID` is terminal and
+   * outranks `INCOMPLETE` (§5.2); that is the only way this reports a message
+   * {@link feed} already threw on.
    *
    * Per the finish-less spec (MESSAGE_SPEC §7) this is a pure accessor: it never
    * throws and never promotes an incomplete decode to an error — the caller owns
    * end-of-input and decides whether a trailing `Incomplete` is a truncation
-   * error. (A *malformed* message has already thrown from {@link feed}.)
+   * error.
    */
   end(): DecodeStatus {
     return this.state.finish();

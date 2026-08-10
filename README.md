@@ -204,6 +204,30 @@ if (is.end() !== DecodeStatus.Complete) {
 }
 ```
 
+`INVALID` is **terminal** (CORELIB_PLAN §5.2): no later bytes can make malformed
+input valid. A stream that has thrown `INVALID_MSG` from `feed` is therefore
+poisoned for good — every further `feed` re-throws it without consuming a byte or
+calling the visitor, and `end()` answers `INVALID` however many well-formed
+chunks follow. So a caller that catches the throw and keeps going still gets a
+truthful verdict:
+
+```ts
+import { SofabError, SofabErrorCode } from "@sofa-buffers/corelib";
+
+const is = new IStream();
+try {
+  for await (const chunk of source) is.feed(chunk, visitor);
+} catch (e) {
+  if ((e as SofabError).code !== SofabErrorCode.InvalidMsg) throw e;
+}
+is.end(); // INVALID — never COMPLETE, never INCOMPLETE
+```
+
+A receiver-side cap (`LIMIT_EXCEEDED`, see [Decode limits](#decode-limits)) does
+*not* poison the stream: the bytes are well-formed and the same message decodes
+under a looser limit (§6.2.1), so it is a policy rejection, not the `INVALID`
+outcome.
+
 ### Code generator
 
 `sofabgen` compiles a schema to one class per message with a `marshal` (chaining
@@ -286,7 +310,9 @@ the visitor — by throwing `SofabError` with code
 is independent, and an omitted one means **no cap** (the default is today's
 unlimited behavior — the corelib invents no default). `LimitExceeded` is distinct
 from `INVALID_MSG`: exceeding a receiver-configured limit is policy, not a
-malformed message. Generated code supplies these values from the sofabgen config.
+malformed message — so, unlike `INVALID_MSG`, it does not poison an `IStream`
+(see [Deserialize stream](#deserialize-stream)). Generated code supplies these
+values from the sofabgen config.
 
 ## Feature flags
 
