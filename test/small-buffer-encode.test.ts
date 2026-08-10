@@ -8,13 +8,19 @@
  * the minimum workable buffer size data-dependent (corelib-ts#94). An encoder
  * must instead be able to split a single write across a flush.
  *
- * §7.2 item 4 asks for the one-byte buffer specifically, and the sweep below
- * goes wider on purpose: 1, 2, 3, 5, 8 and 16 all fail the same way today, but a
- * fix that special-cased 1 would pass a 1-only test and still break at 3.
+ * §7.2 item 4 asks for a buffer of exactly `MIN_OUTPUT_BUFFER` bytes — `1` on
+ * this port, which splits every atomic unit — and the sweep below goes wider on
+ * purpose: 1, 2, 3, 5, 8 and 16 all failed the same way once, but a fix that
+ * special-cased 1 would pass a 1-only test and still break at 3.
+ *
+ * The same item asks for the constant's two edges: a buffer one byte short of it
+ * is rejected **where it is handed over** when a flush sink is installed, and the
+ * very same buffer is accepted when there is none — the minimum is a streaming
+ * constant and must not become a floor on the one-shot `MAX_SIZE` path (§5.1).
  */
 
 import { describe, expect, it } from "vitest";
-import { Long, OStream } from "../src/index.js";
+import { Long, MIN_OUTPUT_BUFFER, OStream, SofabError, SofabErrorCode } from "../src/index.js";
 
 /** Encode through a fixed caller buffer of `size`, collecting everything flushed. */
 function streamed(size: number, write: (os: OStream) => void, offset = 0): number[] {
@@ -34,7 +40,7 @@ function grown(write: (os: OStream) => void): number[] {
   return Array.from(os.bytes());
 }
 
-const SIZES = [1, 2, 3, 5, 8, 16, 64];
+const SIZES = [MIN_OUTPUT_BUFFER, 2, 3, 5, 8, 16, 64];
 
 /** The corpus: every writer that reserves a fixed-width run of bytes. */
 const CASES: Array<[string, (os: OStream) => void]> = [
@@ -128,11 +134,12 @@ describe("encoding through a buffer smaller than a single write (§5.1)", () => 
   });
 
   it("reports a full buffer for a zero-length one rather than spinning", () => {
-    // The degenerate case below the §5.1 floor: no byte can ever be written, so
-    // the byte-at-a-time path must terminate with BufferFull, not loop. The
-    // sequence-end marker is the same case for the one write that is
+    // The degenerate case below the §5.1 floor, on the path where it is legal:
+    // with no sink there is no minimum, so a zero-byte buffer is accepted and
+    // the byte-at-a-time path must terminate with BufferFull rather than loop.
+    // The sequence-end marker is the same case for the one write that is
     // indivisible — a single byte has nothing to split.
-    const os = new OStream(new Uint8Array(0), 0, () => {});
+    const os = new OStream(new Uint8Array(0));
     expect(() => os.writeUnsigned(1, 1)).toThrow(/output buffer full/);
     expect(() => os.writeSequenceEnd()).toThrow(/output buffer full/);
   });
@@ -142,5 +149,98 @@ describe("encoding through a buffer smaller than a single write (§5.1)", () => 
     // for the value is still an error — and it must be the same BufferFull one.
     const os = new OStream(new Uint8Array(2));
     expect(() => os.writeFp64(1, 3.5)).toThrow(/output buffer full/);
+  });
+});
+
+/** Run `fn` and return the SofabError code it throws (or fail). */
+function codeOf(fn: () => unknown): string {
+  try {
+    fn();
+  } catch (e) {
+    if (e instanceof SofabError) return e.code;
+    throw e;
+  }
+  throw new Error("expected a SofabError, but nothing was thrown");
+}
+
+/** One byte short of the declared minimum — zero usable bytes on this port. */
+const UNDERSIZED = MIN_OUTPUT_BUFFER - 1;
+
+describe("MIN_OUTPUT_BUFFER (§5.1)", () => {
+  it("is declared, at most 20, and is this port's true value", () => {
+    // A port that splits every atomic unit declares 1, and the sweep above
+    // proves that at `SIZES[0]` across the whole writer corpus.
+    expect(MIN_OUTPUT_BUFFER).toBeGreaterThanOrEqual(1);
+    expect(MIN_OUTPUT_BUFFER).toBeLessThanOrEqual(20);
+    expect(MIN_OUTPUT_BUFFER).toBe(1);
+  });
+
+  it("rejects an undersized buffer installed with a sink, at the constructor", () => {
+    // Rejected where it is handed over, by the same mechanism as an
+    // out-of-range offset — not partway through a message via BufferFull.
+    expect(codeOf(() => new OStream(new Uint8Array(UNDERSIZED), 0, () => {})))
+      .toBe(SofabErrorCode.Argument);
+  });
+
+  it("measures the window from the offset, not the buffer length", () => {
+    // `offset` reserves room at the front, so what binds is `buflen - offset`:
+    // a roomy buffer handed over with an offset that leaves too little is just
+    // as undersized as a short one.
+    const buf = new Uint8Array(64);
+    expect(codeOf(() => new OStream(buf, buf.length - UNDERSIZED, () => {})))
+      .toBe(SofabErrorCode.Argument);
+    // One byte more of window is at the minimum and must work.
+    expect(() => new OStream(buf, buf.length - MIN_OUTPUT_BUFFER, () => {})).not.toThrow();
+  });
+
+  it("rejects an undersized buffer at a mid-stream setBuffer", () => {
+    const os = new OStream(new Uint8Array(8), 0, () => {});
+    expect(codeOf(() => os.setBuffer(new Uint8Array(UNDERSIZED))))
+      .toBe(SofabErrorCode.Argument);
+    const buf = new Uint8Array(8);
+    expect(codeOf(() => os.setBuffer(buf, buf.length - UNDERSIZED)))
+      .toBe(SofabErrorCode.Argument);
+  });
+
+  it("leaves the encoder on its old buffer when a setBuffer is rejected", () => {
+    // "never partway through a message": the rejected hand-over must not have
+    // swapped anything, so the stream keeps encoding into what it already had.
+    const out: number[] = [];
+    const os = new OStream(new Uint8Array(64), 0, (b) => out.push(...b));
+    os.writeUnsigned(1, 42);
+    expect(codeOf(() => os.setBuffer(new Uint8Array(UNDERSIZED))))
+      .toBe(SofabErrorCode.Argument);
+    os.writeString(2, "hello, world");
+    os.flush();
+    expect(out).toEqual(grown((o) => {
+      o.writeUnsigned(1, 42);
+      o.writeString(2, "hello, world");
+    }));
+  });
+
+  it("imposes no floor on a buffer installed without a sink", () => {
+    // The converse half of §7.2 item 4: the same undersized buffer is accepted
+    // when no sink is installed — no flush can occur, so nothing can be split
+    // and the constant has nothing to say. This is the `MAX_SIZE` case and it
+    // stays exact.
+    const os = new OStream(new Uint8Array(UNDERSIZED));
+    expect(os.bytes().length).toBe(0); // the empty message fits, and encodes
+
+    const buf = new Uint8Array(64);
+    expect(() => new OStream(buf, buf.length - UNDERSIZED)).not.toThrow();
+    expect(() => new OStream(buf, buf.length)).not.toThrow();
+
+    // A sink-less stream may also be handed an undersized buffer mid-stream.
+    const os2 = new OStream(new Uint8Array(8));
+    expect(() => os2.setBuffer(new Uint8Array(UNDERSIZED))).not.toThrow();
+  });
+
+  it("encodes a message into a sink-less buffer sized exactly to it", () => {
+    // Exactness on the one-shot path: two bytes of message into two bytes of
+    // buffer, whatever the streaming minimum happens to be.
+    const buf = new Uint8Array(2);
+    const os = new OStream(buf);
+    os.writeUnsigned(1, 1);
+    expect(Array.from(os.bytes())).toEqual([0x08, 0x01]);
   });
 });

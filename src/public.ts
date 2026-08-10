@@ -13,6 +13,7 @@ export {
   FIXLEN_MAX,
   ARRAY_MAX,
   MAX_DEPTH,
+  MIN_OUTPUT_BUFFER,
   U64_MAX,
   I64_MIN,
   I64_MAX,
