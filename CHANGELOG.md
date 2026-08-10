@@ -53,6 +53,26 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Fixed
 
+- **`IStream` never latched `INVALID`, so `end()` could answer `COMPLETE` after
+  a malformed feed** (#103). CORELIB_PLAN §5.2 makes `INVALID` *terminal* — "the
+  bytes are malformed regardless of what follows … no — terminal" — and forbids
+  reporting `INCOMPLETE` (let alone `COMPLETE`) for input already determined to
+  be malformed. `DecoderState` kept no error state: `feed` threw `INVALID_MSG`
+  and left the machine fully usable, and `end()` decided purely from the
+  resumable parser's position, so a caller that caught the throw and kept
+  feeding was told `COMPLETE` for a message the decoder had already rejected
+  (`00 2a 07 08 01` — a valid field, a sequence end with no open sequence, a
+  valid field). The verdict now outlives the throw: every malformed-input
+  rejection in the state machine goes through one `fail()` helper that latches
+  the reason, `push()` re-throws it and consumes nothing (no visitor callback
+  fires for the bytes after the defect), and `finish()` returns `INVALID`
+  permanently — including where the input is *both* malformed and truncated,
+  which `INVALID` outranks. `LIMIT_EXCEEDED` deliberately does **not** latch: a
+  receiver-side cap is a policy rejection of well-formed bytes (§6.2.1), not the
+  `INVALID` outcome. The cost is one perfectly-predicted branch per `feed`, not
+  per byte, so decode throughput is unchanged; the one-shot `decode()` /
+  `Cursor` paths, which build a fresh state per call and cannot be resumed after
+  a throw, are untouched.
 - **A varint array's allocation guard decided the verdict from the count word,
   before any element was examined** (#99). `Cursor.arrayCount` rejected a count
   larger than the bytes remaining as `INCOMPLETE`. The observation behind it is
@@ -183,6 +203,14 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
   deliberate duplication on the hot path cannot drift.
 - `float-bits.test.ts` covers re-encoding *during* an `fp32` raw-channel
   callback, which is what the raw view's dedicated scratch exists to make safe.
+- `istream.invalid-latch.test.ts` pins §5.2's terminal `INVALID` on the
+  streaming decoder: four malformed constructs (dangling sequence end, an id
+  above `ID_MAX`, a wrong-width `fp32` fixlen, a reserved fixlen subtype) each
+  fed one byte at a time *and* as one whole buffer — so the verdict cannot
+  depend on where the chunk boundaries fell — plus the overlong-varint case, the
+  no-callbacks-after-poisoning guarantee, and the two controls that must stay
+  unaffected: a well-formed stream still reaching `COMPLETE` / `INCOMPLETE`, and
+  a `LIMIT_EXCEEDED` rejection not poisoning the stream.
 
 ## [0.10.0] - 2026-08-01
 

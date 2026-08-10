@@ -67,6 +67,23 @@ export class DecoderState {
   private parents: Visitor[] | null = null;
   /** Number of nested sequences currently open — 0 at the root scope. */
   private depth = 0;
+  /**
+   * Terminal-`INVALID` latch (§5.2): the reason the input was found malformed,
+   * or `null` while the stream is still healthy. `INVALID` is *terminal* — no
+   * later bytes can make already-malformed input valid — so the verdict has to
+   * outlive the throw that reported it: a caller that catches the `INVALID_MSG`
+   * from one {@link push} and keeps feeding must not be able to talk the
+   * machine back into `COMPLETE`. Every malformed-input throw goes through
+   * {@link fail}, which sets this; {@link push} then refuses to consume another
+   * byte and {@link finish} answers {@link DecodeStatus.Invalid} for good.
+   *
+   * Held as the reason string rather than a bare flag so the re-throw names the
+   * original defect instead of a generic "poisoned" message. It is deliberately
+   * *not* set for {@link limitExceededError}: a receiver-side limit is a policy
+   * rejection of well-formed bytes (§6.2.1) — the same message decodes under a
+   * looser limit — and folding it into `INVALID` would misreport it.
+   */
+  private invalidReason: string | null = null;
 
   // current field
   private id = 0;
@@ -118,6 +135,11 @@ export class DecoderState {
 
   /** Feed `input` to the machine, dispatching to `root` and its sub-visitors. */
   push(input: Uint8Array, root: Visitor): void {
+    // §5.2: `INVALID` is terminal. Once the input has been proved malformed the
+    // stream consumes nothing further and drives no visitor callbacks — it just
+    // re-reports the original defect. One perfectly-predicted branch per chunk
+    // (not per byte), so the hot path is unaffected.
+    if (this.invalidReason !== null) throw invalidMsgError(this.invalidReason);
     // The root is bound by the first feed; later feeds continue with it, so a
     // caller cannot swap visitors mid-message.
     if (!this.rooted) {
@@ -137,7 +159,7 @@ export class DecoderState {
           // wire type — a sequence end's id is discarded, not exempt
           // (documentation#35, and see fast.ts).
           const id = this.vUpper();
-          if (id > ID_MAX) throw invalidMsgError(`field id ${id} out of range`);
+          if (id > ID_MAX) this.fail(`field id ${id} out of range`);
           if (type === WireType.SequenceEnd) {
             this.endSequence();
             break;
@@ -170,8 +192,8 @@ export class DecoderState {
           if (!this.vComplete) return;
           const sub = this.vTag();
           const len = this.vUpper();
-          if (sub > FixlenSubtype.Blob) throw invalidMsgError(`invalid fixlen subtype ${sub}`);
-          if (len > FIXLEN_MAX) throw invalidMsgError("fixlen length out of range");
+          if (sub > FixlenSubtype.Blob) this.fail(`invalid fixlen subtype ${sub}`);
+          if (len > FIXLEN_MAX) this.fail("fixlen length out of range");
           if (sub === FixlenSubtype.String && len > this.maxStringLen) {
             throw limitExceededError(`string length ${len} exceeds maxStringLen ${this.maxStringLen}`);
           }
@@ -190,7 +212,7 @@ export class DecoderState {
           }
           if (sub === FixlenSubtype.Fp32 || sub === FixlenSubtype.Fp64) {
             const want = sub === FixlenSubtype.Fp32 ? 4 : 8;
-            if (this.fixLen !== want) throw invalidMsgError("fixlen float length mismatch");
+            if (this.fixLen !== want) this.fail("fixlen float length mismatch");
             this.fpBegin(want);
             this.state = S.FixlenFp;
           } else {
@@ -236,7 +258,7 @@ export class DecoderState {
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
           const count = this.vNum();
-          if (count > ARRAY_MAX) throw invalidMsgError("array count out of range");
+          if (count > ARRAY_MAX) this.fail("array count out of range");
           if (count > this.maxArrayCount) {
             throw limitExceededError(`array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`);
           }
@@ -356,7 +378,7 @@ export class DecoderState {
             this.arrKind = ArrayKind.Fp64;
             this.fpBegin(8);
           } else {
-            throw invalidMsgError("invalid fixlen array element type");
+            this.fail("invalid fixlen array element type");
           }
           if (this.arrCount === 0) {
             // §4.8: an empty fixlen array is [ header ][ count = 0 ][ fixlen_word ]
@@ -398,16 +420,35 @@ export class DecoderState {
    * ended inside a field (a partial varint, an unfinished payload / array, or a
    * still-open nested sequence). This is a pure accessor — the finish-less spec
    * has no finalize step, and a trailing `Incomplete` is a truncation the caller
-   * decides how to treat, not an error this machine raises. A genuinely
-   * malformed message has already thrown from {@link push}.
+   * decides how to treat, not an error this machine raises.
+   *
+   * A malformed message has already thrown `INVALID_MSG` from {@link push}, and
+   * that verdict is terminal (§5.2): once {@link fail} has latched it this
+   * returns {@link DecodeStatus.Invalid} for good, so a caller that swallowed
+   * the throw and kept feeding cannot read back `Complete`. `Invalid` outranks
+   * `Incomplete` here — input that is both malformed and truncated is
+   * `Invalid` — while a merely truncated stream is never promoted to it.
    */
   finish(): DecodeStatus {
+    if (this.invalidReason !== null) return DecodeStatus.Invalid;
     const atBoundary =
       this.state === S.Header && this.vBytes === 0 && this.depth === 0;
     return atBoundary ? DecodeStatus.Complete : DecodeStatus.Incomplete;
   }
 
   // --- helpers ------------------------------------------------------------
+
+  /**
+   * Reject the input as malformed: latch the terminal `INVALID` verdict
+   * ({@link invalidReason}) and throw `INVALID_MSG`. Every malformed-input
+   * rejection in this machine goes through here, so none of them can be caught
+   * and then decoded past — §5.2's "no — terminal". Declared `never` so a call
+   * ends control flow exactly like the `throw` it replaced.
+   */
+  private fail(message: string): never {
+    this.invalidReason = message;
+    throw invalidMsgError(message);
+  }
 
   private dispatch(type: number): void {
     switch (type) {
@@ -438,7 +479,7 @@ export class DecoderState {
         // §4.9/§6.2: reject nesting deeper than MAX_DEPTH.
         const d = this.depth;
         if (d >= MAX_DEPTH) {
-          throw invalidMsgError(`nesting exceeds MAX_DEPTH (${MAX_DEPTH})`);
+          this.fail(`nesting exceeds MAX_DEPTH (${MAX_DEPTH})`);
         }
         const parent = this.cur;
         const child = parent.sequenceBegin?.(this.id) ?? parent;
@@ -449,13 +490,13 @@ export class DecoderState {
         break;
       }
       default:
-        throw invalidMsgError(`invalid wire type ${type}`);
+        this.fail(`invalid wire type ${type}`);
     }
   }
 
   private endSequence(): void {
     const d = this.depth;
-    if (d === 0) throw invalidMsgError("unbalanced sequence end");
+    if (d === 0) this.fail("unbalanced sequence end");
     this.state = S.Header;
     this.cur.sequenceEnd?.();
     this.depth = d - 1;
@@ -527,7 +568,7 @@ export class DecoderState {
     let k = k0;
     const n = input.length;
     while (i < n) {
-      if (k >= VARINT_MAX_BYTES) throw invalidMsgError("varint overflow");
+      if (k >= VARINT_MAX_BYTES) this.fail("varint overflow");
       const b = input[i++]!;
       if (k < 4) lo |= (b & 0x7f) << (7 * k);
       else if (k === 4) {
@@ -536,7 +577,7 @@ export class DecoderState {
       } else {
         // 10th byte (k === 9) has only bit 63 below 64; any higher payload
         // bit would spill past bit 63 and is a >64-bit overflow.
-        if (k === 9 && ((b & 0x7f) >> 1) !== 0) throw invalidMsgError("varint overflow");
+        if (k === 9 && ((b & 0x7f) >> 1) !== 0) this.fail("varint overflow");
         hi |= (b & 0x7f) << (7 * k - 32);
       }
       k++;
@@ -560,7 +601,7 @@ export class DecoderState {
     // suspend that `finish()` would report as INCOMPLETE: §5.2 gives INVALID
     // precedence, and the verdict must not depend on where the chunk boundaries
     // fell (corelib-ts#82; the whole-buffer readers already throw here).
-    if (k >= VARINT_MAX_BYTES) throw invalidMsgError("varint overflow");
+    if (k >= VARINT_MAX_BYTES) this.fail("varint overflow");
     this.vLo = lo;
     this.vHi = hi;
     this.vBytes = k;
@@ -621,11 +662,11 @@ export class DecoderState {
     // 10th byte: only bit 63 (1 payload bit) remains below 64; any higher
     // payload bit, or a continuation into an 11th byte, is a >64-bit overflow.
     b = input[i + 9]!;
-    if (((b & 0x7f) >> 1) !== 0) throw invalidMsgError("varint overflow");
+    if (((b & 0x7f) >> 1) !== 0) this.fail("varint overflow");
     hi |= (b & 0x7f) << 31;
     if (b < 0x80) return this.setVarint(lo, hi, i + 10);
 
-    throw invalidMsgError("varint overflow");
+    this.fail("varint overflow");
   }
 
   /** Publish a fully-decoded varint and the cursor past it (see {@link varintFull}). */

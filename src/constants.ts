@@ -98,10 +98,13 @@ export const MAX_DEPTH = 255;
  *   payload shorter than its declared length, an array that runs off the end, or
  *   a nested sequence never closed). **Not an error** — more bytes could
  *   complete it, and the caller owns end-of-input.
- * - `Invalid` — the bytes are malformed regardless of what follows.
+ * - `Invalid` — the bytes are malformed regardless of what follows. **Terminal**
+ *   (CORELIB_PLAN §5.2): no later bytes can undo it.
  *
- * {@link IStream.end} returns `Complete` or `Incomplete` (an `Invalid` message
- * has already thrown from {@link IStream.feed}); the one-shot {@link decode} /
+ * {@link IStream.end} returns `Complete` or `Incomplete` while the stream is
+ * healthy; an `Invalid` message throws from {@link IStream.feed} *and* latches
+ * there, so `end()` reports `Invalid` from then on and every further `feed`
+ * re-throws without consuming input. The one-shot {@link decode} /
  * {@link Cursor} path signals `Incomplete` and `Invalid` by throwing a
  * {@link SofabError} whose `code` is {@link SofabErrorCode.Incomplete} or
  * {@link SofabErrorCode.InvalidMsg}, and `Complete` by returning normally.
