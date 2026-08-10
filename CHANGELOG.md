@@ -200,6 +200,21 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Fixed
 
+- **The README's error-code list named a code that does not exist and omitted
+  one that does** (#116). The "Usage" paragraph is the one place a caller learns
+  which values `SofabError.code` can take, and it listed `USAGE` — a name
+  `src/errors.ts` has never defined, so `e.code === "USAGE"` compiles into a
+  branch that can never fire — while leaving out `LIMIT_EXCEEDED`, the §6.2.1
+  code a caller most needs to tell apart from `INVALID_MSG` and which the same
+  README documents further down under "Decode limits". The list is now the
+  library's actual closed set (`ARGUMENT`, `BUFFER_FULL`, `INVALID_MSG`,
+  `INCOMPLETE`, `LIMIT_EXCEEDED`), and says what the phantom code had implied
+  was reportable: a read whose declared type contradicts the wire is **not** an
+  error — the field is skipped like an unknown id and the decode stays
+  `COMPLETE` (MESSAGE_SPEC §7.3, CORELIB_PLAN §6.3) — and `LIMIT_EXCEEDED` is a
+  receiver-local policy rejection, not a verdict on the message. Documentation
+  only; no code changed.
+
 - **`leb128.decodeVarint` reported `INCOMPLETE` where the three real decode
   surfaces report `INVALID`** (#113). CORELIB_PLAN §4.1 bounds the varint
   *encoding*, not the decoded value: ten bytes that all carry the continuation
@@ -514,6 +529,13 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Tests
 
+- `readme-error-codes.test.ts` checks the README's error-code prose against
+  `src/errors.ts` instead of against itself (#116): the documented list must name
+  every value `SofabErrorCode` defines, no value it does not, and each exactly
+  once, and every `SofabErrorCode.<member>` the README spells in an example must
+  resolve on the exported object. Both halves of the finding fail on the old
+  text, and the drift they catch — a code added to the enum, or renamed out from
+  under the prose — is invisible to every behavioural test in the suite.
 - `varint-reader-shared.test.ts` guards the single varint reader (#114) at both
   levels the duplication could fail at. Structurally: the bounds-checked unrolled
   reader has exactly one definition across `src/decode/`, and no verbatim block
