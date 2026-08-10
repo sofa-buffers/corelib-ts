@@ -329,6 +329,21 @@ malformed message — so, unlike `INVALID_MSG`, it does not poison an `IStream`
 (see [Deserialize stream](#deserialize-stream)). Generated code supplies these
 values from the sofabgen config.
 
+A limit applies **only to a field the schema leaves unbounded** (§6.2.1). Where
+the schema declares a `count` / `maxlen`, that bound governs and an over-bound
+value is `INVALID_MSG`, never `LimitExceeded` — a schema bound states what is
+*valid*, a receiver limit only what this deployment has the *capacity* for, and
+two receivers with the same schema and different limits must not disagree about a
+bounded field. On the pull `Cursor` this is automatic: passing the schema bound
+(`readString(maxlen)`, `readUnsignedArray(count)`, …) both enables the `INVALID`
+check and takes the field out of the cap's reach, so a bounded field decodes
+normally even when its size exceeds the configured cap. The push surfaces
+(`decode()`, `IStream`) are driven by wire type and never learn the schema, so
+there the caps apply to every field; a caller that needs the distinction on a
+bounded field decodes it through `Cursor`, or leaves the cap unset and enforces
+the schema bound itself from `fixlenBegin` / `arrayBegin`, which carry the
+declared size.
+
 ## Feature flags
 
 None — the build always ships every wire type.

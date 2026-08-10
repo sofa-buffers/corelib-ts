@@ -138,15 +138,28 @@ describe("fixlen array: schema count is applied after the element word (§4.8, #
     expect(cursorFp32(buf, 2)).toBe(SofabErrorCode.InvalidMsg);
   });
 
-  it("still enforces maxArrayCount at the count word", () => {
+  it("still enforces maxArrayCount at the count word (unbounded field)", () => {
+    // The receiver cap applies to a schema-UNBOUNDED array only (§6.2.1,
+    // corelib-ts#105) — so this reads without a schema count. It still fires at
+    // the count word, before the element word arrives.
     const buf = Uint8Array.of(HDR, 0x05, 0x80);
+    expect(
+      codeOf(() => {
+        const c = new Cursor(buf, { maxArrayCount: 2 });
+        c.readHeader();
+        c.readFp32Array();
+      }),
+    ).toBe(SofabErrorCode.LimitExceeded);
+    // With a schema count present the cap is out of the picture entirely: the
+    // count is within the schema bound, so the verdict is decided by the bytes —
+    // here the truncated element word, INCOMPLETE.
     expect(
       codeOf(() => {
         const c = new Cursor(buf, { maxArrayCount: 2 });
         c.readHeader();
         c.readFp32Array(8);
       }),
-    ).toBe(SofabErrorCode.LimitExceeded);
+    ).toBe(SofabErrorCode.Incomplete);
   });
 
   // The same ordering holds for the other two fixlen-array readers.

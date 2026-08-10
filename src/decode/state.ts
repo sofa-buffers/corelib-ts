@@ -201,6 +201,13 @@ export class DecoderState {
           const len = this.vUpper();
           if (sub > FixlenSubtype.Blob) this.fail(`invalid fixlen subtype ${sub}`);
           if (len > FIXLEN_MAX) this.fail("fixlen length out of range");
+          // Like the one-shot push path, this streaming surface is driven by
+          // wire type alone and never learns the schema, so it applies the
+          // receiver cap to every field — it cannot make the §6.2.1
+          // schema-bounded/unbounded distinction the pull Cursor makes, which
+          // takes the bound as an argument (corelib-ts#105). A caller needing
+          // that distinction on a bounded field leaves the cap unset and
+          // enforces the schema bound from fixlenBegin / arrayBegin.
           if (sub === FixlenSubtype.String && len > this.maxStringLen) {
             throw limitExceededError(`string length ${len} exceeds maxStringLen ${this.maxStringLen}`);
           }
@@ -266,6 +273,8 @@ export class DecoderState {
           if (!this.vComplete) return;
           const count = this.vNum();
           if (count > ARRAY_MAX) this.fail("array count out of range");
+          // Applied to every array: no schema count reaches this surface (see
+          // the FixlenLen case above, corelib-ts#105).
           if (count > this.maxArrayCount) {
             throw limitExceededError(`array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`);
           }
