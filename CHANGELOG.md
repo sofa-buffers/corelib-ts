@@ -209,6 +209,55 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
 
 ### Changed
 
+- **The bench tools run BENCH_SPEC's full workload set** (`bench/`). `bench` had
+  four rows over two datasets; the spec defines **ten** over four, and the two
+  that were missing are the two that exercise anything hard. `blob 1MB` — one
+  unbounded `blob` field, 1,000,005 bytes on the wire — is now driven three ways:
+  `one-shot` into a caller buffer sized by hand to exactly the message,
+  `streaming` through a **4096-byte** buffer with a flush sink (~245 flushes,
+  pass-through not granted), and `decode: blob 1MB` fed back in 4096-byte chunks.
+  Nothing in this suite reached the divisible-run flush path of CORELIB_PLAN §5.1
+  before — the other workloads are all schema-bounded and small enough that no
+  flush occurs mid-encode — and the gap between the first two rows is what that
+  path costs (**+75%** `Ir/op`: 1.03M one-shot against 1.80M streaming).
+  `composite` (956 bytes) is the second new dataset and reaches the encoder paths
+  the flat ones miss: a 64-element **wrapper array** (MESSAGE_SPEC §5.1, ids 0–15
+  one header byte and 16–63 two), 320 bytes of 1-, 2-, 3- and 4-byte UTF-8,
+  nesting three deep, a default-valued field the encoder must **not** write (the
+  lazy hold-back's discard path), and the suite's only two-byte field header. Its
+  `decode: composite skip-all` row walks the same bytes through `Cursor.skip`,
+  materializing nothing — the path a router runs, required to be *tested* by
+  MESSAGE_SPEC §7.2 item 7 and until now never measured — and comes out ~5%
+  cheaper in `Ir/op` than the full decode (53,985 against 56,852), the difference
+  being the payload views the full decode materializes and the skip does not. The optional
+  `encode: blob 1MB passthrough` row is omitted rather than stubbed: this port
+  grants no pass-through permission.
+
+  Two changes to how the existing rows are driven came with it. The encode rows
+  now write into a **caller-supplied buffer** rewound per op (CORELIB_PLAN §5.1,
+  and what generated code does) instead of a fresh `growingOStream()` per op, so
+  they measure this encoder rather than V8's allocator —
+  `encode: typical message` reads 119 MB/s where the allocating loop read 65. And
+  the decode rows' checksum visitor folds into a `number` instead of a `bigint`:
+  every callback used to allocate, which on `decode: typical message` cost more
+  than the decode it was reporting on. Both are visible in the numbers, so the
+  four pre-existing rows are not comparable with the ones in earlier releases.
+  Datasets, tools and output grammar are now pinned by tests
+  (`test/bench-datasets.test.ts`, `test/bench-grammar.test.ts`), and
+  `--smoke` runs every row exactly once for a liveness check that costs a second
+  instead of twelve.
+
+- **`bench/run_callgrind.sh` measures all ten rows, with rep counts per workload
+  shape.** The two-rep subtraction only reports steady-state cost if *both* rep
+  counts sit past V8's tier-up, and the classes are now measured rather than
+  assumed: the megabyte-copying blob encodes take BENCH_SPEC's own `R1=1, R2=3`;
+  the 1000-element arrays and the 245-chunk blob decode are steady by a few
+  hundred (the blob decode moves 0.8% between 200/1200 and 2000/12000); and
+  `composite` — 70-odd small field calls per op — is not, reading 90.5k `Ir/op`
+  for `encode: composite` at 200/1200, 75.9k at 2000/12000 and 67.2k at
+  10000/60000, where it finally holds. It gets its own rep pair rather than
+  riding on the array one.
+
 - **The bench tools time through one loop** (`bench/common.ts`). `bench.ts`,
   `perf.ts` and `bound.ts` each carried a copy, and `bound.ts`'s had drifted into
   reading the clock once per *operation* — at ~1 µs a read, several times the cost
@@ -682,6 +731,21 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
   start a fresh varint while a half-read one was still in the accumulator.
 
 ### Tests
+
+- **The benchmark datasets and the tools' output grammar are under test**
+  (`test/bench-datasets.test.ts`, `test/bench-grammar.test.ts`). The datasets are
+  a cross-language contract — BENCH_SPEC fixes the ids, types and literal values
+  so the encoded sizes match on every port, and three of those sizes (`perf` =
+  170 bytes, `blob 1MB` = 1,000,005, `composite` = 956) are stated as parity
+  checks — but nothing here checked them, and a bench that quietly encodes
+  something else prints numbers nobody can compare. The suite now pins the three
+  sizes, the wrapper array's 64 elements and their id widths, the omitted
+  default, the two-byte header, the depth-3 nesting, and that the streaming
+  `blob 1MB` encode through a 4096-byte buffer produces byte-identical output to
+  the one-shot one. The grammar test runs `bench` and `perf` for real (in
+  `--smoke` mode) and matches their output with BENCH_SPEC's own regexes: a row
+  one space out of column, a relabelled workload or a row that stopped printing
+  fails nothing locally — it silently drops out of the cross-language tables.
 
 - **Every shared vector is now encoded through a plain caller buffer as well**,
   at two sizes: exactly the reference length — the `MAX_SIZE` shape, which cannot

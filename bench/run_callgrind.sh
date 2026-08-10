@@ -33,8 +33,9 @@
 #     per-op signal being measured. With it, repeat runs agree to ~0.01%.
 #
 # Prereqs: valgrind, and `npm ci` (for esbuild, which ships with tsup).
-# Usage:   bash bench/run_callgrind.sh          # defaults R1=200 R2=1200
+# Usage:   bash bench/run_callgrind.sh          # every row, default rep counts
 #          R1=500 R2=5500 bash bench/run_callgrind.sh
+#          WORKLOADS="encode_composite decode_composite" bash bench/run_callgrind.sh
 #
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -45,15 +46,24 @@ SCRIPT="$ROOT/bench/bench.ts"
 # cost the table claims to show — and a warm-up-weighted number is not
 # comparable with the compiled ports' Ir/op, which is the point of the tool.
 #
-# The two message workloads do one small message per rep, so they need tens of
-# thousands of reps to get there; the two array workloads run 1000 elements per
-# rep and are fully optimised within a few hundred. Measured on Node 24, the
-# small-message figures fall by ~2.5x (encode) and ~6x (decode) going from
-# 200/1200 to the defaults below, then hold steady — that spread was warm-up.
-R1="${R1:-2000}"    # message workloads
+# The rows that do bulk work per rep — the 1000-element arrays and the 245-chunk
+# `blob 1MB` decode — are fully optimised within a few hundred reps (the array
+# decode moves 0.8% between 200/1200 and 2000/12000). Everything built out of
+# small per-field calls needs far more: measured on Node 24, `typical` falls by
+# ~2.5x (encode) and ~6x (decode) going from 200/1200 to 2000/42000, and
+# `composite` — 70-odd field calls per op, so it tiers up much later than its
+# size suggests — reads 90.5k / 66.4k Ir/op (encode / skip-all) at 200/1200,
+# 75.9k / 57.6k at 2000/12000 and 67.2k / 54.1k at 10000/60000, where it finally
+# holds: the same figure the 12000→42000 marginal cost predicts. Hence its own
+# rep pair rather than a shared "small message" one.
+R1="${R1:-2000}"    # small-message workloads (typical)
 R2="${R2:-42000}"
-AR1="${AR1:-200}"   # 1000-element array workloads
+AR1="${AR1:-200}"   # bulk-per-rep workloads: the arrays and the blob decode
 AR2="${AR2:-1200}"
+CR1="${CR1:-10000}" # the composite rows (see above)
+CR2="${CR2:-40000}"
+BR1="${BR1:-1}"     # the two blob *encode* rows (see below)
+BR2="${BR2:-3}"
 
 if ! command -v valgrind >/dev/null 2>&1; then
     echo "error: valgrind not found (needed for instruction counts)." >&2
@@ -68,18 +78,41 @@ if (( AR2 <= AR1 )); then
     echo "error: AR2 ($AR2) must be greater than AR1 ($AR1)." >&2
     exit 1
 fi
+if (( BR2 <= BR1 )); then
+    echo "error: BR2 ($BR2) must be greater than BR1 ($BR1)." >&2
+    exit 1
+fi
+if (( CR2 <= CR1 )); then
+    echo "error: CR2 ($CR2) must be greater than CR1 ($CR1)." >&2
+    exit 1
+fi
 
-# The rep pair to use for a workload (see the R1/AR1 note above).
+# The rep pair to use for a workload (see the R1/AR1/BR1 note above).
+#
+# The two blob *encode* rows take BENCH_SPEC's own advice (R1=1, R2=3): a
+# megabyte of copying per op is slow under Callgrind, and the subtraction cancels
+# fixed cost just as well at three reps as at three hundred. `decode: blob 1MB`
+# is deliberately not in that class — a decode hands the visitor a window into
+# the input and copies nothing, so its per-op cost is a walk over 245 chunks and
+# a two-op delta would sit inside the run-to-run jitter.
 reps_for() {
     case "$1" in
-        *u64_array) echo "$AR1 $AR2";;
-        *)          echo "$R1 $R2";;
+        encode_blob_oneshot|encode_blob_streaming) echo "$BR1 $BR2";;
+        *u64_array|decode_blob)                    echo "$AR1 $AR2";;
+        *composite|*composite_skip)                echo "$CR1 $CR2";;
+        *)                                         echo "$R1 $R2";;
     esac
 }
 
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
-WORKLOADS=(encode_u64_array encode_typical decode_u64_array decode_typical)
+# BENCH_SPEC's table order. `encode: blob 1MB passthrough` is its one optional
+# row and is absent: this port grants no pass-through permission, so every
+# string/blob run is copied through the output buffer and the row is omitted
+# rather than filled with a placeholder.
+read -r -a WORKLOADS <<<"${WORKLOADS:-encode_u64_array encode_typical \
+encode_blob_oneshot encode_blob_streaming encode_composite decode_u64_array \
+decode_typical decode_blob decode_composite decode_composite_skip}"
 
 BUNDLE="$OUT/bench.mjs"
 if ! npx --no-install esbuild "$SCRIPT" --bundle --format=esm --platform=node \
@@ -98,15 +131,22 @@ bytes_of() { grep -ohE 'bytes=[0-9]+' "$OUT/$1.log" | head -1 | cut -d= -f2; }
 
 label() {
     case "$1" in
-        encode_u64_array) echo "encode: u64 array (1000)";;
-        encode_typical)   echo "encode: typical message";;
-        decode_u64_array) echo "decode: u64 array (1000)";;
-        decode_typical)   echo "decode: typical message";;
+        encode_u64_array)      echo "encode: u64 array (1000)";;
+        encode_typical)        echo "encode: typical message";;
+        encode_blob_oneshot)   echo "encode: blob 1MB one-shot";;
+        encode_blob_streaming) echo "encode: blob 1MB streaming";;
+        encode_composite)      echo "encode: composite";;
+        decode_u64_array)      echo "decode: u64 array (1000)";;
+        decode_typical)        echo "decode: typical message";;
+        decode_blob)           echo "decode: blob 1MB";;
+        decode_composite)      echo "decode: composite";;
+        decode_composite_skip) echo "decode: composite skip-all";;
     esac
 }
 
 echo ">> Measuring instructions/op under Callgrind (messages R1=$R1 R2=$R2," \
-     "arrays R1=$AR1 R2=$AR2; this is slow) ..."
+     "arrays/blob decode R1=$AR1 R2=$AR2, composite R1=$CR1 R2=$CR2," \
+     "blob encode R1=$BR1 R2=$BR2; this is slow) ..."
 echo
 echo "==============================================================================="
 echo " SofaBuffers TypeScript instruction cost   (Callgrind, Ir/op)"
@@ -129,3 +169,5 @@ done
 echo
 echo "Ir = instructions retired (Callgrind). Independent of CPU clock and OS"
 echo "scheduling; depends only on the executed code, so it compares across machines."
+echo "The two blob encode rows are read against each other: their difference is what"
+echo "the divisible-run flush path (CORELIB_PLAN 5.1) costs, bandwidth taken out."

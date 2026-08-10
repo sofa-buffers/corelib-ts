@@ -1,46 +1,35 @@
 /**
  * SofaBuffers TypeScript — per-operation cost benchmark.
  *
- * Mirror of `bench/c/perf.c`, `benches/perf.rs`, C#'s `Perf` and Java's `Perf`:
- * encodes and decodes the identical message (same field ids, types and values)
- * and prints the same report. Two metrics per workload:
+ * The `perf` tool of BENCH_SPEC, mirroring `bench/c/perf.c`, `benches/perf.rs`,
+ * C#'s `Perf` and Java's `Perf`: it encodes and decodes the identical 12-field,
+ * **170-byte** `perf` message (same field ids, types and values on every port —
+ * a different `message size` here means the encoding has diverged) and prints
+ * the same five lines per direction. Two metrics per workload:
  *
  *   1. cycles/op — code cost off a hardware cycle counter. JavaScript VMs expose
  *      no portable cycle counter, so — like the .NET and JVM tools — this is
  *      reported as unavailable and CPU time/op is the clock-independent proxy.
  *      (For a fully hardware-independent figure, `bench/run_callgrind.sh` counts
- *      instructions/op under Valgrind, mirroring the Python tool.)
+ *      instructions/op under Valgrind.)
  *   2. throughput MB/s + CPU time/op — a speedtest for this machine, from
  *      process CPU time (not wall-clock). MB = 1e6 bytes.
  *
- * Run with: `npm run perf`
+ * Both directions run the **stream API** — the encoder over a caller-supplied
+ * buffer and the resumable {@link IStream} — which is what the label says and
+ * what the other ports' `perf` drives. `bench`'s whole-message decode rows use
+ * the contiguous `decode()` fast path instead; the two are different questions,
+ * and the gap between them is this port's cost of resumability.
+ *
+ * ```
+ * npm run perf                 # the measuring run
+ * tsx bench/perf.ts --smoke    # one op per direction: liveness, not a measurement
+ * ```
  */
 
-import { IStream, OStream, growingOStream } from "../src/index.js";
-import { Checksum, blackholeValue, measure, sink } from "./common.js";
-
-const PERF_STRING = "perf-benchmark-message";
-const PERF_SAMPLES = [1e6, 2e6, 3e6, 4e6, 5e6, 6e6, 7e6, 8e6];
-const PERF_DELTAS = [-1e5, -2e5, -3e5, -4e5, -5e5, -6e5, -7e5, -8e5];
-const PERF_FP64 = [3.14159265, 6.2831853, 9.42477795, 12.5663706];
-
-function perfEncode(os: OStream): void {
-  os.writeUnsigned(1, 0xdead_beefn);
-  os.writeSigned(2, -12345);
-  os.writeUnsigned(3, 0x0123_4567_89ab_cdefn);
-  os.writeSigned(4, -5_000_000_000_000);
-  os.writeBoolean(5, true);
-  os.writeFp32(6, 3.14159);
-  os.writeFp64(7, 2.718281828459045);
-  os.writeString(8, PERF_STRING);
-  os.writeUnsignedArray(9, PERF_SAMPLES);
-  os.writeSignedArray(10, PERF_DELTAS);
-  os.writeFp64Array(11, PERF_FP64);
-  os.writeSequenceBeginLazy(12);
-  os.writeUnsigned(1, 99);
-  os.writeSigned(2, -7);
-  os.writeSequenceEnd();
-}
+import { IStream, OStream } from "../src/index.js";
+import { blackholeValue, measure, setSmoke, sink } from "./common.js";
+import { Checksum, PERF_ENCODED_SIZE, encodePerf, encodeToBytes } from "./workloads.js";
 
 interface Result {
   iterations: number;
@@ -67,17 +56,22 @@ function report(what: string, r: Result, bytes: number): void {
 }
 
 function main(): void {
-  const wire = (() => {
-    const os = growingOStream();
-    perfEncode(os);
-    return os.bytes().slice();
-  })();
-  const size = wire.length;
+  const smoke = process.argv.includes("--smoke");
+  setSmoke(smoke);
 
+  const wire = encodeToBytes(encodePerf);
+  const size = wire.length;
+  if (size !== PERF_ENCODED_SIZE) {
+    throw new Error(`perf message is ${size} bytes, expected ${PERF_ENCODED_SIZE}`);
+  }
+
+  // One caller-supplied buffer for the whole loop (CORELIB_PLAN §5.1), rewound
+  // per op: the row is the encoder's cost, not the allocator's.
+  const os = new OStream(new Uint8Array(1024));
   const enc = run(size, () => {
-    const os = growingOStream();
-    perfEncode(os);
-    sink(BigInt(os.bytesUsed));
+    os.reset();
+    encodePerf(os);
+    sink(os.bytesUsed);
   });
   const dec = run(size, () => {
     const c = new Checksum();
@@ -89,8 +83,11 @@ function main(): void {
   report("serialize (stream API)", enc, size);
   report("deserialize (stream API)", dec, size);
   console.log("\ncycles/op tracks code cost; MB/s is this machine's throughput.");
+  if (smoke) {
+    console.log("--smoke: one op per direction. Liveness check, NOT a measurement.");
+  }
 
-  if (blackholeValue() === 42n) console.error("");
+  if (blackholeValue() === 42) console.error("");
 }
 
 main();
