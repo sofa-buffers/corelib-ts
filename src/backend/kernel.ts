@@ -18,8 +18,17 @@ import { jsKernel } from "./js.js";
  *
  * Every method writes into `out` starting at `pos`, assuming the caller has
  * already ensured enough room, and returns the position just past the last byte
- * written. Headers, counts, flushing and validation stay in the stream classes;
- * a kernel only moves bytes.
+ * written. Headers, counts and flushing stay in the stream classes; a kernel
+ * only moves bytes — with one obligation it cannot delegate, because it is the
+ * only code that ever looks at the elements: **the integer kernels must reject
+ * an element outside the 64-bit value domain** (CORELIB_PLAN §6.2 — `0 .. 2^64
+ * - 1` unsigned, `-2^63 .. 2^63 - 1` signed) by throwing `argumentError`,
+ * rather than reducing it modulo 2^64. The stream classes range-check the same
+ * values on their element-at-a-time streaming path, so a kernel that skipped
+ * the check would make the wire depend on which constructor the caller used
+ * (#106). The check is one store, one load and one compare on the `bigint`
+ * branch (`splitU64` / `splitI64`); the `number` fast paths are already gated
+ * on the domain and pay nothing.
  */
 export interface Kernel {
   /** A short identifier, surfaced in diagnostics and the parity tests. */
