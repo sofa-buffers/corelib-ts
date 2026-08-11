@@ -118,11 +118,21 @@ function cursorVerdict(bytes: Uint8Array): DecodeStatus {
   }
 }
 
-/** Push reader: the same bound, taken from `fieldBegin`'s `id`. */
+/**
+ * Push reader applying the same bound — from `fixlenBegin`, not `fieldBegin`.
+ *
+ * `fieldBegin` fires as soon as the field HEADER varint ends, which is before
+ * the `fixlen_word` exists. CORELIB_PLAN §4.1 forbids acting on that word early
+ * "even when the field's id would violate a schema bound (MESSAGE_SPEC §7.1)":
+ * §7.3 makes the bound apply only to a field that IS the declared one, and only
+ * the subtype settles that. A visitor that rejects from `fieldBegin` therefore
+ * reaches a verdict the format does not license yet — which is what generated
+ * code avoids by binding this to `fixlenBegin`.
+ */
 class Elements implements Visitor {
   readonly seen: string[] = [];
-  fieldBegin(id: number, wire: WireType): void {
-    if (wire === WireType.Fixlen && id >= COUNT) {
+  fixlenBegin(id: number, sub: FixlenSubtype, _total: number): void {
+    if (sub === FixlenSubtype.String && id >= COUNT) {
       throw new SofabError(SofabErrorCode.InvalidMsg, `element ${id} >= count ${COUNT}`);
     }
   }
@@ -199,16 +209,31 @@ describe("Visitor.fieldBegin", () => {
       });
     }
 
-    it("lets the push path reach the pull path's INVALID verdict", () => {
-      expect(cursorVerdict(REPRO)).toBe(DecodeStatus.Invalid);
-      expect(whole(REPRO, new Probe())).toBe(DecodeStatus.Invalid);
+    // §4.1: the `fixlen_word` is truncated, so it has no value -- and the clause
+    // says so for this exact case, "even when the field's id would violate a
+    // schema bound once the subtype confirmed the field is the declared one".
+    // Both surfaces therefore answer INCOMPLETE. One byte more (CTRL_OVER below)
+    // completes the word and both answer INVALID, which is what shows the bound
+    // itself is right and only its TIMING was wrong.
+    it("is INCOMPLETE on both surfaces: the word carrying the subtype never ended", () => {
+      expect(cursorVerdict(REPRO)).toBe(DecodeStatus.Incomplete);
+      expect(whole(REPRO, new Probe())).toBe(DecodeStatus.Incomplete);
     });
 
     for (const size of CHUNKINGS) {
       it(`keeps that verdict at ${size}-byte chunks (§6.4: chunking cannot change it)`, () => {
-        expect(feed(REPRO, size, new Probe())).toBe(DecodeStatus.Invalid);
+        expect(feed(REPRO, size, new Probe())).toBe(DecodeStatus.Incomplete);
       });
     }
+
+    it("rejects the moment one more byte completes that word", () => {
+      const done = new Uint8Array([...REPRO, 0x00]);
+      expect(cursorVerdict(done)).toBe(DecodeStatus.Invalid);
+      expect(whole(done, new Probe())).toBe(DecodeStatus.Invalid);
+      for (const size of CHUNKINGS) {
+        expect(feed(done, size, new Probe())).toBe(DecodeStatus.Invalid);
+      }
+    });
 
     it("does not reject the in-range control", () => {
       expect(cursorVerdict(CTRL)).toBe(DecodeStatus.Complete);
