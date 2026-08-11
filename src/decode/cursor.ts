@@ -483,25 +483,48 @@ export class Cursor extends BufferReader {
    * (0..3), a reserved value (4..7), or `-1` when the wire is not a fixlen kind
    * or the subtype word is truncated away.
    *
-   * The subtype is the low 3 bits of the fixlen sub-header word, and the low
-   * bits of a LEB128 word live entirely in its **first** byte — so this only
-   * reads one byte, it never decodes a varint.
+   * The subtype is the low 3 bits of the fixlen sub-header word. Those bits are
+   * settled by the word's **first** byte — every further byte contributes a
+   * multiple of 128, which is divisible by 8 — but CORELIB_PLAN §4.1 forbids
+   * acting on that: a varint yields no value until the byte with a clear
+   * continuation flag arrives, and no packed sub-field may influence a decode
+   * outcome before then, *even when those bits are already fixed*. So a word cut
+   * short reports -1 (INCOMPLETE) rather than a subtype it arithmetically knows.
+   *
+   * Without that, one implementation reached two verdicts for the same bytes: a
+   * caller driving this cursor tested the peeked subtype, passed, and applied a
+   * schema bound to a field whose framing had not arrived — while the visitor
+   * surface, which cannot fire before the complete word, answered INCOMPLETE
+   * (generator#300 `r3`, corelib-ts#38's read-path twin).
    */
   private peekFixSub(wire: number): number {
-    // Scalar fixlen: the sub-header is the byte right after the field header.
+    // Scalar fixlen: the sub-header is the word right after the field header.
     if (wire === WireType.Fixlen) {
-      return this.p < this.n ? this.buf[this.p]! & 7 : -1;
+      return this.subOfCompleteWord(this.p);
     }
     // Fixlen array: the element sub-header sits after the count varint (§4.8:
     // always present, even for count 0), so step over the count's bytes first —
-    // a varint's last byte is the first one with the high bit clear.
+    // a varint's last byte is the first one with the high bit clear. A count
+    // that is itself cut short leaves nothing to step over, and -1 follows.
     if (wire === WireType.ArrayFixlen) {
       let p = this.p;
       while (p < this.n && this.buf[p]! >= 0x80) p++;
-      p++;
-      return p < this.n ? this.buf[p]! & 7 : -1;
+      if (p >= this.n) return -1; // the count word never ended
+      return this.subOfCompleteWord(p + 1);
     }
     return -1; // not a fixlen field
+  }
+
+  /**
+   * The subtype of the fixlen word starting at `at`, or -1 when that word is not
+   * wholly present. Scans to the varint's terminating byte before reading the
+   * low bits, which is what makes the answer a value rather than a guess.
+   */
+  private subOfCompleteWord(at: number): number {
+    let p = at;
+    while (p < this.n && this.buf[p]! >= 0x80) p++;
+    if (p >= this.n) return -1; // truncated inside the word
+    return this.buf[at]! & 7;
   }
 
   /**
