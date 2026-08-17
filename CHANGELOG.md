@@ -8,6 +8,51 @@ While the version is below `1.0.0`, breaking changes bump the **minor** version.
 
 ## [Unreleased]
 
+### Changed
+
+- **The pull decoder's hot path: −35% Ir/op on a full-scale message** (arena
+  `typescript` row). The encoder was already ahead of protobufjs on the same
+  message while the decoder was 65% behind it, and every part of that gap was
+  the same two mistakes in different places — a per-byte bounds test the caller
+  had already settled, and a per-string payload view nothing needed.
+
+  - **`readVarint` is split into an inlinable single-byte head plus
+    `readVarintSlow`**, the decoder-side twin of the encoder's existing
+    `putVarintNum` / `putVarintNumSlow`. The unrolled ten-step ladder is far past
+    what V8 will inline, so before this every field header, fixlen word, array
+    count and array element paid a real call and could not keep the cursor in
+    registers across it.
+  - **Array element loops drive a local cursor and a five-byte, bounds-free
+    ladder (`ladder5`)**, with the buffer-end case hoisted out of the loop.
+    `readVarint` tests `p >= n` before each of its ten byte reads, which is right
+    when a varint may be the last bytes of the message and pure cost inside an
+    array, where the extent is known once. Measured on a five-element array read:
+    1155 Ir/op → 243. Truncation verdicts are unchanged — the guarded tail still
+    goes through `readVarint`, so a short array is still `INCOMPLETE`, decided by
+    the bytes.
+  - **Strings are decoded in place, and a short all-ASCII payload is built with a
+    single `String.fromCharCode` call** (new `decode/text.ts`, plus `takeRange`
+    on the reader). `TextDecoder` needs a `Uint8Array` covering exactly the
+    payload, and building that `subarray` cost about a third of a short string's
+    whole read. Appending with `+=` instead — what protobufjs does — only moves
+    the cost: it builds a rope that the next consumer flattens, which in a
+    decode-then-encode round trip is the encoder's own UTF-8 pass. Measured on a
+    13-byte ASCII field, decode plus one `charCodeAt` walk: `TextDecoder` 2006
+    Ir/op, rope 2095, single flat call **858**. Strictness is unchanged: the fast
+    path is gated on every byte being below 0x80, and everything else still goes
+    to the fatal `TextDecoder` whole.
+  - **`num()`, `upper()`, `unsignedValue()` and `signedValue()` take an integer
+    path when the high half is zero**, which is every id, length, count and every
+    value a u8..u32 / i8..i32 field or element can carry. Each of those used a
+    float multiply by 2^32 on the most-executed arithmetic in the decoder.
+  - **`readHeader` only peeks a fixlen subtype for a fixlen wire type**, keeping
+    the scanning call off every other header, and the fp32/fp64 array readers
+    hoist their `DataView` and cursor out of the element loop.
+
+  No public API, no wire and no verdict changes: the shared vectors, the 1510
+  unit tests and the generator's TypeScript conformance suite are byte-identical
+  before and after.
+
 ### Added
 
 - **`IStream.feed()` returns the three-valued decode outcome, and `IStream.status()`
