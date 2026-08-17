@@ -43,6 +43,7 @@ import {
 import { Long } from "../long.js";
 import type { DecodeLimits } from "./limits.js";
 import { BufferReader } from "./reader.js";
+import { decodeUtf8 } from "./text.js";
 
 // Strict UTF-8 (MESSAGE_SPEC §8, CORELIB_PLAN §6.4): JavaScript strings are a
 // Unicode string type, so this target is always strict — the decoder builds the
@@ -50,7 +51,7 @@ import { BufferReader } from "./reader.js";
 // (overlong forms, surrogate code points, out-of-range, truncated or stray
 // bytes) rather than silently substituting U+FFFD. readString maps that throw to
 // the INVALID decode outcome. A lossy decoder is never used.
-const _utf8 = new TextDecoder("utf-8", { fatal: true });
+// Strict decode lives in ./text, which reads the payload RANGE in place.
 
 /**
  * A pull decoder over a complete message held in one contiguous buffer.
@@ -173,7 +174,13 @@ export class Cursor extends BufferReader {
     }
     this.id = id;
     this.wire = wire;
-    this.fixSub = this.peekFixSub(wire);
+    // Only a fixlen field has a subtype to peek, and peekFixSub is a scanning
+    // call. Deciding that here rather than inside it keeps the call off every
+    // other header — which on a typical message is most of them.
+    this.fixSub =
+      wire === WireType.Fixlen || wire === WireType.ArrayFixlen
+        ? this.peekFixSub(wire)
+        : -1;
     return true;
   }
 
@@ -231,12 +238,19 @@ export class Cursor extends BufferReader {
    */
   readString(schemaMaxlen?: number): string {
     const len = this.fixlenLen(FixlenSubtype.String, schemaMaxlen);
-    // take() (truncation → INCOMPLETE) runs before the decode, so a short
+    // The truncation check (→ INCOMPLETE) runs before the decode, so a short
     // payload stays INCOMPLETE; only genuinely malformed UTF-8 bytes reach the
     // fatal decoder. Its TypeError becomes the INVALID outcome (§8/§6.4/§5.2).
-    const bytes = this.take(len);
+    //
+    // takeRange, not take(): the payload is decoded straight out of the source
+    // buffer. take() would build a `subarray` view over exactly these bytes for
+    // the decoder to read, and that view is one of the most expensive parts of a
+    // short string read — see ./text.
+    // takeRange, not take(): ./text decodes straight out of the source buffer, so
+    // the `subarray` take() would build for it is pure cost (see ./text).
+    const start = this.takeRange(len);
     try {
-      return _utf8.decode(bytes);
+      return decodeUtf8(this.buf, start, start + len);
     } catch {
       throw invalidMsgError("invalid UTF-8 in string");
     }
@@ -263,18 +277,38 @@ export class Cursor extends BufferReader {
   readUnsignedArray(schemaCount?: number, elemMax?: number | bigint): (number | bigint)[] {
     const count = this.arrayCount(schemaCount);
     const out: (number | bigint)[] = this.arrayAlloc(count);
+    // The element loop drives a LOCAL cursor over a local `buf`, and reads the
+    // one-byte element — what a narrow integer array almost always carries —
+    // without leaving this frame. Going through readVarint()/unsignedValue() per
+    // element instead put two calls plus a reload of `this.p`, `this.buf`,
+    // `this.lo` and `this.hi` inside the innermost loop of the whole decode.
+    const safe = this.n - Cursor.VARINT_SAFE;
+    let p = this.p;
     for (let i = 0; i < count; i++) {
-      this.readVarint();
-      const v = this.unsignedValue();
+      let v: number | bigint;
+      // Bounds hoisted out of the element read: with VARINT_SAFE bytes in hand
+      // the ladder cannot run off the end. Near the end of the buffer the
+      // checked reader takes over, so a truncated array still ends as INCOMPLETE
+      // — decided by readVarint, exactly as before.
+      let q = p <= safe ? this.ladder5(p) : -1;
+      if (q < 0) {
+        this.p = p;
+        this.readVarint();
+        q = this.p;
+      }
+      p = q;
+      v = this.unsignedValue();
       // Checked HERE, on the element that carries the value — not after the whole
       // array. §5.2 makes INVALID dominate INCOMPLETE, so a message truncated
       // after an out-of-range element must stay INVALID; a caller that filtered
       // the returned array would never see one that never arrived (#267).
       if (elemMax !== undefined && v > elemMax) {
+        this.p = p;
         throw invalidMsgError("array element above declared width");
       }
       out[i] = v;
     }
+    this.p = p;
     return out;
   }
 
@@ -290,14 +324,27 @@ export class Cursor extends BufferReader {
   ): (number | bigint)[] {
     const count = this.arrayCount(schemaCount);
     const out: (number | bigint)[] = this.arrayAlloc(count);
+    // Local cursor, one-byte element inline — see readUnsignedArray.
+    const safe = this.n - Cursor.VARINT_SAFE;
+    let p = this.p;
     for (let i = 0; i < count; i++) {
-      this.readVarint();
-      const v = this.signedValue();
+      let v: number | bigint;
+      // Bounds hoisted — see readUnsignedArray.
+      let q = p <= safe ? this.ladder5(p) : -1;
+      if (q < 0) {
+        this.p = p;
+        this.readVarint();
+        q = this.p;
+      }
+      p = q;
+      v = this.signedValue();
       if ((elemMin !== undefined && v < elemMin) || (elemMax !== undefined && v > elemMax)) {
+        this.p = p;
         throw invalidMsgError("array element above declared width");
       }
       out[i] = v;
     }
+    this.p = p;
     return out;
   }
 
@@ -309,10 +356,21 @@ export class Cursor extends BufferReader {
   readUnsignedArrayLong(schemaCount?: number): Long[] {
     const count = this.arrayCount(schemaCount);
     const out = this.arrayAlloc<Long>(count);
+    // Local cursor, one-byte element inline — see readUnsignedArray.
+    const safe = this.n - Cursor.VARINT_SAFE;
+    let p = this.p;
     for (let i = 0; i < count; i++) {
-      this.readVarint();
+      // Bounds hoisted — see readUnsignedArray.
+      let q = p <= safe ? this.ladder5(p) : -1;
+      if (q < 0) {
+        this.p = p;
+        this.readVarint();
+        q = this.p;
+      }
+      p = q;
       out[i] = new Long(this.lo, this.hi);
     }
+    this.p = p;
     return out;
   }
 
@@ -320,13 +378,24 @@ export class Cursor extends BufferReader {
   readSignedArrayLong(schemaCount?: number): Long[] {
     const count = this.arrayCount(schemaCount);
     const out = this.arrayAlloc<Long>(count);
+    // Local cursor, one-byte element inline — see readUnsignedArray.
+    const safe = this.n - Cursor.VARINT_SAFE;
+    let p = this.p;
     for (let i = 0; i < count; i++) {
-      this.readVarint();
+      // Bounds hoisted — see readUnsignedArray.
+      let q = p <= safe ? this.ladder5(p) : -1;
+      if (q < 0) {
+        this.p = p;
+        this.readVarint();
+        q = this.p;
+      }
+      p = q;
       const lo = this.lo >>> 0;
       const hi = this.hi >>> 0;
       const mask = (-(lo & 1)) >>> 0; // all ones when the zig-zag lsb is set
       out[i] = new Long((((lo >>> 1) | (hi << 31)) >>> 0) ^ mask, ((hi >>> 1) >>> 0) ^ mask);
     }
+    this.p = p;
     return out;
   }
 
@@ -334,7 +403,14 @@ export class Cursor extends BufferReader {
   readFp32Array(schemaCount?: number): number[] {
     const count = this.arrayFixlenHeader(FixlenSubtype.Fp32, 4, schemaCount);
     const out: number[] = new Array(count);
-    for (let i = 0; i < count; i++) out[i] = this.rawFp32();
+    // The bound is settled for the whole payload by arrayFixlenHeader (it already
+    // rejects a count claiming more than the buffer holds), so the element loop
+    // needs neither a per-element bounds test nor a reload of `this.p` — it walks
+    // one hoisted DataView with a local offset.
+    const dv = this.floats();
+    let p = this.p;
+    for (let i = 0; i < count; i++, p += 4) out[i] = dv.getFloat32(p, true);
+    this.p = p;
     return out;
   }
 
@@ -357,7 +433,12 @@ export class Cursor extends BufferReader {
   readFp64Array(schemaCount?: number): number[] {
     const count = this.arrayFixlenHeader(FixlenSubtype.Fp64, 8, schemaCount);
     const out: number[] = new Array(count);
-    for (let i = 0; i < count; i++) out[i] = this.rawFp64();
+    // See readFp32Array: the payload is bounds-checked whole, so the loop is a
+    // hoisted DataView plus a local offset.
+    const dv = this.floats();
+    let p = this.p;
+    for (let i = 0; i < count; i++, p += 8) out[i] = dv.getFloat64(p, true);
+    this.p = p;
     return out;
   }
 

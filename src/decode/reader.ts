@@ -75,12 +75,25 @@ export abstract class BufferReader {
   }
 
   /** The float-conversion view over the source buffer (see {@link fpView}). */
-  private floats(): DataView {
+  protected floats(): DataView {
     return (this.fpView ??= new DataView(
       this.buf.buffer,
       this.buf.byteOffset,
       this.buf.length,
     ));
+  }
+
+  /**
+   * Consume the next `len` bytes and return the offset they start at, WITHOUT
+   * building a view over them — for a reader that can work off `buf` and a
+   * range, and so should not pay for the `subarray` {@link take} allocates.
+   */
+  protected takeRange(len: number): number {
+    const start = this.p;
+    const end = start + len;
+    if (end > this.n) throw incompleteError("truncated fixlen payload");
+    this.p = end;
+    return start;
   }
 
   /** Hand back a zero-copy view of the next `len` bytes, advancing the cursor. */
@@ -119,12 +132,25 @@ export abstract class BufferReader {
    */
   protected unsignedValue(): number | bigint {
     const hi = this.hi >>> 0; // unsigned: hi's bit 31 must not read as negative
+    // Everything a u8..u32 field or array element can carry lands here with
+    // hi === 0, and there the value is already in `lo` — no float multiply, and
+    // the result stays a Smi below 2^31. This is per array ELEMENT, so it is the
+    // most-executed arithmetic in the decoder.
+    if (hi === 0) return this.lo >>> 0;
     return hi <= 0x1fffff ? hi * TWO32 + (this.lo >>> 0) : joinU64(this.lo >>> 0, hi);
   }
 
   /** The last zig-zag varint as a signed value, number-first (see {@link unsignedValue}). */
   protected signedValue(): number | bigint {
     const hi = this.hi >>> 0;
+    // See unsignedValue: hi === 0 covers every i8..i32 value, and the zig-zag
+    // undo is then two integer ops on the low half — (r >>> 1) ^ -(r & 1) — with
+    // no division and no float multiply. Exact for the whole 32-bit range:
+    // r = 0xFFFFFFFF yields -2^31, which is (r + 1) / -2 as required.
+    if (hi === 0) {
+      const r = this.lo >>> 0;
+      return (r >>> 1) ^ -(r & 1);
+    }
     if (hi <= 0x1fffff) {
       const r = hi * TWO32 + (this.lo >>> 0); // raw zig-zag, ≤ 2^53-1
       return r % 2 === 0 ? r / 2 : -(r + 1) / 2;
@@ -147,13 +173,70 @@ export abstract class BufferReader {
    * the ARRAY_MAX ceiling this feeds and is only ever compared against it.
    */
   protected num(): number {
-    return (this.hi >>> 0) * TWO32 + (this.lo >>> 0);
+    // hi === 0 for every varint that fits 32 bits — every id, length and count on
+    // any real message — and there the float multiply below is pure cost. It is
+    // paid once per field header and once per array count, so it is on the
+    // hottest path the decoder has.
+    return this.hi === 0 ? this.lo >>> 0 : (this.hi >>> 0) * TWO32 + (this.lo >>> 0);
+  }
+
+  /**
+   * Number of buffer bytes that must remain for {@link ladder5} to be safe:
+   * MESSAGE_SPEC §4.1 bounds a varint at ten bytes, so with ten in hand no step
+   * of a bounds-free ladder can run off the end.
+   */
+  protected static readonly VARINT_SAFE = 10;
+
+  /**
+   * Decode a varint of at most FIVE bytes at `p` without a per-byte bounds test,
+   * returning the position past it, or `-1` when the value is longer and the
+   * caller must fall back to {@link readVarint}. The caller must have proved
+   * `n - p >= VARINT_SAFE`.
+   *
+   * Two things make this the shape an array element loop wants, and both are
+   * measured. {@link readVarint} tests `p >= n` before every one of its ten byte
+   * reads — right when a varint may be the last bytes of the message, but inside
+   * an array the caller settles that once for the whole run, so those ten
+   * predicted-false branches are pure cost on the innermost loop of the decode.
+   * (protobufjs's reader does the same: its packed-field loop knows the extent up
+   * front and its ladder carries no bounds test at all.) And stopping at five
+   * bytes keeps the body small enough for V8 to INLINE into that loop, which the
+   * full ten-step ladder is far too large for — the difference between the two on
+   * a five-element array read was 1155 Ir/op and 243.
+   *
+   * Five bytes cover every value below 2^35, which is every element a u8/u16/u32
+   * or i8/i16/i32 array can legally carry and the common case for a 64-bit one,
+   * so the fallback is the rare path. It costs nothing in verdicts: an over-long
+   * element, and every element near the end of the buffer, still goes through
+   * {@link readVarint} and reaches the same INVALID / INCOMPLETE outcome.
+   */
+  protected ladder5(p: number): number {
+    const buf = this.buf;
+    let b = buf[p++]!;
+    let lo = b & 0x7f;
+    if (b < 0x80) { this.lo = lo; this.hi = 0; return p; }
+    b = buf[p++]!;
+    lo |= (b & 0x7f) << 7;
+    if (b < 0x80) { this.lo = lo; this.hi = 0; return p; }
+    b = buf[p++]!;
+    lo |= (b & 0x7f) << 14;
+    if (b < 0x80) { this.lo = lo; this.hi = 0; return p; }
+    b = buf[p++]!;
+    lo |= (b & 0x7f) << 21;
+    if (b < 0x80) { this.lo = lo; this.hi = 0; return p; }
+    // 5th byte straddles the 32-bit boundary: 4 bits to lo, 3 bits to hi.
+    b = buf[p++]!;
+    if (b < 0x80) { this.lo = lo | ((b & 0x0f) << 28); this.hi = (b >> 4) & 0x07; return p; }
+    return -1;
   }
 
   /** The last varint with its low 3 tag bits stripped (`value >> 3`). */
   protected upper(): number {
     // value >> 3 without losing the high bits: drop 3 bits, carry hi's low 3.
-    return (this.hi >>> 0) * (TWO32 / 8) + (this.lo >>> 3);
+    // hi === 0 is the common case (see num()), and there this is a plain shift.
+    return this.hi === 0
+      ? this.lo >>> 3
+      : (this.hi >>> 0) * (TWO32 / 8) + (this.lo >>> 3);
   }
 
   /**
@@ -163,6 +246,37 @@ export abstract class BufferReader {
    * Unrolled, number-only — no `bigint`.
    */
   protected readVarint(): void {
+    // Single-byte fast path, kept deliberately tiny. Every field header, every
+    // fixlen word, every array count and the overwhelming majority of array
+    // elements are one byte, and this is the innermost call of the whole decode
+    // — but the unrolled ladder below is far past what V8 will inline into a
+    // caller, so before this split every one of those reads was a real call, and
+    // the caller could not keep `lo`/`hi` in registers across it. Measured on the
+    // arena's eight-array message: `readUnsignedArray` of five one-byte elements
+    // cost 1155 Ir/op against 243 for the same loop written inline.
+    //
+    // This is the decoder-side twin of `putVarintNum` / `putVarintNumSlow` in the
+    // encoder, which splits for exactly this reason — and which is why the encode
+    // path did not have this problem.
+    const p = this.p;
+    if (p < this.n) {
+      const b = this.buf[p]!;
+      if (b < 0x80) {
+        this.lo = b;
+        this.hi = 0;
+        this.p = p + 1;
+        return;
+      }
+    }
+    this.readVarintSlow();
+  }
+
+  /**
+   * The multi-byte / end-of-buffer tail of {@link readVarint}: the full unrolled
+   * ladder, re-reading from the first byte. Kept out of line so the single-byte
+   * test above stays small enough for the JIT to inline into every call site.
+   */
+  private readVarintSlow(): void {
     const buf = this.buf;
     const n = this.n;
     let p = this.p;
