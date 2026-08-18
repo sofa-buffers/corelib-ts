@@ -1,19 +1,28 @@
 /**
- * `Visitor.fieldBegin` — the push twin of `Cursor.readHeader()`.
+ * `Visitor.fieldBegin` — the push twin of `Cursor.readHeader()`, and where a
+ * schema bound must *not* be taken.
  *
- * The visitor path had no callback between a field's **header varint** and the
- * value's own header word. For a fixlen field the earliest signal was
- * `fixlenBegin`, which needs the *complete* fixlen word — so a message that ends
- * inside that word delivered no event at all and a visitor could not latch a
- * bound the header alone had already decided (an element id past the schema
- * `count`, MESSAGE_SPEC §7.1/§5.1). The pull path has no such gap: `readHeader()`
- * publishes `id` / `wire` (and peeks `fixSub`) one byte into the word, which is
- * exactly why the two paths disagreed — whole-buffer `INVALID`, chunked
- * `INCOMPLETE`. CORELIB_PLAN §5.2 gives INVALID precedence over INCOMPLETE, and
- * §6.4 / MESSAGE_SPEC §7.2 forbid a chunk boundary changing the outcome.
+ * The hook was added for the divergence Crucible F-0061 found
+ * (`r3_wrapper_reopen_overindex_trunc.bin` against the `probe` schema —
+ * `string_array` at id 200, `count: 5`, corelib-ts#97): an element id past the
+ * declared `count` in a message that ends inside the element's fixlen word. The
+ * push path saw no event at all, because `fixlenBegin` needs the *complete*
+ * word, and answered `INCOMPLETE`; the pull path peeked the subtype one byte
+ * into that word and answered `INVALID`. The same bytes, two verdicts.
  *
- * Reproducer: Crucible F-0061 `r3_wrapper_reopen_overindex_trunc.bin` against
- * the `probe` schema (`string_array` at id 200, `count: 5`), corelib-ts#97.
+ * It was closed from the other end. CORELIB_PLAN §4.1 makes the pull path's
+ * peek the defect: a varint has no value before its final byte, and a decoder
+ * MUST NOT let a settled low bit influence an outcome "even when the field's id
+ * would violate a schema bound (MESSAGE_SPEC §7.1) once the subtype confirmed
+ * the field is the declared one" — because §7.3 skips a field whose subtype
+ * contradicts the declared type instead of rejecting it, so the id alone never
+ * settles anything. `Cursor` now waits for the whole word, both surfaces answer
+ * `INCOMPLETE`, and generated code takes the bound at `fixlenBegin`.
+ *
+ * So this file pins two things: the timing (both surfaces, every chunking) and
+ * what the hook is actually for — announcing every field header, in wire order,
+ * to a reader that would otherwise implement eight value callbacks to see the
+ * same thing.
  */
 
 import { describe, expect, it } from "vitest";
@@ -245,6 +254,52 @@ describe("Visitor.fieldBegin", () => {
         expect(feed(CTRL, size, q)).toBe(DecodeStatus.Complete);
         expect(q.elements.seen).toEqual(["0:1", "0:1"]);
       }
+    });
+  });
+
+  // The clause that makes the id alone insufficient, shown on bytes rather than
+  // by argument: the SAME over-index id, this time with a complete fixlen word
+  // whose subtype is Blob where the schema declares String. MESSAGE_SPEC §7.3
+  // skips such a field — it was never this array's value, so the array's bound
+  // has nothing to say about it — and it wins against the schema bound. A
+  // reader that rejected at the header would answer INVALID here, on a message
+  // that is valid.
+  describe("an over-index element whose subtype contradicts the schema (§7.3)", () => {
+    // c6 0c        wrapper id 200, sequence start
+    // 02 0a 41     element 0: fixlen, String, length 1, payload "A"
+    // 07           sequence end
+    // c6 0c        the same wrapper re-opened (MESSAGE_SPEC §7.4)
+    // 8a 0a        element header: id 161, wire Fixlen  <- 161 >= count 5
+    // 0b 41        fixlen word: length 1, subtype Blob  <- not the declared String
+    // 07           sequence end
+    const SKIPPED = new Uint8Array([
+      0xc6, 0x0c, 0x02, 0x0a, 0x41, 0x07, 0xc6, 0x0c, 0x8a, 0x0a, 0x0b, 0x41, 0x07,
+    ]);
+
+    it("is skipped, not rejected, on both surfaces", () => {
+      expect(cursorVerdict(SKIPPED)).toBe(DecodeStatus.Complete);
+      const p = new Probe();
+      expect(whole(SKIPPED, p)).toBe(DecodeStatus.Complete);
+      expect(p.elements.seen).toEqual(["0:1"]); // only the in-range string element
+      for (const size of CHUNKINGS) {
+        expect(feed(SKIPPED, size, new Probe())).toBe(DecodeStatus.Complete);
+      }
+    });
+
+    it("would be rejected by a bound taken from fieldBegin — which is why it is not", () => {
+      const wrong: Visitor = {
+        sequenceBegin: (id) =>
+          id === WRAPPER
+            ? {
+                fieldBegin(elem: number): void {
+                  if (elem >= COUNT) {
+                    throw new SofabError(SofabErrorCode.InvalidMsg, `element ${elem} >= count ${COUNT}`);
+                  }
+                },
+              }
+            : undefined,
+      };
+      expect(whole(SKIPPED, wrong)).toBe(DecodeStatus.Invalid);
     });
   });
 

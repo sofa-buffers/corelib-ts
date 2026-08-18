@@ -105,10 +105,10 @@ class FastDecoder extends BufferReader {
         continue;
       }
 
-      // Announce the header before the value — and before the value's own header
-      // word — so a bound the header alone decides (an element id past the
-      // schema count) is taken at the same point on both decode paths, and even
-      // when the word behind it is truncated away (see Visitor.fieldBegin).
+      // Announce the header before the value — and before the value's own
+      // header word — so an observing visitor sees the field stream in wire
+      // order. It carries no verdict of its own: a schema bound waits for the
+      // word behind it (CORELIB_PLAN §4.1; see Visitor.fieldBegin).
       top.fieldBegin?.(id, type as WireType);
 
       switch (type) {

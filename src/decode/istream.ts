@@ -88,17 +88,27 @@ export interface Visitor<TInt = number | bigint> {
    * header word (a fixlen length word, an array count word, the fields of a
    * nested sequence).
    *
-   * The push twin of {@link Cursor.readHeader}, and it exists because the two
-   * paths must agree. Whatever the header alone decides has to be decidable
-   * here: a wrapper-array element whose id is past the schema `count`
-   * (MESSAGE_SPEC §7.1/§5.1) is such a verdict — `id >= count` needs no length,
-   * no count and no payload. Without this hook the earliest signal for a fixlen
-   * element was {@link fixlenBegin}, which needs the *complete* fixlen word, so
-   * a message ending inside that word delivered no event at all and degraded to
-   * `INCOMPLETE` — while the same bytes through {@link Cursor.readHeader} are
-   * `INVALID`. CORELIB_PLAN §5.2 gives INVALID precedence over INCOMPLETE for
-   * input already known to be malformed, and §6.4 forbids a chunk boundary
-   * changing the outcome (corelib-ts#97).
+   * The push twin of {@link Cursor.readHeader}, and that is the whole of its
+   * job: an observation point for a reader that wants the field stream as it
+   * arrives — which id, in which scope, in which order — without implementing
+   * the eight value callbacks it would otherwise take to see the same thing.
+   *
+   * **A schema bound does not belong here.** The header settles `id` and
+   * `wire`, and nothing else. An element id past the schema `count`
+   * (MESSAGE_SPEC §7.1/§5.1) looks decidable from the id alone, and it is not:
+   * §7.3 applies that bound only to a field whose *subtype* has confirmed it is
+   * the declared one, and a contradicting subtype is skipped rather than
+   * rejected. The subtype arrives in the fixlen word, so the verdict is due at
+   * {@link fixlenBegin} — which is where generated code puts it. CORELIB_PLAN
+   * §4.1 makes the timing normative: a message ending inside that word is
+   * `INCOMPLETE` "even when the field's id would violate a schema bound
+   * (MESSAGE_SPEC §7.1) once the subtype confirmed the field is the declared
+   * one", because the low 3 bits of an unfinished varint must not influence an
+   * outcome even though they are already arithmetically fixed. Rejecting from
+   * here answers `INVALID` where §4.1 requires `INCOMPLETE`, and, since the
+   * pull path waits for the complete word, makes the two surfaces disagree on
+   * the same bytes — the divergence corelib-ts#97 reported, now closed from the
+   * other end.
    *
    * Called exactly once per field, in every scope, for every wire type — the
    * sequence *end* marker excepted: it closes a scope rather than opening a
@@ -107,10 +117,12 @@ export interface Visitor<TInt = number | bigint> {
    * header. For a nested sequence it fires on the *enclosing* visitor, before
    * {@link sequenceBegin}.
    *
-   * Throwing from it rejects the field, exactly as from {@link fixlenBegin}.
-   * Checks that need more than `id` and `wire` still belong on the later, more
-   * informative hook: a fixlen *subtype* mismatch on {@link fixlenBegin}, a
-   * declared length or element count on {@link fixlenBegin} / {@link arrayBegin}.
+   * Throwing from it rejects the field, exactly as from {@link fixlenBegin} —
+   * for a verdict the header really does settle on its own, such as an id this
+   * reader will not accept in any shape. Anything schema-shaped belongs on the
+   * later, more informative hook: a fixlen *subtype* mismatch and a declared
+   * length on {@link fixlenBegin}, a declared element count on
+   * {@link arrayBegin}.
    */
   fieldBegin?(id: number, wire: WireType): void;
   /**
