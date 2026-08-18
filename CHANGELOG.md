@@ -55,6 +55,28 @@ While the version is below `1.0.0`, breaking changes bump the **minor** version.
 
 ### Added
 
+- **Scalar 64-bit `Long` codecs: `OStream.write{Unsigned,Signed}Long` and
+  `Cursor.read{Unsigned,Signed}Long`** (#143). The `bigint`-free 64-bit path
+  existed for arrays only (`write/readUnsignedArrayLong` and the signed twins),
+  so a u64/i64 **scalar** had no `Long` codec at all. Downstream that capped
+  `sofabgen`'s `int64: long` mode at Long-backed *arrays* — its scalars had to
+  stay `bigint` for want of these four methods (sofa-buffers/generator#339).
+
+  Wire-identical to the `bigint` writers for every value in the 64-bit domain,
+  and cheaper on both sides: the writer reads the `Long`'s `.low`/`.high`
+  straight into `putVarintLoHi`, with no range check and no scratch round-trip
+  (a `Long` is 64 bits of raw storage, so it is in range by construction — the
+  check `writeUnsigned` performs exists only because a `number`/`bigint`
+  argument can be negative or ≥ 2^64), and the reader hands back the two halves
+  `readVarint` already produced instead of deciding a representation per value.
+
+  That last point is the reason the methods exist rather than a convenience
+  wrapper: `readUnsigned` is number-first — a `number` below 2^53, a `bigint`
+  above — so the representation follows the *value*. `readUnsignedLong` returns
+  a `Long` for every value, small ones included, which is what lets a generated
+  field's runtime type be a property of the **field**. Nothing else changes:
+  no wire, no verdicts, and the number-first readers are untouched.
+
 - **`IStream.feed()` returns the three-valued decode outcome, and `IStream.status()`
   re-reads it** (#112). CORELIB_PLAN §6 requires `feed(bytes)` to *return* the
   `COMPLETE` / `INCOMPLETE` / `INVALID` outcome of §5.2 with **no** separate
