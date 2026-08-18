@@ -235,17 +235,24 @@ decode(bytes, new My());
 `fieldBegin(id, wire)` is announced first for every field — right after the header
 varint, before the value and before the value's *own* header word (a fixlen length
 word, an array count word, a nested sequence's fields). It is the push twin of
-`Cursor.readHeader()`, and it is where a check the header alone decides belongs: a
-wrapper-array element whose id is past the schema `count` needs no length, no
-count and no payload, and a message that ends inside the word behind that header
-fires no later callback at all — so without it the same bytes were `INVALID`
-through the cursor and `INCOMPLETE` through the visitor, which §5.2 forbids.
-Throwing from it rejects the field, as from `fixlenBegin`. The sequence-*end*
-marker gets no `fieldBegin`: it closes a scope rather than opening a field, the
-same answer `readHeader()` gives by returning `false` for it. Checks that need
-more than `id` and `wire` stay on the later, more informative hook — a fixlen
-subtype on `fixlenBegin`, a declared length or element count on `fixlenBegin` /
-`arrayBegin`.
+`Cursor.readHeader()`: an observation point for a reader that wants the field
+stream in wire order — which id, in which scope, in which order — without writing
+the eight value callbacks it would otherwise take to see the same thing. The
+sequence-*end* marker gets none: it closes a scope rather than opening a field,
+the same answer `readHeader()` gives by returning `false` for it.
+
+**Do not apply a schema bound from it.** An element id past the declared `count`
+looks decidable from the id alone, and is not: that bound applies only to a field
+whose *subtype* has confirmed it is the declared one, so it belongs on
+`fixlenBegin`. A message ending inside the fixlen word is `INCOMPLETE` even when
+the id would violate the bound — the low 3 bits of an unfinished varint are
+already arithmetically fixed, and a decoder still must not act on them
+(CORELIB_PLAN §4.1). Rejecting early answers `INVALID` where `INCOMPLETE` is
+required, and makes this path disagree with the cursor on the same bytes.
+Throwing from `fieldBegin` is still how you reject a field the header alone
+settles — an id you will not accept in any shape. Everything schema-shaped stays
+on the later, more informative hook: a fixlen subtype and a declared length on
+`fixlenBegin`, a declared element count on `arrayBegin`.
 
 ### Deserialize stream
 
