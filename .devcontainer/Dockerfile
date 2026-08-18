@@ -33,7 +33,8 @@ RUN corepack enable \
        npm@latest
 
 # Claude Code
-RUN npm install -g @anthropic-ai/claude-code
+RUN npm install -g @anthropic-ai/claude-code \
+    && node "$(npm root -g)/@anthropic-ai/claude-code/install.cjs"
 
 # GitHub CLI (gh) — installed from GitHub's official apt repository
 RUN mkdir -p -m 755 /etc/apt/keyrings \
