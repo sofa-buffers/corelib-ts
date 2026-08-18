@@ -254,6 +254,22 @@ settles — an id you will not accept in any shape. Everything schema-shaped sta
 on the later, more informative hook: a fixlen subtype and a declared length on
 `fixlenBegin`, a declared element count on `arrayBegin`.
 
+`sequenceBegin(id)` has three answers. Return a visitor and the nested scope's
+fields go to it; return **`null`** and the whole subtree is skipped — no callback
+of any kind fires inside it, a scope opened within it is skipped too without
+being offered, and no `sequenceEnd` arrives for what was skipped. Return nothing
+and the current visitor keeps receiving, which merges two id spaces (a nested
+scope's ids are its own) and is rarely what you want.
+
+`null` is what you say about a subtree you have no destination for. The bytes are
+still parsed — a sequence is framed by markers rather than by a length, so its end
+has to be found — but nothing is decoded into existence for it: no payload views,
+no boxed values, and the caps in `DecodeLimits` do not fire, because they bound
+what *this reader* is handed and a skipped scope hands it nothing. Format ceilings
+(`ARRAY_MAX`, `FIXLEN_MAX`, `MAX_DEPTH`, the varint bound) apply inside a skipped
+subtree exactly as outside it: they bound what the wire may express, which is not
+the reader's to waive.
+
 ### Deserialize stream
 
 `IStream` resumes across chunk boundaries, so feed it whatever the transport hands

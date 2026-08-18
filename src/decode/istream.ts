@@ -207,15 +207,32 @@ export interface Visitor<TInt = number | bigint> {
   /** End of an array. */
   arrayEnd?(id: number): void;
   /**
-   * Start of a nested sequence. Return a {@link Visitor} to route the nested
-   * fields to it (its {@link Visitor.sequenceEnd} fires at the matching end);
-   * return nothing to keep using the current visitor.
+   * Start of a nested sequence. Three answers:
+   *
+   * * a {@link Visitor} — route the nested fields to it; its
+   *   {@link Visitor.sequenceEnd} fires at the matching end;
+   * * `null` — **skip this subtree**. No callback of any kind fires inside it,
+   *   nesting included, and nothing in it can reach a visitor again: a scope
+   *   opened inside a skipped one is skipped too, without being offered.
+   * * nothing (`undefined`) — keep using the current visitor, so the nested
+   *   scope's fields arrive here. Note that a nested scope's ids are its own
+   *   (§4.9), so this merges two id spaces and is rarely what a reader wants.
+   *
+   * `null` is what a reader says about a subtree it has no destination for —
+   * an unknown id, a field it does not care about. It is worth saying: a
+   * skipped scope is still parsed (a sequence is framed by markers, not by a
+   * length, so its end has to be found), but nothing is decoded into
+   * existence for it. Payload views are not built, values are not boxed, and
+   * the receiver caps of {@link DecodeLimits} do not fire — they bound what
+   * this reader is handed, and a skipped scope hands it nothing. Format
+   * ceilings (`ARRAY_MAX`, `FIXLEN_MAX`, `MAX_DEPTH`, the varint bound) still
+   * apply everywhere, skipped or not: they bound what the wire may express.
    *
    * The child carries the parent's `TInt`, which is exactly right: {@link longs}
    * is read once from the **root**, so a whole message tree is on one channel or
    * the other and a child never sees a different representation than its parent.
    */
-  sequenceBegin?(id: number): Visitor<TInt> | void;
+  sequenceBegin?(id: number): Visitor<TInt> | null | void;
   /** End of the nested sequence this visitor was handling. */
   sequenceEnd?(): void;
 }
