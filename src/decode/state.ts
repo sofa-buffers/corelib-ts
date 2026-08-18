@@ -55,7 +55,7 @@ export class DecoderState {
    * loads and a bounds check at every one of the dozen dispatch sites below, on
    * a path that runs per array element.
    */
-  private cur: AnyVisitor = EMPTY_VISITOR;
+  private cur: AnyVisitor | null = EMPTY_VISITOR;
   /**
    * {@link Visitor.longs}, read ONCE from the root visitor in {@link push} and
    * fixed for the whole stream — see the note in {@link "./fast"}: refreshing it
@@ -72,7 +72,7 @@ export class DecoderState {
    * all; entries are overwritten in place rather than pushed and popped, so a
    * message that nests repeatedly allocates once.
    */
-  private parents: AnyVisitor[] | null = null;
+  private parents: (AnyVisitor | null)[] | null = null;
   /** Number of nested sequences currently open — 0 at the root scope. */
   private depth = 0;
   /**
@@ -180,7 +180,7 @@ export class DecoderState {
           // that ends inside the word behind it stays INCOMPLETE: the bound
           // that word settles is not this event's to take (CORELIB_PLAN §4.1;
           // see Visitor.fieldBegin).
-          this.cur.fieldBegin?.(id, type as WireType);
+          this.cur?.fieldBegin?.(id, type as WireType);
           this.dispatch(type);
           break;
         }
@@ -190,7 +190,7 @@ export class DecoderState {
           if (!this.vComplete) return;
           const value = this.curLongs ? new Long(this.vLo, this.vHi) : this.vUnsigned();
           this.state = S.Header;
-          this.cur.unsigned?.(this.id, value);
+          this.cur?.unsigned?.(this.id, value);
           break;
         }
 
@@ -201,7 +201,7 @@ export class DecoderState {
             ? zigzagDecodeLong(this.vLo, this.vHi)
             : this.vSigned();
           this.state = S.Header;
-          this.cur.signed?.(this.id, value);
+          this.cur?.signed?.(this.id, value);
           break;
         }
 
@@ -219,10 +219,10 @@ export class DecoderState {
           // takes the bound as an argument (corelib-ts#105). A caller needing
           // that distinction on a bounded field leaves the cap unset and
           // enforces the schema bound from fixlenBegin / arrayBegin.
-          if (sub === FixlenSubtype.String && len > this.maxStringLen) {
+          if (this.cur !== null && sub === FixlenSubtype.String && len > this.maxStringLen) {
             throw limitExceededError(`string length ${len} exceeds maxStringLen ${this.maxStringLen}`);
           }
-          if (sub === FixlenSubtype.Blob && len > this.maxBlobLen) {
+          if (this.cur !== null && sub === FixlenSubtype.Blob && len > this.maxBlobLen) {
             throw limitExceededError(`blob length ${len} exceeds maxBlobLen ${this.maxBlobLen}`);
           }
           this.fixSub = sub as FixlenSubtype;
@@ -233,7 +233,7 @@ export class DecoderState {
           // the declared length is decidable here, and only here for a message
           // that ends right after it (§5.2: INVALID over INCOMPLETE).
           if (sub === FixlenSubtype.String || sub === FixlenSubtype.Blob) {
-            this.cur.fixlenBegin?.(this.id, sub as FixlenSubtype, len);
+            this.cur?.fixlenBegin?.(this.id, sub as FixlenSubtype, len);
           }
           if (sub === FixlenSubtype.Fp32 || sub === FixlenSubtype.Fp64) {
             const want = sub === FixlenSubtype.Fp32 ? 4 : 8;
@@ -243,7 +243,7 @@ export class DecoderState {
           } else {
             // string / blob: emit empties immediately, otherwise stream below
             if (this.fixLen === 0) {
-              this.emitBytes(input.subarray(0, 0));
+              if (this.cur !== null) this.emitBytes(input.subarray(0, 0));
               this.state = S.Header;
             } else {
               this.state = S.FixlenBytes;
@@ -265,14 +265,14 @@ export class DecoderState {
             // (Visitor.fp32Raw): `value` (a double) would have quieted a
             // signaling NaN (§4.6), but the view is waste for a value consumer.
             const top = this.cur;
-            top.fp32?.(this.id, value, top.fp32Raw ? rawFp32Bytes(this.fpLo) : undefined);
-          } else this.cur.fp64?.(this.id, value);
+            top?.fp32?.(this.id, value, top.fp32Raw ? rawFp32Bytes(this.fpLo) : undefined);
+          } else this.cur?.fp64?.(this.id, value);
           break;
         }
 
         case S.FixlenBytes: {
           const take = Math.min(n - i, this.fixLen - this.fixOff);
-          this.emitBytes(input.subarray(i, i + take));
+          if (this.cur !== null) this.emitBytes(input.subarray(i, i + take));
           i += take;
           this.fixOff += take;
           if (this.fixOff === this.fixLen) this.state = S.Header;
@@ -286,7 +286,7 @@ export class DecoderState {
           if (count > ARRAY_MAX) this.fail("array count out of range");
           // Applied to every array: no schema count reaches this surface (see
           // the FixlenLen case above, corelib-ts#105).
-          if (count > this.maxArrayCount) {
+          if (this.cur !== null && count > this.maxArrayCount) {
             throw limitExceededError(`array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`);
           }
           this.arrCount = count;
@@ -302,11 +302,11 @@ export class DecoderState {
             // §4.7: a zero-count integer array is empty — no payload follows and
             // no element-length word exists (element width is API-only).
             this.state = S.Header;
-            this.cur.arrayBegin?.(this.id, this.arrKind, 0);
-            this.cur.arrayEnd?.(this.id);
+            this.cur?.arrayBegin?.(this.id, this.arrKind, 0);
+            this.cur?.arrayEnd?.(this.id);
           } else {
             this.state = this.arrKind === ArrayKind.Unsigned ? S.ArrayUElem : S.ArraySElem;
-            this.cur.arrayBegin?.(this.id, this.arrKind, this.arrCount);
+            this.cur?.arrayBegin?.(this.id, this.arrKind, this.arrCount);
           }
           break;
         }
@@ -344,20 +344,20 @@ export class DecoderState {
                 const vhi = this.vHi >>> 0;
                 v = vhi <= 0x1fffff ? vhi * TWO32 + (this.vLo >>> 0) : joinU64(this.vLo >>> 0, vhi);
               }
-              cur.arrayUnsigned?.(id, idx, v);
+              cur?.arrayUnsigned?.(id, idx, v);
               this.arrIndex = ++idx;
             }
           }
           if (idx === count) {
             this.state = S.Header;
-            cur.arrayEnd?.(id);
+            cur?.arrayEnd?.(id);
             break;
           }
           if (i >= n) break;
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
           const value = wantLongs ? new Long(this.vLo, this.vHi) : this.vUnsigned();
-          cur.arrayUnsigned?.(id, idx, value);
+          cur?.arrayUnsigned?.(id, idx, value);
           this.advanceArray();
           break;
         }
@@ -385,20 +385,20 @@ export class DecoderState {
                   v = zigzagDecodeLoHi(vlo, vhi);
                 }
               }
-              cur.arraySigned?.(id, idx, v);
+              cur?.arraySigned?.(id, idx, v);
               this.arrIndex = ++idx;
             }
           }
           if (idx === count) {
             this.state = S.Header;
-            cur.arrayEnd?.(id);
+            cur?.arrayEnd?.(id);
             break;
           }
           if (i >= n) break;
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
           const value = wantLongs ? zigzagDecodeLong(this.vLo, this.vHi) : this.vSigned();
-          cur.arraySigned?.(id, idx, value);
+          cur?.arraySigned?.(id, idx, value);
           this.advanceArray();
           break;
         }
@@ -421,11 +421,11 @@ export class DecoderState {
             // §4.8: an empty fixlen array is [ header ][ count = 0 ][ fixlen_word ]
             // with no payload — the word above yielded the true element kind.
             this.state = S.Header;
-            this.cur.arrayBegin?.(this.id, this.arrKind, this.arrCount);
-            this.cur.arrayEnd?.(this.id);
+            this.cur?.arrayBegin?.(this.id, this.arrKind, this.arrCount);
+            this.cur?.arrayEnd?.(this.id);
           } else {
             this.state = S.ArrayFp;
-            this.cur.arrayBegin?.(this.id, this.arrKind, this.arrCount);
+            this.cur?.arrayBegin?.(this.id, this.arrKind, this.arrCount);
           }
           break;
         }
@@ -441,8 +441,8 @@ export class DecoderState {
           this.fpBegin(this.need); // next element starts from a clear accumulator
           if (isFp32) {
             const top = this.cur;
-            top.arrayFp32?.(this.id, this.arrIndex, value, top.fp32Raw ? rawFp32Bytes(bits) : undefined);
-          } else this.cur.arrayFp64?.(this.id, this.arrIndex, value);
+            top?.arrayFp32?.(this.id, this.arrIndex, value, top.fp32Raw ? rawFp32Bytes(bits) : undefined);
+          } else this.cur?.arrayFp64?.(this.id, this.arrIndex, value);
           this.advanceArray();
           break;
         }
@@ -518,8 +518,17 @@ export class DecoderState {
         if (d >= MAX_DEPTH) {
           this.fail(`nesting exceeds MAX_DEPTH (${MAX_DEPTH})`);
         }
+        // null = skip this subtree; undefined = keep the current visitor. A
+        // scope opened inside a skipped one is never offered: `parent` is
+        // already null, so nesting cannot climb back out of a discarded
+        // subtree — and the depth still counts it, so the frame has to close
+        // before the stream is Complete.
         const parent = this.cur;
-        const child = parent.sequenceBegin?.(this.id) ?? parent;
+        let child: AnyVisitor | null = null;
+        if (parent !== null) {
+          const r = parent.sequenceBegin?.(this.id);
+          child = r === null ? null : (r ?? parent);
+        }
         (this.parents ??= [])[d] = parent;
         this.depth = d + 1;
         this.cur = child;
@@ -535,7 +544,7 @@ export class DecoderState {
     const d = this.depth;
     if (d === 0) this.fail("unbalanced sequence end");
     this.state = S.Header;
-    this.cur.sequenceEnd?.();
+    this.cur?.sequenceEnd?.();
     this.depth = d - 1;
     this.cur = this.parents![d - 1]!;
   }
@@ -543,12 +552,13 @@ export class DecoderState {
   private advanceArray(): void {
     if (++this.arrIndex === this.arrCount) {
       this.state = S.Header;
-      this.cur.arrayEnd?.(this.id);
+      this.cur?.arrayEnd?.(this.id);
     }
   }
 
+  /** Hand one payload chunk to the current scope. Never called while skipping. */
   private emitBytes(chunk: Uint8Array): void {
-    const v = this.cur;
+    const v = this.cur!;
     if (this.fixSub === FixlenSubtype.String) v.string?.(this.id, this.fixLen, this.fixOff, chunk);
     else v.blob?.(this.id, this.fixLen, this.fixOff, chunk);
   }

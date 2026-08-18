@@ -55,6 +55,33 @@ While the version is below `1.0.0`, breaking changes bump the **minor** version.
 
 ### Added
 
+- **`Visitor.sequenceBegin` can return `null` to skip a subtree** (#149). It had
+  two answers — a child visitor, or nothing, meaning "keep the current visitor" —
+  and no way to say *I have no destination for this scope*. Readers said it with
+  a stand-in visitor that swallowed everything, and every generated TypeScript
+  module carried one for the purpose
+  (`const _DEAD: Visitor = { sequenceBegin(): Visitor { return _DEAD; } };`).
+
+  The dummy stood in for a decoder state that was missing, so a discarded subtree
+  still paid: a `subarray` view per fixlen field, a property lookup per callback,
+  and the receiver caps of a reader that would never see the payload. `null` says
+  it directly, on both push surfaces. Nothing inside a skipped scope is offered
+  to anyone — a sequence opened within it is skipped too, and no `sequenceEnd`
+  arrives for what was skipped.
+
+  Two bounds are deliberately treated differently inside a skipped subtree. The
+  **receiver caps** of `DecodeLimits` (`maxStringLen`, `maxBlobLen`,
+  `maxArrayCount`) do **not** fire: they bound what this reader is handed, and a
+  skipped scope hands it nothing. This matches corelib-dart, whose cap sits
+  inside `if (read)`. **Format ceilings** — `ARRAY_MAX`, `FIXLEN_MAX`,
+  `MAX_DEPTH`, the varint bound, the reserved fixlen subtypes — still apply
+  everywhere: they bound what the wire may express, which is not a reader's to
+  waive. A skipped scope also still counts toward depth and balance, so a stream
+  truncated inside one is `INCOMPLETE`, never `COMPLETE`.
+
+  Additive: `undefined` keeps its meaning, and `null` was not assignable to the
+  old `Visitor | void` return type, so no existing visitor changes behaviour.
+
 - **Scalar 64-bit `Long` codecs** (#143). The `bigint`-free 64-bit path existed
   for *arrays* only (`writeUnsignedArrayLong` / `readUnsignedArrayLong`, and the
   signed twins); a `u64` / `i64` **scalar** could only be written from, and
