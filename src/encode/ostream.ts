@@ -348,6 +348,42 @@ export class OStream {
     this.putVarintLoHi(zLo, zHi);
   }
 
+  /**
+   * Write an unsigned 64-bit scalar from a {@link Long} — the `bigint`-free
+   * twin of {@link writeUnsigned}, and the scalar counterpart of
+   * {@link writeUnsignedArrayLong}. Produces the identical wire.
+   *
+   * No range check and no scratch round-trip: a `Long` is 64 bits of raw
+   * two's-complement storage, so every value it can hold is in range by
+   * construction — the check {@link writeUnsigned} performs exists only because
+   * a `number`/`bigint` argument can be negative or ≥ 2^64.
+   */
+  writeUnsignedLong(id: number, value: Long): void {
+    // Halves read out BEFORE `header`, which may flush into caller code that
+    // re-enters this encoder — the same ordering rule as writeUnsigned, even
+    // though a Long is immutable and could not itself be clobbered.
+    const lo = value.low;
+    const hi = value.high;
+    this.header(id, WireType.Unsigned);
+    this.putVarintLoHi(lo, hi);
+  }
+
+  /**
+   * Write a signed 64-bit scalar (zig-zag) from a {@link Long} — the
+   * `bigint`-free twin of {@link writeSigned}. Zig-zag `(n << 1) ^ (n >> 63)` is
+   * computed on the lo/hi pair, so the varint goes out at its exact size (a
+   * fixed caller buffer must not see a 10-byte demand for a 2-byte field).
+   */
+  writeSignedLong(id: number, value: Long): void {
+    const lo = value.low;
+    const hi = value.high;
+    const sgn = -(hi >>> 31) >>> 0;
+    const zLo = (((lo << 1) >>> 0) ^ sgn) >>> 0;
+    const zHi = ((((hi << 1) | (lo >>> 31)) >>> 0) ^ sgn) >>> 0;
+    this.header(id, WireType.Signed);
+    this.putVarintLoHi(zLo, zHi);
+  }
+
   /** Write a boolean field (encoded as the unsigned value 0 or 1). */
   writeBoolean(id: number, value: boolean): void {
     this.header(id, WireType.Unsigned);

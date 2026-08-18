@@ -196,6 +196,35 @@ export class Cursor extends BufferReader {
     return this.signedValue();
   }
 
+  /**
+   * Read an unsigned 64-bit scalar into a {@link Long} — the `bigint`-free twin
+   * of {@link readUnsigned}, and the scalar counterpart of
+   * {@link readUnsignedArrayLong}.
+   *
+   * {@link readUnsigned} is number-first: it decides a representation per value
+   * and materialises a `bigint` past 2^53-1. This one hands back the two halves
+   * the varint reader already produced, so the value's representation is a
+   * property of the FIELD, not of the value that happened to arrive — which is
+   * what lets a generated `Long` field hold a `Long` for every value.
+   */
+  readUnsignedLong(): Long {
+    this.readVarint();
+    return new Long(this.lo, this.hi);
+  }
+
+  /**
+   * Read a signed 64-bit scalar (zig-zag) into a {@link Long} — the `bigint`-free
+   * twin of {@link readSigned}. The zig-zag undo runs on the halves, as in
+   * {@link readSignedArrayLong}.
+   */
+  readSignedLong(): Long {
+    this.readVarint();
+    const lo = this.lo >>> 0;
+    const hi = this.hi >>> 0;
+    const mask = (-(lo & 1)) >>> 0; // all ones when the zig-zag lsb is set
+    return new Long((((lo >>> 1) | (hi << 31)) >>> 0) ^ mask, ((hi >>> 1) >>> 0) ^ mask);
+  }
+
   /** Read a 32-bit float scalar (wire {@link WireType.Fixlen}, subtype fp32). */
   readFp32(): number {
     this.fixlenHeader(FixlenSubtype.Fp32, 4);
