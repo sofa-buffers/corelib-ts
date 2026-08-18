@@ -23,9 +23,10 @@ import {
 import { invalidMsgError, limitExceededError } from "../errors.js";
 import { joinU64 } from "../varint/bits64.js";
 import { fp32FromBits, fp64FromBits, rawFp32Bytes } from "../varint/num64.js";
-import { zigzagDecodeLoHi } from "../varint/zigzag.js";
+import { Long } from "../long.js";
+import { zigzagDecodeLoHi, zigzagDecodeLong } from "../varint/zigzag.js";
 import type { DecodeLimits } from "./limits.js";
-import type { Visitor } from "./istream.js";
+import type { AnyVisitor } from "./istream.js";
 
 const enum S {
   Header,
@@ -44,7 +45,7 @@ const enum S {
 const TWO32 = 0x1_0000_0000; // 2^32, for combining the 32-bit halves
 
 /** Placeholder for {@link DecoderState.cur} before the first {@link DecoderState.push}. */
-const EMPTY_VISITOR: Visitor = {};
+const EMPTY_VISITOR: AnyVisitor = {};
 
 export class DecoderState {
   private state = S.Header;
@@ -54,7 +55,14 @@ export class DecoderState {
    * loads and a bounds check at every one of the dozen dispatch sites below, on
    * a path that runs per array element.
    */
-  private cur: Visitor = EMPTY_VISITOR;
+  private cur: AnyVisitor = EMPTY_VISITOR;
+  /**
+   * {@link Visitor.longs}, read ONCE from the root visitor in {@link push} and
+   * fixed for the whole stream — see the note in {@link "./fast"}: refreshing it
+   * per scope is a megamorphic property load at every sequence transition, and
+   * it measured. The root decides; a child visitor's own flag is ignored.
+   */
+  private curLongs = false;
   /** Set once the first {@link push} has installed its root visitor into {@link cur}. */
   private rooted = false;
   /**
@@ -64,7 +72,7 @@ export class DecoderState {
    * all; entries are overwritten in place rather than pushed and popped, so a
    * message that nests repeatedly allocates once.
    */
-  private parents: Visitor[] | null = null;
+  private parents: AnyVisitor[] | null = null;
   /** Number of nested sequences currently open — 0 at the root scope. */
   private depth = 0;
   /**
@@ -134,7 +142,7 @@ export class DecoderState {
   }
 
   /** Feed `input` to the machine, dispatching to `root` and its sub-visitors. */
-  push(input: Uint8Array, root: Visitor): void {
+  push(input: Uint8Array, root: AnyVisitor): void {
     // §5.2: `INVALID` is terminal. Once the input has been proved malformed the
     // stream consumes nothing further and drives no visitor callbacks — it just
     // re-reports the original defect. One perfectly-predicted branch per chunk
@@ -145,6 +153,7 @@ export class DecoderState {
     if (!this.rooted) {
       this.rooted = true;
       this.cur = root;
+      this.curLongs = root.longs === true;
     }
     let i = 0;
     const n = input.length;
@@ -179,7 +188,7 @@ export class DecoderState {
         case S.ScalarU: {
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
-          const value = this.vUnsigned();
+          const value = this.curLongs ? new Long(this.vLo, this.vHi) : this.vUnsigned();
           this.state = S.Header;
           this.cur.unsigned?.(this.id, value);
           break;
@@ -188,7 +197,9 @@ export class DecoderState {
         case S.ScalarS: {
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
-          const value = this.vSigned();
+          const value = this.curLongs
+            ? zigzagDecodeLong(this.vLo, this.vHi)
+            : this.vSigned();
           this.state = S.Header;
           this.cur.signed?.(this.id, value);
           break;
@@ -310,6 +321,7 @@ export class DecoderState {
           const cur = this.cur;
           const id = this.id;
           const count = this.arrCount;
+          const wantLongs = this.curLongs;
           // Hoisted bound: past `safeEnd` an element could straddle the chunk,
           // so the bulk loop stops and the resumable tail below takes over.
           const safeEnd = n - VARINT_MAX_BYTES;
@@ -324,9 +336,14 @@ export class DecoderState {
               i = this.varintFull(input, i);
               // vUnsigned() inlined: on this path the halves are already in
               // hand, and the call is a per-element cost the loop need not pay.
-              const vhi = this.vHi >>> 0;
-              const v =
-                vhi <= 0x1fffff ? vhi * TWO32 + (this.vLo >>> 0) : joinU64(this.vLo >>> 0, vhi);
+              // `wantLongs` is loop-invariant, so the branch costs nothing the
+              // JIT cannot hoist.
+              let v: number | bigint | Long;
+              if (wantLongs) v = new Long(this.vLo, this.vHi);
+              else {
+                const vhi = this.vHi >>> 0;
+                v = vhi <= 0x1fffff ? vhi * TWO32 + (this.vLo >>> 0) : joinU64(this.vLo >>> 0, vhi);
+              }
               cur.arrayUnsigned?.(id, idx, v);
               this.arrIndex = ++idx;
             }
@@ -339,7 +356,7 @@ export class DecoderState {
           if (i >= n) break;
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
-          const value = this.vUnsigned();
+          const value = wantLongs ? new Long(this.vLo, this.vHi) : this.vUnsigned();
           cur.arrayUnsigned?.(id, idx, value);
           this.advanceArray();
           break;
@@ -349,20 +366,24 @@ export class DecoderState {
           const cur = this.cur;
           const id = this.id;
           const count = this.arrCount;
+          const wantLongs = this.curLongs;
           const safeEnd = n - VARINT_MAX_BYTES;
           let idx = this.arrIndex;
           // See the unsigned arm: never bulk-decode over a pending partial varint.
           if (this.vBytes === 0) {
             while (idx < count && i <= safeEnd) {
               i = this.varintFull(input, i);
-              const vhi = this.vHi >>> 0;
-              const vlo = this.vLo >>> 0;
-              let v: number | bigint;
-              if (vhi <= 0x1fffff) {
-                const r = vhi * TWO32 + vlo; // raw zig-zag, ≤ 2^53-1
-                v = r % 2 === 0 ? r / 2 : -(r + 1) / 2;
-              } else {
-                v = zigzagDecodeLoHi(vlo, vhi);
+              let v: number | bigint | Long;
+              if (wantLongs) v = zigzagDecodeLong(this.vLo, this.vHi);
+              else {
+                const vhi = this.vHi >>> 0;
+                const vlo = this.vLo >>> 0;
+                if (vhi <= 0x1fffff) {
+                  const r = vhi * TWO32 + vlo; // raw zig-zag, ≤ 2^53-1
+                  v = r % 2 === 0 ? r / 2 : -(r + 1) / 2;
+                } else {
+                  v = zigzagDecodeLoHi(vlo, vhi);
+                }
               }
               cur.arraySigned?.(id, idx, v);
               this.arrIndex = ++idx;
@@ -376,7 +397,7 @@ export class DecoderState {
           if (i >= n) break;
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
-          const value = this.vSigned();
+          const value = wantLongs ? zigzagDecodeLong(this.vLo, this.vHi) : this.vSigned();
           cur.arraySigned?.(id, idx, value);
           this.advanceArray();
           break;

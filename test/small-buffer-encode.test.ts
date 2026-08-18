@@ -55,6 +55,8 @@ const CASES: Array<[string, (os: OStream) => void]> = [
   ["a full-width i64", (os) => os.writeSigned(1, -(2n ** 63n))],
   ["a large number-path unsigned", (os) => os.writeUnsigned(1, Number.MAX_SAFE_INTEGER)],
   ["a large number-path signed", (os) => os.writeSigned(1, -Number.MAX_SAFE_INTEGER)],
+  ["a full-width u64 Long scalar", (os) => os.writeUnsignedLong(1, Long.fromValue(2n ** 64n - 1n))],
+  ["a full-width i64 Long scalar", (os) => os.writeSignedLong(1, Long.fromValue(-(2n ** 63n)))],
   ["a multi-byte field header", (os) => os.writeBoolean(1_000_000, true)],
   ["a multi-byte fixlen word", (os) => os.writeString(1, "x".repeat(200))],
   ["a blob", (os) => os.writeBlob(3, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9]))],

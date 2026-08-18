@@ -349,39 +349,35 @@ export class OStream {
   }
 
   /**
-   * Write an unsigned 64-bit scalar from a {@link Long} — the `bigint`-free
-   * twin of {@link writeUnsigned}, and the scalar counterpart of
+   * Write an unsigned 64-bit scalar from a {@link Long} — the `bigint`-free twin
+   * of {@link writeUnsigned}, and the scalar counterpart of
    * {@link writeUnsignedArrayLong}. Produces the identical wire.
    *
-   * No range check and no scratch round-trip: a `Long` is 64 bits of raw
-   * two's-complement storage, so every value it can hold is in range by
-   * construction — the check {@link writeUnsigned} performs exists only because
-   * a `number`/`bigint` argument can be negative or ≥ 2^64.
+   * There is no range check and no scratch round-trip: a `Long` *is* two 32-bit
+   * halves, so it is in the `uint64` domain by construction — which is the whole
+   * of what `splitU64` decides for a `number | bigint`. The halves go straight
+   * into the varint writer, so nothing is allocated per value. Nothing needs
+   * copying out ahead of `header` either, for the same reason the array writers
+   * do not: the halves come off a caller-owned immutable `Long`, not the shared
+   * scratch a re-entrant flush sink could overwrite.
    */
   writeUnsignedLong(id: number, value: Long): void {
-    // Halves read out BEFORE `header`, which may flush into caller code that
-    // re-enters this encoder — the same ordering rule as writeUnsigned, even
-    // though a Long is immutable and could not itself be clobbered.
-    const lo = value.low;
-    const hi = value.high;
     this.header(id, WireType.Unsigned);
-    this.putVarintLoHi(lo, hi);
+    this.putVarintLoHi(value.low, value.high);
   }
 
   /**
    * Write a signed 64-bit scalar (zig-zag) from a {@link Long} — the
-   * `bigint`-free twin of {@link writeSigned}. Zig-zag `(n << 1) ^ (n >> 63)` is
-   * computed on the lo/hi pair, so the varint goes out at its exact size (a
-   * fixed caller buffer must not see a 10-byte demand for a 2-byte field).
+   * `bigint`-free twin of {@link writeSigned}, and the scalar counterpart of
+   * {@link writeSignedArrayLong}. Zig-zag `(n << 1) ^ (n >> 63)` is computed on
+   * the lo/hi pair, so the varint goes out at its exact size (a fixed caller
+   * buffer must not see a 10-byte demand for a 2-byte field) and no `bigint` is
+   * created. A `Long` carries exactly 64 bits, so as in {@link writeUnsignedLong}
+   * there is nothing left to range-check.
    */
   writeSignedLong(id: number, value: Long): void {
-    const lo = value.low;
-    const hi = value.high;
-    const sgn = -(hi >>> 31) >>> 0;
-    const zLo = (((lo << 1) >>> 0) ^ sgn) >>> 0;
-    const zHi = ((((hi << 1) | (lo >>> 31)) >>> 0) ^ sgn) >>> 0;
     this.header(id, WireType.Signed);
-    this.putVarintLoHi(zLo, zHi);
+    this.putZigzagVarintLoHi(value.low, value.high);
   }
 
   /** Write a boolean field (encoded as the unsigned value 0 or 1). */

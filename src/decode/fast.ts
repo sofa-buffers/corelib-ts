@@ -44,14 +44,16 @@ import {
   invalidMsgError,
   limitExceededError,
 } from "../errors.js";
+import { Long } from "../long.js";
+import { zigzagDecodeLong } from "../varint/zigzag.js";
 import type { DecodeLimits } from "./limits.js";
-import type { Visitor } from "./istream.js";
+import type { AnyVisitor } from "./istream.js";
 import { BufferReader } from "./reader.js";
 
 /** Decode a complete message held in one contiguous buffer. */
 export function decodeContiguous(
   buf: Uint8Array,
-  root: Visitor,
+  root: AnyVisitor,
   limits?: DecodeLimits,
 ): void {
   new FastDecoder(buf, limits).run(root);
@@ -70,9 +72,18 @@ class FastDecoder extends BufferReader {
     this.maxBlobLen = limits?.maxBlobLen ?? Infinity;
   }
 
-  run(root: Visitor): void {
-    const stack: Visitor[] = [root];
+  run(root: AnyVisitor): void {
+    const stack: AnyVisitor[] = [root];
     let top = root;
+    // Visitor.longs, read ONCE — from the root visitor, for the whole decode.
+    // Not per field, and deliberately not per scope either: re-reading an
+    // optional property off a differently-shaped visitor object is the
+    // megamorphic load this decoder is shaped to avoid, and doing it at the two
+    // sequence transitions cost +1.1% Ir/op on `decode: typical message` — one
+    // nested sequence, so three such loads — to buy a flexibility no caller
+    // wants, a generated message tree being uniformly one channel or the other.
+    // See Visitor.longs: the ROOT decides, and a child's own flag is ignored.
+    const longs = root.longs === true;
 
     while (this.p < this.n) {
       this.readVarint();
@@ -103,13 +114,13 @@ class FastDecoder extends BufferReader {
       switch (type) {
         case WireType.Unsigned: {
           this.readVarint();
-          top.unsigned?.(id, this.unsignedValue());
+          top.unsigned?.(id, longs ? new Long(this.lo, this.hi) : this.unsignedValue());
           break;
         }
 
         case WireType.Signed: {
           this.readVarint();
-          top.signed?.(id, this.signedValue());
+          top.signed?.(id, longs ? zigzagDecodeLong(this.lo, this.hi) : this.signedValue());
           break;
         }
 
@@ -166,7 +177,7 @@ class FastDecoder extends BufferReader {
           top.arrayBegin?.(id, ArrayKind.Unsigned, count);
           for (let i = 0; i < count; i++) {
             this.readVarint();
-            top.arrayUnsigned?.(id, i, this.unsignedValue());
+            top.arrayUnsigned?.(id, i, longs ? new Long(this.lo, this.hi) : this.unsignedValue());
           }
           top.arrayEnd?.(id);
           break;
@@ -177,7 +188,7 @@ class FastDecoder extends BufferReader {
           top.arrayBegin?.(id, ArrayKind.Signed, count);
           for (let i = 0; i < count; i++) {
             this.readVarint();
-            top.arraySigned?.(id, i, this.signedValue());
+            top.arraySigned?.(id, i, longs ? zigzagDecodeLong(this.lo, this.hi) : this.signedValue());
           }
           top.arrayEnd?.(id);
           break;

@@ -11,6 +11,7 @@
  * form had no production caller left and is gone with it.
  */
 
+import { Long } from "../long.js";
 import { joinI64 } from "./bits64.js";
 import { encodeVarintLoHi } from "./leb128.js";
 
@@ -51,5 +52,25 @@ export function zigzagDecodeLoHi(lo: number, hi: number): bigint {
   return joinI64(
     (((lo >>> 1) | (hi << 31)) >>> 0) ^ mask,
     ((hi >>> 1) ^ mask) >>> 0,
+  );
+}
+
+/**
+ * Zig-zag *decode* an unsigned 64-bit value held as two 32-bit halves into a
+ * {@link Long} — the `bigint`-free twin of {@link zigzagDecodeLoHi}, and the one
+ * implementation every `Long`-returning signed reader shares: the scalar
+ * {@link Cursor.readSignedLong}, the array {@link Cursor.readSignedArrayLong},
+ * and the opt-in `Long` channel on both push decoders. It allocates the single
+ * `Long` it returns and nothing else.
+ *
+ * The shifts are the ones {@link zigzagDecodeLoHi} performs, and they are
+ * bit-exact on a half whose bit 31 is set: `>>>` reads its operand as unsigned
+ * and `<<` works on the raw 32 bits, so neither half needs coercing first.
+ */
+export function zigzagDecodeLong(lo: number, hi: number): Long {
+  const mask = -(lo & 1) >>> 0;
+  return new Long(
+    (((lo >>> 1) | (hi << 31)) >>> 0) ^ mask,
+    ((hi >>> 1) >>> 0) ^ mask,
   );
 }
