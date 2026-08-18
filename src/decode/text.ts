@@ -31,7 +31,17 @@
  * bit set is handed to the platform decoder whole and gets exactly the
  * validation it always got — the fast path can never accept bytes the platform
  * would refuse.
+ *
+ * {@link decodeUtf8} is **public** because both decode surfaces need it and only
+ * one of them is inside this library: {@link Cursor} calls it on the pull path,
+ * while the push path hands out raw, unvalidated chunks (§6.4) and leaves
+ * materialization — and therefore the UTF-8 check — to whoever reassembles them.
+ * Generated code lives on that side, so without an exported entry point every
+ * generated package builds a plain fatal `TextDecoder` of its own and pays the
+ * full 2006 Ir/op per short string instead of 858.
  */
+
+import { invalidMsgError } from "../errors.js";
 
 const _utf8 = new TextDecoder("utf-8", { fatal: true });
 
@@ -43,11 +53,22 @@ const _utf8 = new TextDecoder("utf-8", { fatal: true });
 const FLAT_MAX = 16;
 
 /**
- * Decode `buf[start..end)` as strict UTF-8. Throws whatever the fatal
- * {@link TextDecoder} throws (a `TypeError`) on malformed input; callers map
- * that to the `INVALID` decode outcome.
+ * Decode `buf[start..end)` as strict UTF-8 — the whole of `buf` when the range
+ * is omitted, which is the shape a reassembled payload (see {@link PayloadAcc})
+ * arrives in.
+ *
+ * Malformed bytes throw a {@link SofabError} (`INVALID_MSG`), never the fatal
+ * {@link TextDecoder}'s bare `TypeError`. The mapping belongs here rather than at
+ * each call site: invalid UTF-8 is an invalid *message* (MESSAGE_SPEC §8,
+ * CORELIB_PLAN §6.4), so it has to reach a caller as the same `INVALID` verdict
+ * as every other malformation — through the one `catch (e) { if (e instanceof
+ * SofabError) … }` a consumer writes — and a platform exception escaping that
+ * clause is precisely the bug this closes.
+ *
+ * A zero-length payload is the empty string, decoded without touching the
+ * platform decoder.
  */
-export function decodeUtf8(buf: Uint8Array, start: number, end: number): string {
+export function decodeUtf8(buf: Uint8Array, start = 0, end = buf.length): string {
   const n = end - start;
   if (n <= 0) return "";
   if (n <= FLAT_MAX) {
@@ -81,5 +102,9 @@ export function decodeUtf8(buf: Uint8Array, start: number, end: number): string 
       }
     }
   }
-  return _utf8.decode(buf.subarray(start, end));
+  try {
+    return _utf8.decode(buf.subarray(start, end));
+  } catch {
+    throw invalidMsgError("invalid UTF-8 in string");
+  }
 }

@@ -174,6 +174,37 @@ While the version is below `1.0.0`, breaking changes bump the **minor** version.
   buffer installed **without** a sink is deliberately left unrestricted — no
   flush can occur, so nothing can be split, and the one-shot `MAX_SIZE` path
   stays exact down to a zero-length buffer.
+- **The support layer generated code was carrying itself** (#147): `decodeUtf8`,
+  `PayloadAcc`, `StringSeq` / `BlobSeq` and `elementsEqual` are now part of the
+  public surface. Every one of them has the same shape for every schema — a
+  capacity, a `maxlen` or a payload length is an argument, exactly as `Cursor`
+  already takes its bounds — so a generated package had no reason to carry its
+  own copy beyond the corelib not offering one (sofa-buffers/generator#345).
+
+  `decodeUtf8` is the one with a number on it. It existed already, with a
+  measured ASCII fast path (858 vs 2006 Ir/op on a 13-byte field), but was
+  reachable only through `Cursor`; generated code decodes through the **visitor**
+  path, so it built a plain `TextDecoder` and every decoded string paid ~2.3x. It
+  now also maps the fatal decoder's `TypeError` to `SofabError(INVALID_MSG)`
+  itself — invalid UTF-8 is an invalid *message*, and the verdict has to arrive
+  through the same `catch` as every other one — and its range arguments are
+  optional, so a reassembled payload is `decodeUtf8(bytes)`.
+
+  `PayloadAcc` joins a `string` / `blob` payload split across fed chunks, without
+  copying one that arrived whole. `StringSeq` / `BlobSeq` collect the elements of
+  a wrapper-sequence array, applying the schema `count` as an index capacity and
+  the element `maxlen` at `fixlenBegin` — early enough that a message cut off
+  inside an over-long element is still `INVALID` (§5.2) — and implementing §5.1's
+  placement rules: a gap keeps the indices after it, the length is the highest
+  present id + 1, a repeated index replaces. `elementsEqual` is the array form of
+  the omit-if-default test (§2).
+
+  Purely additive: nothing was removed or renamed, and generated code in the wild
+  keeps compiling against its own copies. Switching the generator over is a
+  separate PR there. The new unit tests cover what the shared vectors cannot —
+  where a payload was split, and what a gap or a repeat becomes — including the
+  split-at-every-offset sweep and an index near 2^31 that must be rejected before
+  a slot is allocated.
 
 ### Performance
 

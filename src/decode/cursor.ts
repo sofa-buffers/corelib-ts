@@ -268,7 +268,7 @@ export class Cursor extends BufferReader {
     const len = this.fixlenLen(FixlenSubtype.String, schemaMaxlen);
     // The truncation check (→ INCOMPLETE) runs before the decode, so a short
     // payload stays INCOMPLETE; only genuinely malformed UTF-8 bytes reach the
-    // fatal decoder. Its TypeError becomes the INVALID outcome (§8/§6.4/§5.2).
+    // fatal decoder, which reports them as the INVALID outcome (§8/§6.4/§5.2).
     //
     // takeRange, not take(): the payload is decoded straight out of the source
     // buffer. take() would build a `subarray` view over exactly these bytes for
@@ -277,11 +277,7 @@ export class Cursor extends BufferReader {
     // takeRange, not take(): ./text decodes straight out of the source buffer, so
     // the `subarray` take() would build for it is pure cost (see ./text).
     const start = this.takeRange(len);
-    try {
-      return decodeUtf8(this.buf, start, start + len);
-    } catch {
-      throw invalidMsgError("invalid UTF-8 in string");
-    }
+    return decodeUtf8(this.buf, start, start + len);
   }
 
   /**
