@@ -28,6 +28,7 @@ import type {
   FixlenSubtype,
   WireType,
 } from "../constants.js";
+import type { Long } from "../long.js";
 import { decodeContiguous } from "./fast.js";
 import type { DecodeLimits } from "./limits.js";
 import { DecoderState } from "./state.js";
@@ -41,8 +42,46 @@ import { DecoderState } from "./state.js";
  * field's `total` length and the `offset` of the chunk within the field, so a
  * large payload never has to be held in one piece. Array elements arrive one at
  * a time between {@link Visitor.arrayBegin} and {@link Visitor.arrayEnd}.
+ *
+ * `TInt` is how the four integer hooks deliver a value, and it exists only so
+ * the opt-in {@link Visitor.longs} channel can be typed exactly. Leave it at its
+ * default and `Visitor` means precisely what it always did — number-first
+ * `number | bigint`; write {@link LongVisitor} for the `Long` channel. Nothing
+ * needs a union of the two: the decoders are implemented against
+ * {@link AnyVisitor}, which both shapes satisfy.
  */
-export interface Visitor {
+export interface Visitor<TInt = number | bigint> {
+  /**
+   * Opt in to the {@link Long} channel on {@link unsigned} / {@link signed} /
+   * {@link arrayUnsigned} / {@link arraySigned}: with this set, all four deliver
+   * a `Long` — the raw 32-bit halves the varint reader already holds — instead of
+   * the number-first `number | bigint`. Off by default, so a consumer that does
+   * not set it sees exactly what it saw before and pays nothing. Symmetric with
+   * {@link fp32Raw}, and the streaming counterpart of
+   * {@link Cursor.readUnsignedLong} / {@link Cursor.readSignedLong}, so a field
+   * that generated code holds as a `Long` has that same runtime type through
+   * *every* decode API rather than one type per path.
+   *
+   * Set it through {@link LongVisitor}, which pairs the flag with `TInt = Long`;
+   * setting it on a plain `Visitor` makes the decoder deliver `Long`s the
+   * declared type does not admit.
+   *
+   * **Read once, from the root visitor, for the whole decode.** A nested scope
+   * does not get its own answer: the flag is read at the root and every child
+   * visitor is driven on that channel, whatever its own flag says. That is the
+   * useful semantics — a generated message tree is uniformly one channel or the
+   * other — and it is also the affordable one: re-reading the property at each
+   * sequence transition is a megamorphic load, and it measured at +1.1% Ir/op on
+   * `decode: typical message` for consumers that never opt in at all.
+   *
+   * It is not per **field** either: this push surface is driven by wire type
+   * alone and never learns the schema (the same limit that puts receiver caps on
+   * every field — see {@link "./fast"}), so it covers every unsigned / signed
+   * field and element in the message, whatever its declared width. Narrowing back
+   * is exact and cheap — for `u8`..`u32` the value is `value.low`, and for
+   * `i8`..`i32` it is `value.low | 0`.
+   */
+  readonly longs?: boolean;
   /**
    * A field **header**: its `id` and `wire` type, announced the moment the
    * header varint is complete — before the value, and before the value's own
@@ -78,10 +117,12 @@ export interface Visitor {
    * An unsigned integer field. Number-first: `value` is a `number` when it fits
    * exactly (`≤ 2^53-1`, covering ids, u8..u32 and small u64s) and a `bigint`
    * only beyond that, so the common case avoids a per-value bigint allocation.
+   * It is a {@link Long} instead — always, never the other two — on a
+   * {@link LongVisitor}.
    */
-  unsigned?(id: number, value: number | bigint): void;
-  /** A signed integer field. Number-first like {@link unsigned} (`|value| ≤ 2^53-1` ⇒ `number`). */
-  signed?(id: number, value: number | bigint): void;
+  unsigned?(id: number, value: TInt): void;
+  /** A signed integer field. Number-first like {@link unsigned} (`|value| ≤ 2^53-1` ⇒ `number`), or a {@link Long} on a {@link LongVisitor}. */
+  signed?(id: number, value: TInt): void;
   /**
    * Opt in to the raw-bytes channel on {@link fp32} / {@link arrayFp32}. Off by
    * default so a value-only consumer pays nothing: when this is not `true` the
@@ -143,10 +184,10 @@ export interface Visitor {
   blob?(id: number, total: number, offset: number, chunk: Uint8Array): void;
   /** Start of an array; `count` elements of `kind` follow. */
   arrayBegin?(id: number, kind: ArrayKind, count: number): void;
-  /** One unsigned array element. Number-first like {@link unsigned}. */
-  arrayUnsigned?(id: number, index: number, value: number | bigint): void;
-  /** One signed array element. Number-first like {@link signed}. */
-  arraySigned?(id: number, index: number, value: number | bigint): void;
+  /** One unsigned array element. Number-first like {@link unsigned}, or a {@link Long} on a {@link LongVisitor}. */
+  arrayUnsigned?(id: number, index: number, value: TInt): void;
+  /** One signed array element. Number-first like {@link signed}, or a {@link Long} on a {@link LongVisitor}. */
+  arraySigned?(id: number, index: number, value: TInt): void;
   /** One fp32 array element. `raw` (the element's 4 wire bytes) is present only under {@link fp32Raw} — see {@link fp32}. */
   arrayFp32?(id: number, index: number, value: number, raw?: Uint8Array): void;
   /** One fp64 array element. `value` is exact — see {@link fp64}. */
@@ -157,11 +198,39 @@ export interface Visitor {
    * Start of a nested sequence. Return a {@link Visitor} to route the nested
    * fields to it (its {@link Visitor.sequenceEnd} fires at the matching end);
    * return nothing to keep using the current visitor.
+   *
+   * The child carries the parent's `TInt`, which is exactly right: {@link longs}
+   * is read once from the **root**, so a whole message tree is on one channel or
+   * the other and a child never sees a different representation than its parent.
    */
-  sequenceBegin?(id: number): Visitor | void;
+  sequenceBegin?(id: number): Visitor<TInt> | void;
   /** End of the nested sequence this visitor was handling. */
   sequenceEnd?(): void;
 }
+
+/**
+ * A {@link Visitor} on the {@link Long} channel: the four integer hooks deliver
+ * a {@link Long} and {@link Visitor.longs} is set, which is what turns the
+ * channel on. The two go together — the flag decides what the decoder passes and
+ * `TInt` decides what the hooks declare — so this pairing is the supported way to
+ * opt in.
+ *
+ * {@link decode} and {@link IStream.feed} are overloaded on this shape *first*,
+ * which is what makes an inline visitor literal work without an annotation: a
+ * literal that sets `longs: true` matches here and gets its four integer hooks
+ * contextually typed with `Long`, while one that does not cannot match (the flag
+ * is required) and falls through to plain {@link Visitor} — where the hooks are
+ * still typed `number | bigint`, exactly as before this channel existed.
+ */
+export type LongVisitor = Visitor<Long> & { readonly longs: true };
+
+/**
+ * Either visitor shape — the parameter type the decoders are *implemented*
+ * against, since they call the integer hooks with whichever representation the
+ * flag selected. {@link Visitor} and {@link LongVisitor} are both assignable to
+ * it, so a caller that holds one of those needs no cast.
+ */
+export type AnyVisitor = Visitor<number | bigint | Long>;
 
 /**
  * Push parser for the SofaBuffers wire format. Feed it bytes in chunks of any
@@ -208,7 +277,9 @@ export class IStream {
    * {@link DecodeLimits}) does *not* latch: the bytes are well-formed, and it is
    * a policy rejection rather than the `INVALID` outcome.
    */
-  feed(chunk: Uint8Array, visitor: Visitor): DecodeStatus {
+  feed(chunk: Uint8Array, visitor: LongVisitor): DecodeStatus;
+  feed(chunk: Uint8Array, visitor: Visitor): DecodeStatus;
+  feed(chunk: Uint8Array, visitor: AnyVisitor): DecodeStatus {
     this.state.push(chunk, visitor);
     return this.state.finish();
   }
@@ -267,9 +338,11 @@ export class IStream {
  * lengths; an over-limit field throws `LIMIT_EXCEEDED` at its header, before it
  * is materialized. Omit for no caps (the default).
  */
+export function decode(bytes: Uint8Array, visitor: LongVisitor, limits?: DecodeLimits): void;
+export function decode(bytes: Uint8Array, visitor: Visitor, limits?: DecodeLimits): void;
 export function decode(
   bytes: Uint8Array,
-  visitor: Visitor,
+  visitor: AnyVisitor,
   limits?: DecodeLimits,
 ): void {
   decodeContiguous(bytes, visitor, limits);

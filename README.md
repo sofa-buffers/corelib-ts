@@ -57,7 +57,7 @@ full type declarations.
 | Streaming **out** | `OStream` writes into a small caller buffer and calls a `FlushSink` when it fills, so a message can exceed the buffer — by any amount, down to a one-byte buffer: a value too large for the buffer is split across flushes. |
 | Streaming **in** | `IStream` is a resumable state machine fed arbitrary chunks; large string / blob payloads arrive in pieces. |
 | Fast whole-buffer decode | With the whole message in one buffer, `decode()` (push) and `Cursor` (pull) advance a single cursor. |
-| Full 64-bit fidelity | Scalars round-trip the entire `uint64` / `int64` range: `number` when exact, `bigint` beyond `2^53-1` (`Long` offers a `bigint`-free path for both scalars and arrays). |
+| Full 64-bit fidelity | Scalars round-trip the entire `uint64` / `int64` range: `number` when exact, `bigint` beyond `2^53-1` (`Long` offers a `bigint`-free path, for scalars and arrays alike). |
 | Generated-code friendly | The pull `Cursor` gives a monomorphic `readHeader()` + typed `read*` loop; the push `Visitor` has all-optional methods. |
 | Reserve-offset | `new OStream(buf, offset)` leaves room at the front for a lower-layer header, saving a copy. The offset belongs to that installation and is consumed by the flush that hands the unit over; `setBuffer(buf, offset)` from inside the sink re-arms it, for header room in every packet. |
 | Caller-owned buffers | The encoder allocates no output buffer and grows none: it writes into yours, and asks the `BufferOwner` you named for the next one when it fills. `growingOStream()` is that owner ready-made. |
@@ -307,6 +307,57 @@ A receiver-side cap (`LIMIT_EXCEEDED`, see [Decode limits](#decode-limits)) does
 *not* poison the stream: the bytes are well-formed and the same message decodes
 under a looser limit (§6.2.1), so it is a policy rejection, not the `INVALID`
 outcome.
+
+### 64-bit values without `bigint`
+
+The default 64-bit surface is *number-first*: a value that fits exactly comes
+back as a `number`, and only past `2^53-1` is a `bigint` materialised. That is
+the right default, but it means the runtime type of a `u64` / `i64` depends on
+the value, and a `bigint` in the hot path is expensive.
+
+`Long` — a value carried as two unsigned 32-bit halves (`.low` / `.high`) — is
+the fixed-type alternative. It is **representation-only**: the wire is identical
+to the `number | bigint` path, byte for byte, in both directions.
+
+```ts
+import { Long, OStream, Cursor } from "@sofa-buffers/corelib";
+
+const os = new OStream();
+os.writeUnsignedLong(1, Long.fromValue(2n ** 63n));         // scalar
+os.writeSignedLong(2, Long.fromValue(-(2n ** 62n)));
+os.writeUnsignedArrayLong(3, [1n, 2n].map(Long.fromValue)); // array
+
+const c = new Cursor(os.bytes());
+c.readHeader(); const a = c.readUnsignedLong();   // a Long, whatever the value
+c.readHeader(); const b = c.readSignedLong();
+c.readHeader(); const xs = c.readUnsignedArrayLong();
+a.toBigInt();       // materialise only the values you actually need
+b.toBigInt(true);   // `signed` reads the high bit as two's complement
+```
+
+On the push decoders the same channel is opt-in per visitor, so a consumer that
+does not ask for it is unaffected — in values, in cost and in types:
+
+```ts
+import { decode, IStream, type LongVisitor } from "@sofa-buffers/corelib";
+
+const v: LongVisitor = {
+  longs: true,                                  // turns the channel on
+  unsigned(id, value) { /* value: Long */ },
+  signed(id, value)   { /* value: Long */ },
+  arrayUnsigned(id, i, value) { /* value: Long */ },
+  arraySigned(id, i, value)   { /* value: Long */ },
+};
+decode(bytes, v);                               // and new IStream().feed(chunk, v)
+```
+
+The flag is read **once, from the root visitor**, and governs the whole decode: a
+nested scope is driven on the root's channel whatever its own flag says, so a
+message tree is uniformly one or the other. It is not per *field* either — this
+push surface is driven by wire type alone and never learns the schema (the same
+limit that makes a receiver cap apply to every field), so it covers every
+unsigned / signed field and element in the message. Narrowing back is exact:
+`value.low` for `u8`..`u32`, and `value.low | 0` for `i8`..`i32`.
 
 ### Code generator
 

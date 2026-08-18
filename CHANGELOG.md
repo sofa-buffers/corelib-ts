@@ -55,27 +55,61 @@ While the version is below `1.0.0`, breaking changes bump the **minor** version.
 
 ### Added
 
-- **Scalar 64-bit `Long` codecs: `OStream.write{Unsigned,Signed}Long` and
-  `Cursor.read{Unsigned,Signed}Long`** (#143). The `bigint`-free 64-bit path
-  existed for arrays only (`write/readUnsignedArrayLong` and the signed twins),
-  so a u64/i64 **scalar** had no `Long` codec at all. Downstream that capped
-  `sofabgen`'s `int64: long` mode at Long-backed *arrays* — its scalars had to
-  stay `bigint` for want of these four methods (sofa-buffers/generator#339).
+- **Scalar 64-bit `Long` codecs** (#143). The `bigint`-free 64-bit path existed
+  for *arrays* only (`writeUnsignedArrayLong` / `readUnsignedArrayLong`, and the
+  signed twins); a `u64` / `i64` **scalar** could only be written from, and
+  decoded to, `number | bigint`. So a generated field under sofabgen's
+  `int64: long` still materialised a `bigint` per scalar per decode — the one
+  thing the mode exists to avoid — and the generator had to document that
+  "scalars stay bigint". Four methods close it, wire-identical to the `bigint`
+  path in both directions:
 
-  Wire-identical to the `bigint` writers for every value in the 64-bit domain,
-  and cheaper on both sides: the writer reads the `Long`'s `.low`/`.high`
-  straight into `putVarintLoHi`, with no range check and no scratch round-trip
-  (a `Long` is 64 bits of raw storage, so it is in range by construction — the
-  check `writeUnsigned` performs exists only because a `number`/`bigint`
-  argument can be negative or ≥ 2^64), and the reader hands back the two halves
-  `readVarint` already produced instead of deciding a representation per value.
+  | | encode | decode (pull) |
+  |---|---|---|
+  | unsigned | `OStream.writeUnsignedLong(id, Long)` | `Cursor.readUnsignedLong(): Long` |
+  | signed | `OStream.writeSignedLong(id, Long)` | `Cursor.readSignedLong(): Long` |
 
-  That last point is the reason the methods exist rather than a convenience
-  wrapper: `readUnsigned` is number-first — a `number` below 2^53, a `bigint`
-  above — so the representation follows the *value*. `readUnsignedLong` returns
-  a `Long` for every value, small ones included, which is what lets a generated
-  field's runtime type be a property of the **field**. Nothing else changes:
-  no wire, no verdicts, and the number-first readers are untouched.
+  Encode reads `.low` / `.high` straight into the varint writer, with no range
+  check and no scratch round-trip: a `Long` is in the 64-bit domain by
+  construction, which is the whole of what `splitU64` / `splitI64` decide for a
+  `number | bigint`. Decode assembles the halves the varint reader already holds
+  instead of taking the number-first / `bigint` decision. `Long` itself is
+  unchanged, and `zigzagDecodeLong` is now the single zig-zag-to-`Long` used by
+  the scalar reader, the array reader and both push decoders.
+- **`Visitor.longs`, an opt-in `Long` channel on the push decoders** (#143). With
+  it set, `unsigned`, `signed`, `arrayUnsigned` and `arraySigned` deliver a
+  `Long` on both `decode()` and `IStream`, so a field that generated code holds
+  as a `Long` has that same runtime type through *every* decode API rather than
+  one type per path. Symmetric with the existing `fp32Raw` flag: off by default,
+  and a consumer that does not set it is unaffected in values, in cost and in
+  **types**. `Visitor` gains a type parameter for the integer hooks that defaults
+  to today's `number | bigint`, and `LongVisitor` (= `Visitor<Long>` plus
+  `longs: true`) is the shape that opts in; `decode` / `IStream.feed` are
+  overloaded on it first, so an inline visitor literal is contextually typed
+  correctly either way and no existing source needed a change.
+
+  The flag is read **once, from the root visitor**, and governs the whole decode:
+  a nested scope is driven on the root's channel whatever its own flag says. Both
+  the semantics and the cost argue for that — a generated message tree is
+  uniformly one channel or the other, and re-reading an optional property off a
+  differently-shaped visitor object at each sequence transition is exactly the
+  megamorphic load these decoders are shaped to avoid. A first cut that did
+  refresh per scope cost **+1.1% Ir/op on `decode: typical message`** (one nested
+  sequence, so three such loads) for consumers that never opt in; reading it once
+  brings that to +0.3%. It is not per *field* either — this push surface is
+  driven by wire type alone and never learns the schema, the same limit that
+  already puts a receiver cap on every field (#105) — so it covers every integer
+  field and element in the message; narrowing back is exact (`value.low` for
+  `u8`..`u32`, `value.low | 0` for `i8`..`i32`).
+
+  Cost on the shared workloads, against `main` @ 1eb151d
+  (`bench/run_callgrind.sh`, Callgrind `Ir/op`, Node 24; repeat runs agree to
+  <0.01%, so these are signal): `decode: u64 array (1000)` 691,422 → 681,126
+  (−1.5%), `decode: typical message` 5,148 → 5,162 (+0.3%), `decode: composite`
+  50,075 → 50,212 (+0.3%), `decode: blob 1MB` 303,177 → 304,281 (+0.4%),
+  `decode: composite skip-all` and all five encode rows within ±0.1%. None of
+  these workloads uses the `Long` path at all — they measure only what the added
+  branch costs everything else.
 
 - **`IStream.feed()` returns the three-valued decode outcome, and `IStream.status()`
   re-reads it** (#112). CORELIB_PLAN §6 requires `feed(bytes)` to *return* the
@@ -916,6 +950,17 @@ Measured with `bench/run_callgrind.sh` (Callgrind `Ir/op`, Node 24):
   unreachable through the public API — and that is the point: they are the second
   half of a two-pass invariant, and dropping the pre-pass would start emitting
   `U+FFFD` (which §8 forbids) with the public suite still green.
+- `long-scalar.test.ts` holds the new scalar codecs and the `longs` channel to
+  the bar #143 sets for a representation-only change: the same wire as the
+  `bigint` writers at every caller-buffer size (1..64 B, so both the
+  split-across-flushes and the drain-and-retry routes), the same values out of
+  `Cursor`, `decode()` and `IStream`, and — the streaming half — the same values
+  *and* the same `SofabError` codes through both push paths at **every** chunk
+  size, over a corpus of malformed and truncated inputs. It also pins the two
+  things a cached flag can get wrong: a nested scope that opts out (and a parent
+  restored to the channel after it closes), and a non-opting visitor still seeing
+  number-first values. The two scalar writers join the
+  `small-buffer-encode.test.ts` corpus as well.
 
 ## [0.10.0] - 2026-08-01
 

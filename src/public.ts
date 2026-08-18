@@ -26,7 +26,7 @@ export { OStream, growingOStream } from "./encode/ostream.js";
 export type { BufferOwner, FlushSink } from "./encode/sink.js";
 
 export { IStream, decode } from "./decode/istream.js";
-export type { Visitor } from "./decode/istream.js";
+export type { AnyVisitor, LongVisitor, Visitor } from "./decode/istream.js";
 export type { DecodeLimits } from "./decode/limits.js";
 export { Cursor } from "./decode/cursor.js";
 

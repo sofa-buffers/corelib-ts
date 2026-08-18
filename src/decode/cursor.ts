@@ -41,6 +41,7 @@ import {
   limitExceededError,
 } from "../errors.js";
 import { Long } from "../long.js";
+import { zigzagDecodeLong } from "../varint/zigzag.js";
 import type { DecodeLimits } from "./limits.js";
 import { BufferReader } from "./reader.js";
 import { decodeUtf8 } from "./text.js";
@@ -197,15 +198,16 @@ export class Cursor extends BufferReader {
   }
 
   /**
-   * Read an unsigned 64-bit scalar into a {@link Long} — the `bigint`-free twin
-   * of {@link readUnsigned}, and the scalar counterpart of
+   * Read an unsigned scalar into a {@link Long} — the `bigint`-free twin of
+   * {@link readUnsigned}, and the scalar counterpart of
    * {@link readUnsignedArrayLong}.
    *
-   * {@link readUnsigned} is number-first: it decides a representation per value
-   * and materialises a `bigint` past 2^53-1. This one hands back the two halves
-   * the varint reader already produced, so the value's representation is a
-   * property of the FIELD, not of the value that happened to arrive — which is
-   * what lets a generated `Long` field hold a `Long` for every value.
+   * {@link readUnsigned} is number-first, so it decides a representation per
+   * value and materialises a `bigint` past `2^53-1`; this one always hands back
+   * the raw halves the varint reader already has. That makes the returned type
+   * *fixed*, which is the point for generated code: a `u64` field holds a `Long`
+   * whichever value arrives, and only a caller that needs an arithmetic value
+   * pays for {@link Long.toBigInt}.
    */
   readUnsignedLong(): Long {
     this.readVarint();
@@ -213,16 +215,13 @@ export class Cursor extends BufferReader {
   }
 
   /**
-   * Read a signed 64-bit scalar (zig-zag) into a {@link Long} — the `bigint`-free
-   * twin of {@link readSigned}. The zig-zag undo runs on the halves, as in
-   * {@link readSignedArrayLong}.
+   * Read a signed scalar (zig-zag) into a {@link Long} — the `bigint`-free twin
+   * of {@link readSigned}; see {@link readUnsignedLong}. The zig-zag is undone on
+   * the halves, so the one allocation is the `Long` itself.
    */
   readSignedLong(): Long {
     this.readVarint();
-    const lo = this.lo >>> 0;
-    const hi = this.hi >>> 0;
-    const mask = (-(lo & 1)) >>> 0; // all ones when the zig-zag lsb is set
-    return new Long((((lo >>> 1) | (hi << 31)) >>> 0) ^ mask, ((hi >>> 1) >>> 0) ^ mask);
+    return zigzagDecodeLong(this.lo, this.hi);
   }
 
   /** Read a 32-bit float scalar (wire {@link WireType.Fixlen}, subtype fp32). */
@@ -419,10 +418,7 @@ export class Cursor extends BufferReader {
         q = this.p;
       }
       p = q;
-      const lo = this.lo >>> 0;
-      const hi = this.hi >>> 0;
-      const mask = (-(lo & 1)) >>> 0; // all ones when the zig-zag lsb is set
-      out[i] = new Long((((lo >>> 1) | (hi << 31)) >>> 0) ^ mask, ((hi >>> 1) >>> 0) ^ mask);
+      out[i] = zigzagDecodeLong(this.lo, this.hi);
     }
     this.p = p;
     return out;
