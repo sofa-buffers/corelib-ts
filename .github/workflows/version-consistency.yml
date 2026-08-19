@@ -1,0 +1,82 @@
+name: "Version consistency"
+
+# The git tag is the source of truth for the version: package.json and the
+# lockfile it pins must match it.
+#
+# release.yml already validates that the tag is semver and is not already on
+# npm, but it deliberately *overwrites* package.json with the tag-derived
+# version at build time ("the tag wins"), so nothing there ever notices that
+# the committed manifest disagreed. That is the gap this closes: the published
+# tarball would be right while the repository, the lockfile and every
+# `npm view`-free consumer reading the source tree stayed on the old number.
+#
+# Tags only: the comparison is only meaningful when there is a tag to compare
+# against. Between releases the manifest may legitimately sit ahead of (or
+# behind) the newest tag, so running this on every push and pull request would
+# produce noise, not signal — and cost a runner slot per run.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  check-versions:
+    runs-on: ubuntu-latest
+    # A hung step must fail fast and say which one it was: the account gets 20
+    # concurrent Actions slots, and a wedged job holds one of them for six
+    # hours by default while everyone else queues behind it.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # need tags for the reference version
+
+      - name: Reference version (git tag)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            ref_version=${GITHUB_REF_NAME#v}
+          else
+            # Latest tag on a manual/branch run; empty if the repo has no tags
+            # yet, in which case the comparison is skipped.
+            ref_version=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)
+            [[ -n "$ref_version" ]] || echo "::notice::no git tag found; skipping version comparison"
+          fi
+          echo "REF_VERSION=$ref_version" >> "$GITHUB_ENV"
+
+      - name: Check package.json
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          [[ -z "$REF_VERSION" || "$version" == "$REF_VERSION" ]] || {
+            echo "::error::package.json version: '$version' != '$REF_VERSION'"; exit 1; }
+          # package.json is the source of truth for name/license; publish them
+          # for the lockfile check below.
+          {
+            echo "REF_NAME=$(node -p "require('./package.json').name")"
+            echo "REF_LICENSE=$(node -p "require('./package.json').license")"
+          } >> "$GITHUB_ENV"
+
+      - name: Check package-lock.json
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # npm writes the manifest's version in two places in the lockfile —
+          # the root object and the "" package entry — and a hand-edited
+          # package.json leaves both behind.
+          check() { [[ -z "$3" || "$2" == "$3" ]] || { echo "::error::package-lock.json $1: '$2' != '$3'"; exit 1; }; }
+          get() { jq -r "$1" package-lock.json; }
+          check version               "$(get '.version')"                 "$REF_VERSION"
+          check 'packages."".version' "$(get '.packages."".version')"     "$REF_VERSION"
+          check name                  "$(get '.name')"                    "$REF_NAME"
+          check 'packages."".license' "$(get '.packages."".license')"     "$REF_LICENSE"

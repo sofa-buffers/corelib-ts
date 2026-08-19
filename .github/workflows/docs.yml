@@ -4,21 +4,27 @@ on:
   push:
     branches: [main]
 
+# Least privilege by default: only the deploy job below is allowed to write to
+# Pages or mint an OIDC token. The build job compiles TypeDoc output from a
+# checkout and needs nothing beyond reading the repo (plus the Pages settings
+# that configure-pages looks up).
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
   cancel-in-progress: false
 
 jobs:
-  docs:
+  build:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+    # A hung step must fail fast and say which one it was: the account gets 20
+    # concurrent Actions slots, and a wedged job holds one of them for six
+    # hours by default while everyone else queues behind it.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: read
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -38,6 +44,21 @@ jobs:
           # keeps each attempt's artifact isolated.
           name: github-pages-${{ github.run_attempt }}
           path: docs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The only job in the repo that may publish to Pages, and the only one
+    # holding an OIDC token — deploy-pages needs both; nothing else does.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
