@@ -44,6 +44,7 @@ import {
   invalidMsgError,
   limitExceededError,
 } from "../errors.js";
+import { SKIP } from "./skip.js";
 import { Long } from "../long.js";
 import { zigzagDecodeLong } from "../varint/zigzag.js";
 import type { DecodeLimits } from "./limits.js";
@@ -73,13 +74,19 @@ class FastDecoder extends BufferReader {
   }
 
   run(root: AnyVisitor): void {
-    // A null slot is a skipped scope (Visitor.sequenceBegin returned null).
-    // Every dispatch below goes through `top?.`, so a null slot short-circuits
-    // the call AND its arguments — no value is decoded into existence for a
-    // visitor that does not exist. The stack still grows, so MAX_DEPTH and the
-    // balance check cover skipped scopes exactly as they cover live ones.
-    const stack: (AnyVisitor | null)[] = [root];
-    let top: AnyVisitor | null = root;
+    // A skipped scope (Visitor.sequenceBegin returned null) puts SKIP in the
+    // slot rather than null. SKIP declares no callback, so every dispatch below
+    // short-circuits on it through the `?.` it already had — no value is decoded
+    // into existence, and a LIVE decode pays nothing for the feature: a nullable
+    // slot would have put a null check on every dispatch instead, which measured
+    // +204 Ir/op (+4%) on `decode: typical message`.
+    //
+    // Nesting needs no bookkeeping: SKIP has no sequenceBegin, so the
+    // `child ?? top` below keeps SKIP for a scope opened inside a skipped one.
+    // The stack still grows, so MAX_DEPTH and the balance check cover skipped
+    // scopes exactly as they cover live ones.
+    const stack: AnyVisitor[] = [root];
+    let top: AnyVisitor = root;
     // Visitor.longs, read ONCE — from the root visitor, for the whole decode.
     // Not per field, and deliberately not per scope either: re-reading an
     // optional property off a differently-shaped visitor object is the
@@ -104,7 +111,7 @@ class FastDecoder extends BufferReader {
 
       if (type === WireType.SequenceEnd) {
         if (stack.length <= 1) throw invalidMsgError("unbalanced sequence end");
-        top?.sequenceEnd?.();
+        top.sequenceEnd?.();
         stack.pop();
         top = stack[stack.length - 1]!;
         continue;
@@ -114,18 +121,18 @@ class FastDecoder extends BufferReader {
       // header word — so an observing visitor sees the field stream in wire
       // order. It carries no verdict of its own: a schema bound waits for the
       // word behind it (CORELIB_PLAN §4.1; see Visitor.fieldBegin).
-      top?.fieldBegin?.(id, type as WireType);
+      top.fieldBegin?.(id, type as WireType);
 
       switch (type) {
         case WireType.Unsigned: {
           this.readVarint();
-          top?.unsigned?.(id, longs ? new Long(this.lo, this.hi) : this.unsignedValue());
+          top.unsigned?.(id, longs ? new Long(this.lo, this.hi) : this.unsignedValue());
           break;
         }
 
         case WireType.Signed: {
           this.readVarint();
-          top?.signed?.(id, longs ? zigzagDecodeLong(this.lo, this.hi) : this.signedValue());
+          top.signed?.(id, longs ? zigzagDecodeLong(this.lo, this.hi) : this.signedValue());
           break;
         }
 
@@ -143,10 +150,10 @@ class FastDecoder extends BufferReader {
           // §6.2.1 distinction on a bounded field decodes it through Cursor, or
           // leaves the cap unset here and enforces the schema bound itself from
           // Visitor.fixlenBegin / arrayBegin, which carry the declared size.
-          if (top !== null && sub === FixlenSubtype.String && len > this.maxStringLen) {
+          if (len > this.maxStringLen && sub === FixlenSubtype.String && top !== SKIP) {
             throw limitExceededError(`string length ${len} exceeds maxStringLen ${this.maxStringLen}`);
           }
-          if (top !== null && sub === FixlenSubtype.Blob && len > this.maxBlobLen) {
+          if (len > this.maxBlobLen && sub === FixlenSubtype.Blob && top !== SKIP) {
             throw limitExceededError(`blob length ${len} exceeds maxBlobLen ${this.maxBlobLen}`);
           }
           if (sub === FixlenSubtype.Fp32 || sub === FixlenSubtype.Fp64) {
@@ -159,16 +166,16 @@ class FastDecoder extends BufferReader {
               // waste for the common value-only consumer, so it is not allocated.
               const p = this.p;
               const value = this.rawFp32();
-              top?.fp32?.(id, value, top.fp32Raw ? this.buf.subarray(p, p + 4) : undefined);
+              top.fp32?.(id, value, top.fp32Raw ? this.buf.subarray(p, p + 4) : undefined);
             } else {
               // Read into a local *before* the optional call: `v?.m(read())`
               // would short-circuit and never advance when fp64 is absent.
               const value = this.rawFp64();
-              top?.fp64?.(id, value);
+              top.fp64?.(id, value);
             }
-          } else if (top === null) {
+          } else if (top === SKIP) {
             // Skipped scope: consume the payload without the `subarray` view
-            // take() would allocate for a visitor that is not there.
+            // take() would allocate for a scope nobody is reading.
             this.takeRange(len);
           } else {
             // Announce at the length word first, so a visitor sees `total` at the
@@ -182,29 +189,29 @@ class FastDecoder extends BufferReader {
         }
 
         case WireType.ArrayUnsigned: {
-          const count = this.arrayCount(top !== null);
-          top?.arrayBegin?.(id, ArrayKind.Unsigned, count);
+          const count = this.arrayCount(top !== SKIP);
+          top.arrayBegin?.(id, ArrayKind.Unsigned, count);
           for (let i = 0; i < count; i++) {
             this.readVarint();
-            top?.arrayUnsigned?.(id, i, longs ? new Long(this.lo, this.hi) : this.unsignedValue());
+            top.arrayUnsigned?.(id, i, longs ? new Long(this.lo, this.hi) : this.unsignedValue());
           }
-          top?.arrayEnd?.(id);
+          top.arrayEnd?.(id);
           break;
         }
 
         case WireType.ArraySigned: {
-          const count = this.arrayCount(top !== null);
-          top?.arrayBegin?.(id, ArrayKind.Signed, count);
+          const count = this.arrayCount(top !== SKIP);
+          top.arrayBegin?.(id, ArrayKind.Signed, count);
           for (let i = 0; i < count; i++) {
             this.readVarint();
-            top?.arraySigned?.(id, i, longs ? zigzagDecodeLong(this.lo, this.hi) : this.signedValue());
+            top.arraySigned?.(id, i, longs ? zigzagDecodeLong(this.lo, this.hi) : this.signedValue());
           }
-          top?.arrayEnd?.(id);
+          top.arrayEnd?.(id);
           break;
         }
 
         case WireType.ArrayFixlen: {
-          const count = this.arrayCount(top !== null);
+          const count = this.arrayCount(top !== SKIP);
           // §4.8: a fixlen array always carries its element-length word — even
           // when empty — so the true element kind (fp32 vs fp64) stays known.
           // When count == 0 the payload loops below simply run zero times.
@@ -215,25 +222,25 @@ class FastDecoder extends BufferReader {
           if (sub === FixlenSubtype.Fp32 && size === 4) kind = ArrayKind.Fp32;
           else if (sub === FixlenSubtype.Fp64 && size === 8) kind = ArrayKind.Fp64;
           else throw invalidMsgError("invalid fixlen array element type");
-          top?.arrayBegin?.(id, kind, count);
+          top.arrayBegin?.(id, kind, count);
           // Read each element into a local *before* the optional call: with an
           // absent handler, `v?.m(read())` would short-circuit and never advance.
           if (kind === ArrayKind.Fp32) {
             // Hoist the opt-in check out of the loop: a value-only consumer
             // (Visitor.fp32Raw unset) allocates no per-element views.
-            const wantRaw = top?.fp32Raw === true;
+            const wantRaw = top.fp32Raw === true;
             for (let i = 0; i < count; i++) {
               const p = this.p;
               const value = this.rawFp32();
-              top?.arrayFp32?.(id, i, value, wantRaw ? this.buf.subarray(p, p + 4) : undefined);
+              top.arrayFp32?.(id, i, value, wantRaw ? this.buf.subarray(p, p + 4) : undefined);
             }
           } else {
             for (let i = 0; i < count; i++) {
               const value = this.rawFp64();
-              top?.arrayFp64?.(id, i, value);
+              top.arrayFp64?.(id, i, value);
             }
           }
-          top?.arrayEnd?.(id);
+          top.arrayEnd?.(id);
           break;
         }
 
@@ -244,12 +251,10 @@ class FastDecoder extends BufferReader {
             throw invalidMsgError(`nesting exceeds MAX_DEPTH (${MAX_DEPTH})`);
           }
           // null = skip this subtree; undefined = keep the current visitor.
-          // A scope already skipped stays skipped: its children are not offered
-          // to anyone, so nesting cannot climb back out of a discarded subtree.
-          if (top !== null) {
-            const child: AnyVisitor | null | void = top.sequenceBegin?.(id);
-            top = child === null ? null : (child ?? top);
-          }
+          // SKIP declares no sequenceBegin, so a scope opened inside a skipped
+          // one falls through to `?? top` and stays skipped by construction.
+          const child: AnyVisitor | null | void = top.sequenceBegin?.(id);
+          top = child === null ? SKIP : (child ?? top);
           stack.push(top);
           break;
         }
@@ -281,7 +286,7 @@ class FastDecoder extends BufferReader {
     this.readVarint();
     const count = this.num();
     if (count > ARRAY_MAX) throw invalidMsgError("array count out of range");
-    if (live && count > this.maxArrayCount) {
+    if (count > this.maxArrayCount && live) {
       throw limitExceededError(`array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`);
     }
     return count;

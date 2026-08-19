@@ -336,6 +336,28 @@ export function decodeChunked(wire: Uint8Array, visitor: Visitor, chunk: number)
  * exercised. Returns the number of top-level fields skipped, so the loop cannot
  * be optimised away.
  */
+/**
+ * A message whose one subtree the consumer declines, and the two ways to say so.
+ *
+ * `declineWire` is deliberately string-heavy: a declined subtree used to cost a
+ * payload view and a callback lookup per field, and the row exists to keep that
+ * saving honest rather than asserted.
+ */
+export function declinedWire(): Uint8Array {
+  const os = new OStream();
+  os.writeUnsigned(1, 7);
+  os.writeSequenceBeginLazy(2);
+  for (let i = 0; i < 200; i++) os.writeString(i % 64, "payload".repeat(8));
+  os.writeSequenceEnd();
+  os.writeUnsigned(9, 6);
+  return os.bytes().slice();
+}
+
+/** Declines the subtree: sequenceBegin returns null (corelib-ts#154). */
+export function decodeDeclining(wire: Uint8Array): void {
+  decode(wire, { sequenceBegin: () => null });
+}
+
 export function skipAll(wire: Uint8Array): number {
   const c = new Cursor(wire);
   let n = 0;
@@ -377,6 +399,7 @@ export function buildWorkloads(): Workload[] {
   const u64Wire = encodeToBytes((os) => os.writeUnsignedArray(1, src));
   const typWire = encodeToBytes(encodeTypical);
   const compWire = encodeToBytes(encodeComposite);
+  const declWire = declinedWire();
 
   // Output targets, allocated once: the encode rows measure the encoder, not
   // the allocator (see the file header).
@@ -439,5 +462,9 @@ export function buildWorkloads(): Workload[] {
       run: decodeWhole(compWire) },
     { key: "decode_composite_skip", label: "decode: composite skip-all", bytes: compWire.length,
       run: () => sink(skipAll(compWire)) },
+    // The PUSH twin of the row above: skip-all there is the pull cursor jumping
+    // fields, this is a visitor declining a whole subtree (sequenceBegin -> null).
+    { key: "decode_declined", label: "decode: declined subtree", bytes: declWire.length,
+      run: () => decodeDeclining(declWire) },
   ];
 }
