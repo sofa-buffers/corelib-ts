@@ -567,10 +567,24 @@ Who owns the bytes:
   builds the string with a fatal `TextDecoder` and rejects invalid UTF-8 as
   `INVALID_MSG`. A visitor `string` chunk is *raw wire bytes* and is not
   validated — it may even end mid-code-point — so a visitor that materializes one
-  itself owns that check and must use `new TextDecoder("utf-8", { fatal: true })`.
-  The default `TextDecoder` silently substitutes `U+FFFD`, which the format
-  forbids in either direction; the encoder likewise refuses an unpaired surrogate
-  with `ARGUMENT` rather than replacing it.
+  itself owns that check. `decodeUtf8(bytes)` is that check, exported for exactly
+  this: it is what `Cursor.readString` uses, it rejects malformed bytes as
+  `INVALID_MSG` rather than as a platform `TypeError`, and it is faster than a
+  bare `TextDecoder` on the short payloads a message is mostly made of. Rolling
+  your own instead means `new TextDecoder("utf-8", { fatal: true })` — the
+  default `TextDecoder` silently substitutes `U+FFFD`, which the format forbids
+  in either direction; the encoder likewise refuses an unpaired surrogate with
+  `ARGUMENT` rather than replacing it.
+- **Reassembly is the caller's, with a helper.** Nothing in the library holds a
+  payload across `feed` calls, so a consumer that wants a *value* rather than a
+  stream of chunks joins them itself. `PayloadAcc` does that join — one per
+  decoder, since only one payload is ever in flight — and allocates only for a
+  payload that actually straddled a chunk boundary; one arriving whole is handed
+  straight back, still a view into the chunk and still valid only for that call.
+  `StringSeq` / `BlobSeq` build on it to collect the elements of a `string` /
+  `blob` array, and `elementsEqual` is the array form of the omit-if-default test
+  an encoder applies before writing a field. These four are the support layer
+  generated code calls instead of carrying its own copy.
 
 ### Decode limits
 

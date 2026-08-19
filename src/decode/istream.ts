@@ -184,12 +184,14 @@ export interface Visitor<TInt = number | bigint> {
    * They are **not validated**. §6.4 puts the UTF-8 check where a string is
    * *materialized* — a chunk may end mid-code-point, and a skipped field is
    * never validated at all — so on this path the caller who materializes owns
-   * the check and must use the **fatal** decoder,
-   * `new TextDecoder("utf-8", { fatal: true })`, which is what
-   * {@link Cursor.readString} uses to report invalid UTF-8 as `INVALID_MSG`.
-   * JavaScript's default `TextDecoder` substitutes `U+FFFD`, and §6.4 forbids
-   * that silent replacement in either direction. Decode `total`-sized reassembled
-   * payloads, not individual chunks, unless a chunk is the whole payload.
+   * the check. {@link decodeUtf8} is it: the same strict decoder
+   * {@link Cursor.readString} uses, reporting invalid UTF-8 as `INVALID_MSG`.
+   * A hand-rolled one must be built **fatal**,
+   * `new TextDecoder("utf-8", { fatal: true })` — JavaScript's default
+   * `TextDecoder` substitutes `U+FFFD`, and §6.4 forbids that silent replacement
+   * in either direction. Decode `total`-sized reassembled payloads
+   * ({@link PayloadAcc} joins them), not individual chunks, unless a chunk is the
+   * whole payload.
    */
   string?(id: number, total: number, offset: number, chunk: Uint8Array): void;
   /** A chunk of a blob field. */

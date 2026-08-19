@@ -30,6 +30,14 @@ export type { AnyVisitor, LongVisitor, Visitor } from "./decode/istream.js";
 export type { DecodeLimits } from "./decode/limits.js";
 export { Cursor } from "./decode/cursor.js";
 
+// The generated layer's support (ARCHITECTURE §8): schema-free helpers that a
+// generated message class would otherwise carry its own copy of. Nothing here
+// knows a schema — a capacity, a maxlen or a payload length is an argument.
+export { decodeUtf8 } from "./decode/text.js";
+export { PayloadAcc } from "./decode/acc.js";
+export { BlobSeq, StringSeq } from "./decode/seq.js";
+export { elementsEqual } from "./encode/equal.js";
+
 export { getKernel, setKernel } from "./backend/kernel.js";
 export type { Kernel } from "./backend/kernel.js";
 export { jsKernel } from "./backend/js.js";
