@@ -39,6 +39,11 @@ jobs:
 
   # Second gate: a tsup/exports config that cannot even produce a bundle makes
   # the smoke jobs meaningless, so prove the build once before the fan-out.
+  # The only build in this pipeline. It uploads dist/ because that is the only
+  # way to hand files to another job -- each job runs on a fresh VM, so a dist/
+  # left on disk here would simply be thrown away. Every runtime smoke below
+  # then imports this one artifact, which is the point: they must all exercise
+  # the same bundle, the one that would be published.
   build:
     needs: [lint]
     runs-on: ubuntu-latest
@@ -57,8 +62,14 @@ jobs:
       - name: Build (ESM + CJS + IIFE + types)
         run: npm run build
 
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          retention-days: 1
+
   build-test:
-    needs: [build]
+    needs: [lint]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -113,27 +124,8 @@ jobs:
   # The bundle is built once here and handed to the smoke jobs as an artifact,
   # so those jobs need no npm install at all — they only ever see what a
   # consumer would see.
-  smoke-build:
-    needs: [build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
-      - name: Build (produces the dist/ bundle the smoke test imports)
-        run: npm run build
-      - uses: actions/upload-artifact@v7
-        with:
-          name: dist
-          path: dist/
-          retention-days: 1
-
   smoke-node:
-    needs: smoke-build
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -160,7 +152,7 @@ jobs:
         run: node test/smoke-browser.mjs
 
   smoke-deno:
-    needs: smoke-build
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -176,7 +168,7 @@ jobs:
         run: deno run --allow-read test/smoke.mjs
 
   smoke-bun:
-    needs: smoke-build
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -194,7 +186,7 @@ jobs:
         run: bun ./test/smoke.cjs
 
   coverage:
-    needs: [build]
+    needs: [lint]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
