@@ -13,12 +13,22 @@ on:
 permissions:
   contents: read
 
+# One publish per tag at a time, and never cancel one in flight: a half-run
+# `npm publish` is not something to interrupt.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # Preflight gate. Fails the whole workflow *before* any build or publish so a
   # bad tag surfaces here with a clear message instead of deep inside
   # `npm publish`. Emits the resolved version for the publish job to consume.
   guard:
     runs-on: ubuntu-latest
+    # A hung step must fail fast and say which one it was: the account gets 20
+    # concurrent Actions slots, and a wedged job holds one of them for six
+    # hours by default while everyone else queues behind it.
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.resolve.outputs.version }}
     steps:
@@ -61,6 +71,10 @@ jobs:
   publish:
     needs: guard
     runs-on: ubuntu-latest
+    # Longer than the other jobs: this one installs npm@latest, runs the full
+    # typecheck/test/build chain and then talks to the registry. Still far
+    # below the 360-minute default.
+    timeout-minutes: 20
     # Trusted Publishing (OIDC) instead of a long-lived npm token:
     #   * id-token: write  — lets the runner mint the short-lived OIDC token
     #     that npm exchanges for a one-off publish credential. No NPM_TOKEN.

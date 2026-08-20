@@ -9,9 +9,58 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
-  build-test:
+  # Cheap gate in front of everything else. `npm run typecheck` is ~2s, and a
+  # type error fails every one of the eleven jobs below in exactly the same
+  # way — so pay for one runner to learn that, not eleven.
+  lint:
     runs-on: ubuntu-latest
+    # A hung step must fail fast and say which one it was: the account gets 20
+    # concurrent Actions slots, and a wedged job holds one of them for six
+    # hours by default while everyone else queues behind it.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Use Node.js 24 (current LTS)
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: Type-check
+        run: npm run typecheck
+
+  # Second gate: a tsup/exports config that cannot even produce a bundle makes
+  # the smoke jobs meaningless, so prove the build once before the fan-out.
+  build:
+    needs: [lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Use Node.js 24 (current LTS)
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build (ESM + CJS + IIFE + types)
+        run: npm run build
+
+  build-test:
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -65,7 +114,9 @@ jobs:
   # so those jobs need no npm install at all — they only ever see what a
   # consumer would see.
   smoke-build:
+    needs: [build]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -84,6 +135,7 @@ jobs:
   smoke-node:
     needs: smoke-build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -110,6 +162,7 @@ jobs:
   smoke-deno:
     needs: smoke-build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: denoland/setup-deno@v2
@@ -125,6 +178,7 @@ jobs:
   smoke-bun:
     needs: smoke-build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
@@ -140,7 +194,9 @@ jobs:
         run: bun ./test/smoke.cjs
 
   coverage:
+    needs: [build]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
