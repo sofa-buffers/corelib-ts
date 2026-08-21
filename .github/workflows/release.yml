@@ -5,7 +5,8 @@ name: Release
 # The git tag is the single source of truth for the version: it is resolved
 # from the release tag, validated, checked against the registry, and injected
 # into package.json at build time. The version committed in package.json is
-# never trusted for the publish — the tag wins.
+# never trusted for the publish — the tag wins. The tag also decides the npm
+# dist-tag, so only a stable tag can claim `latest`.
 on:
   release:
     types: [published]
@@ -21,7 +22,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.resolve.outputs.version }}
+      dist_tag: ${{ steps.resolve.outputs.dist_tag }}
     steps:
+      - uses: actions/checkout@v7
+
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -30,18 +34,70 @@ jobs:
         id: resolve
         env:
           TAG: ${{ github.event.release.tag_name }}
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
           # The tag is the truth. Strip an optional leading "v".
           VERSION="${TAG#v}"
           # Reject anything that is not plain semver (with optional
           # prerelease / build metadata). A malformed tag must never reach
-          # `npm publish`.
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+          # `npm publish`. The prerelease part is captured — it decides the
+          # dist-tag below.
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-([0-9A-Za-z.-]+))?(\+[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::Tag '$TAG' does not resolve to a valid semver version ('$VERSION')."
             exit 1
           fi
+          PRE="${BASH_REMATCH[2]}"
+
+          # The dist-tag decides what a bare `npm i @sofa-buffers/corelib`
+          # installs. Only a stable version may claim `latest`; a prerelease
+          # publishes under its own identifier (0.11.0-rc.1 -> rc).
+          if [ -n "$PRE" ]; then
+            DIST_TAG="${PRE%%.*}"
+            # npm rejects a dist-tag that parses as semver; requiring a leading
+            # letter also rules out semver's numeric identifiers (-1, -0.3).
+            if ! [[ "$DIST_TAG" =~ ^[a-z][a-z0-9-]*$ ]]; then
+              echo "::error::Prerelease '$PRE' yields '$DIST_TAG', which is not a usable npm dist-tag. Use a named identifier such as -rc.1 or -beta.2."
+              exit 1
+            fi
+          else
+            DIST_TAG=latest
+          fi
+
+          # A release flagged as a prerelease on GitHub but carrying a stable
+          # tag would silently take over `latest` — the wrong-publish this step
+          # exists to stop, so it is fatal. The mirror case (prerelease tag,
+          # box unticked) still publishes safely under its own dist-tag and is
+          # only worth a notice.
+          if [ "$IS_PRERELEASE" = true ] && [ -z "$PRE" ]; then
+            echo "::error::Release is marked as a prerelease but tag '$TAG' is a stable version, which would publish to 'latest'."
+            exit 1
+          fi
+          if [ "$IS_PRERELEASE" = false ] && [ -n "$PRE" ]; then
+            echo "::notice::Tag '$TAG' is a prerelease but the GitHub release is not marked as one. Publishing to '$DIST_TAG'."
+          fi
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Resolved release version: $VERSION"
+          echo "dist_tag=$DIST_TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved release version: $VERSION (dist-tag: $DIST_TAG)"
+
+      # `npm version` in the publish job rewrites both files to the tag version,
+      # so a stale package.json cannot corrupt the publish. A lockfile left
+      # behind by a version bump can: `npm ci` validates dependency edges, not
+      # the root package's own version field, so the desync survives into the
+      # published tarball's package-lock.json. This is policy-independent —
+      # whatever package.json says, the lockfile must agree with it.
+      - name: Guard package-lock.json against package.json
+        run: |
+          PKG="$(node -p "require('./package.json').version")"
+          # npm carries the root version in two places; a hand bump often
+          # misses both.
+          LOCK_ROOT="$(node -p "require('./package-lock.json').version")"
+          LOCK_SELF="$(node -p "require('./package-lock.json').packages[''].version")"
+          if [ "$LOCK_ROOT" != "$PKG" ] || [ "$LOCK_SELF" != "$PKG" ]; then
+            echo "::error::package-lock.json ($LOCK_ROOT / $LOCK_SELF) is out of sync with package.json ($PKG). Run 'npm install --package-lock-only' and re-cut the tag."
+            exit 1
+          fi
+          echo "Lockfile in sync at $PKG."
 
       - name: Guard against republishing an existing version
         env:
@@ -75,6 +131,7 @@ jobs:
       url: https://www.npmjs.com/package/@sofa-buffers/corelib
     env:
       VERSION: ${{ needs.guard.outputs.version }}
+      DIST_TAG: ${{ needs.guard.outputs.dist_tag }}
     steps:
       - uses: actions/checkout@v7
 
@@ -111,5 +168,8 @@ jobs:
       # No NODE_AUTH_TOKEN: npm detects the OIDC environment, exchanges the
       # id-token for a publish credential, and attaches provenance
       # automatically. `access: public` comes from package.json publishConfig.
+      # --tag is `latest` for a stable release (npm's own default) and the
+      # prerelease identifier otherwise, so an RC never becomes what a bare
+      # `npm i` installs.
       - name: Publish to npm (Trusted Publishing)
-        run: npm publish
+        run: npm publish --tag "$DIST_TAG"
