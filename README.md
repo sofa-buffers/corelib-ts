@@ -38,6 +38,10 @@ required).
 None. Zero runtime dependencies; uses only standard JS / Web APIs
 (`Uint8Array`, `DataView`, `TextEncoder` / `TextDecoder`).
 
+### Feature flags
+
+None — the build always ships every wire type.
+
 ### Packaging
 
 Published as `@sofa-buffers/corelib`:
@@ -625,10 +629,6 @@ there the caps apply to every field; a caller that needs the distinction on a
 bounded field decodes it through `Cursor`, or leaves the cap unset and enforces
 the schema bound itself from `fixlenBegin` / `arrayBegin`, which carry the
 declared size.
-
-## Feature flags
-
-None — the build always ships every wire type.
 
 ## Build & test
 
