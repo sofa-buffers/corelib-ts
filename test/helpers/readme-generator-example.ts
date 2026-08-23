@@ -35,26 +35,37 @@ class Point {
   }
 
   static decode(bytes: Uint8Array): Point {
-    return Point.decodeFrom(new Cursor(bytes));
-  }
-
-  static decodeFrom(c: Cursor): Point {
-    const p = new Point();
-    while (c.readHeader()) {
-      switch (c.id) {
-        case 1: p.x = Number(c.readSigned()); break;
-        case 2: p.y = Number(c.readSigned()); break;
-        // case 3: p.child = Child.decodeFrom(c); break;  // nested sequence
-        default: c.skip(c.wire); break;                   // forward-compatible
-      }
-    }
-    return p;
+    return _decodeFromPoint(new Cursor(bytes));
   }
 
   /** The streaming half: a reader bound to the corelib's resumable IStream. */
   static decoder(): PointDecoder {
     return new PointDecoder();
   }
+}
+
+// The cursor-level steps sit beside the class, not on it: CORELIB_PLAN §6.1.1
+// closes the generated object's surface to encode / decode / try_decode /
+// serialize / deserialize / decoder, and `decode_from` / `decode_into` are two of
+// the spellings it names as forbidden. They stay module-private — reachable from
+// the sibling classes that decode into one another, and from nowhere else.
+
+function _decodeFromPoint(c: Cursor): Point {
+  return _decodeIntoPoint(c, new Point());
+}
+
+// Decodes into `o`, so a re-opened sequence continues the scope an earlier
+// opening populated (MESSAGE_SPEC §7.4).
+function _decodeIntoPoint(c: Cursor, o: Point): Point {
+  while (c.readHeader()) {
+    switch (c.id) {
+      case 1: o.x = Number(c.readSigned()); break;
+      case 2: o.y = Number(c.readSigned()); break;
+      // case 3: _decodeIntoChild(c, o.child); break;     // nested sequence
+      default: c.skip(c.wire); break;                     // forward-compatible
+    }
+  }
+  return o;
 }
 
 // generated alongside it: the visitor that fills a Point, one callback per
