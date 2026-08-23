@@ -28,15 +28,17 @@ monomorphic pull cursor (`Cursor`) driven by a single `switch` over the field id
 
 ### Requirements
 
-Node.js 20+ — every Node line that is still supported plus the current release
-is tested, so CI runs 20 / 22 / 24 / 26 today — or any modern browser /
-Electron / Deno / Bun. Built with TypeScript 6.x; targets ES2020 (`bigint`
-required).
+Node.js 20+ — CI runs 20 / 22 / 24 / 26 — or any modern browser / Electron /
+Deno / Bun. Built with TypeScript 6.x; targets ES2020 (`bigint` required).
 
 ### Dependencies
 
 None. Zero runtime dependencies; uses only standard JS / Web APIs
 (`Uint8Array`, `DataView`, `TextEncoder` / `TextDecoder`).
+
+### Feature flags
+
+None — the build always ships every wire type.
 
 ### Packaging
 
@@ -69,29 +71,24 @@ full type declarations.
 The codec has four use cases — serialize a message that fits in one buffer,
 serialize one too large for the buffer (streamed out in chunks), deserialize a
 whole message, and deserialize one arriving in chunks — plus the generated-code
-path that wraps them. Problems are reported by throwing `SofabError`; the cause is
-on `SofabError.code` (`ARGUMENT`, `BUFFER_FULL`, `INVALID_MSG`, `INCOMPLETE`,
-`LIMIT_EXCEEDED`) — and that is the whole set. There is no "invalid usage" code
-(CORELIB_PLAN §6.3): a read whose declared type contradicts the field on the wire
-is not an error at all — the field is *skipped* like an unknown id, the
-destination is left untouched and the decode stays `COMPLETE` (MESSAGE_SPEC
-§7.3) — so every remaining caller mistake is an `ARGUMENT` error and every
-remaining malformed input is `INVALID_MSG`. The decoder splits its two failure
-kinds (MESSAGE_SPEC §7): `INVALID_MSG` is a message malformed regardless of what
-follows, while `INCOMPLETE` means the bytes merely ended *inside* a field — a
-truncation more bytes could complete, which is not an error the caller must treat
-as one. There is no finish/finalize step: every streaming `feed()` *returns* the
-decode outcome for the bytes so far (see below), so `INCOMPLETE` is reported to
-the caller, never promoted to a throw. `LIMIT_EXCEEDED` is neither: it is a
-receiver-local *policy* rejection — a field larger than a cap **you** configured
-(see [Decode limits](#decode-limits)) — and says nothing about the message's
-validity, since the same bytes decode under a looser limit.
+path that wraps them.
+
+Problems are reported by throwing `SofabError`; the cause is on
+`SofabError.code` (`ARGUMENT`, `BUFFER_FULL`, `INVALID_MSG`, `INCOMPLETE`,
+`LIMIT_EXCEEDED`), and that is the whole set. A read whose declared type
+contradicts the field on the wire is not an error at all: the field is *skipped*
+like an unknown id, the destination is left untouched and the decode stays
+`COMPLETE`. `INVALID_MSG` is a message malformed regardless of what follows;
+`INCOMPLETE` means the bytes merely ended *inside* a field, and is reported by
+what `feed()` returns rather than thrown — there is no finish/finalize step.
+`LIMIT_EXCEEDED` is neither: it is a receiver-local *policy* rejection, a field
+larger than a cap **you** configured (see [Decode limits](#decode-limits)).
 
 ### Serialize
 
-`OStream` writes into the buffer **you** hand it — the library allocates no
-output buffer and never grows one it was given (CORELIB_PLAN §5.1). Where the
-schema bounds the message, that is one buffer of `MAX_SIZE` bytes:
+`OStream` writes into the buffer **you** hand it: the library allocates no output
+buffer and never grows one it was given. Where the schema bounds the message,
+that is one buffer of `MAX_SIZE` bytes:
 
 ```ts
 import { OStream } from "@sofa-buffers/corelib";
@@ -103,11 +100,9 @@ os.writeString(3, "hi");
 const bytes = os.bytes();          // Uint8Array view of the finished message
 ```
 
-Where it does not — no `maxlen` / `count` to size from — the buffer has to follow
-the message, and that is the caller's job too. `growingOStream()` builds that caller,
-ready-made: it owns a buffer, hands it to the encoder like any other caller and
-replaces it with a bigger one of its own as the message grows. It is the
-one-liner for the 90% case:
+Where it does not — no `maxlen` / `count` to size from — `growingOStream()` owns
+a buffer, hands it to the encoder like any other caller and replaces it with a
+bigger one of its own as the message grows:
 
 ```ts
 import { growingOStream } from "@sofa-buffers/corelib";
@@ -123,25 +118,20 @@ Everything below is written against `OStream`, and every one of its `write*`
 methods works the same on the stream `growingOStream()` returns.
 
 Every integer written — scalar **or array element** — is checked against the
-64-bit value domains (CORELIB_PLAN §6.2): unsigned `0 .. 2^64 - 1`, signed
-`-2^63 .. 2^63 - 1`. Anything outside them is a caller mistake and throws
-`SofabError` with code `ARGUMENT`; the encoder never reduces a value modulo 2^64
-and never puts a wrapped one on the wire. The answer does not depend on how the
-encoder was constructed — a buffer that grows and a fixed streaming one reject
-exactly the same values — nor on the installed `Kernel`, which carries the same obligation.
-A `number` that is not an integer at all (a fraction, `NaN`, `±Infinity`) is the
-same kind of caller mistake and is reported the same way: `SofabError` with code
-`ARGUMENT`, never a bare `RangeError` — so the `instanceof SofabError` pattern
-above catches every encoder rejection without exception.
+64-bit value domains: unsigned `0 .. 2^64 - 1`, signed `-2^63 .. 2^63 - 1`.
+Anything outside them, and any `number` that is not an integer at all (a
+fraction, `NaN`, `±Infinity`), throws `SofabError` with code `ARGUMENT` rather
+than a bare `RangeError`; the encoder never reduces a value modulo 2^64 and never
+puts a wrapped one on the wire. That answer does not depend on how the encoder
+was constructed, nor on the installed `Kernel`, which carries the same
+obligation.
 
-The byte-level `writeFixlen(id, data, subtype)` is checked the same way, against
-the fixlen domain of CORELIB_PLAN §4.6: subtypes `0x4`–`0x7` are **reserved**, and
-an `fp32` / `fp64` payload is **exactly** 4 / 8 bytes. Either mistake throws
-`ARGUMENT` before a byte is written, because a decoder must reject the resulting
-`fixlen_word` as malformed (`INVALID_MSG`) — the encoder does not emit bytes it
-would refuse to read. `String` and `Blob` still take any length up to
-`FIXLEN_MAX` (`0x7fffffff`), and the typed `writeFp32` / `writeFp64` /
-`writeString` are correct by construction and pay nothing for this.
+The byte-level `writeFixlen(id, data, subtype)` is checked the same way against
+the fixlen domain: subtypes `0x4`–`0x7` are **reserved**, and an `fp32` / `fp64`
+payload is **exactly** 4 / 8 bytes. Either mistake throws `ARGUMENT` before a
+byte is written. `String` and `Blob` still take any length up to `FIXLEN_MAX`
+(`0x7fffffff`); the typed `writeFp32` / `writeFp64` / `writeString` are correct
+by construction.
 
 ### Serialize stream
 
@@ -161,10 +151,9 @@ os.flush();                                            // push the tail
 ### Nested sequences
 
 A nested message is a *sequence*: a fresh id scope between a begin header and the
-`0x07` end marker. MESSAGE_SPEC §2 omits a sequence-typed **field** whose value
-equals its declared default, so the encoder holds the begin header back until the
-sequence proves it has content — no buffering of the sub-message, and nothing to
-compare byte images against:
+`0x07` end marker. A sequence-typed **field** whose value equals its declared
+default is omitted from the wire, so the encoder holds the begin header back
+until the sequence proves it has content — no buffering of the sub-message:
 
 ```ts
 const os = growingOStream();
@@ -186,13 +175,11 @@ by the value:
 | wrapper-array **element**, or an array field differing from a non-empty declared default | `writeSequenceEndKeep()` — always emits `begin` + `end` |
 
 An element keeps its frame because element presence is what carries a dynamic
-array's length (highest present id + 1, §5.1); dropping an all-default element
-would change the decoded length, not just the bytes. The failure directions are
-not symmetric, so `writeSequenceEndKeep()` is the safe choice when in doubt: a
-needless one costs a non-canonical empty frame that a decoder normalizes away,
-while a wrong `writeSequenceEnd()` shortens an array. Raw transcoding — replaying
-bytes rather than encoding a schema value — should use `writeSequenceEndKeep()`
-throughout, so the output reproduces the input frame for frame.
+array's length (highest present id + 1): dropping an all-default element would
+shorten the array. `writeSequenceEndKeep()` is the safe choice when in doubt — a
+needless one costs only a non-canonical empty frame that a decoder normalizes
+away — and raw transcoding, replaying bytes rather than encoding a schema value,
+uses it throughout so the output reproduces the input frame for frame.
 
 ```ts
 const os = growingOStream();
@@ -209,9 +196,9 @@ os.bytes();                     // 26 06 00 07 07 0e 07 07
 Decoding is unaffected by the distinction: an empty frame is valid input that the
 message layer normalizes to the default, and an absent sequence field is
 reconstructed from the schema default. Nesting is capped at `MAX_DEPTH` (255) on
-both sides; the encoder holds headers back to that full depth, so its output is
-canonical however deep a message nests. A held-back header is encoder state, never
-buffer content, so streaming through a small buffer produces the same bytes.
+both sides, and the encoder holds headers back to that full depth. A held-back
+header is encoder state, never buffer content, so streaming through a small
+buffer produces the same bytes.
 
 ### Deserialize
 
@@ -235,24 +222,20 @@ decode(bytes, new My());
 `fieldBegin(id, wire)` is announced first for every field — right after the header
 varint, before the value and before the value's *own* header word (a fixlen length
 word, an array count word, a nested sequence's fields). It is the push twin of
-`Cursor.readHeader()`: an observation point for a reader that wants the field
-stream in wire order — which id, in which scope, in which order — without writing
-the eight value callbacks it would otherwise take to see the same thing. The
-sequence-*end* marker gets none: it closes a scope rather than opening a field,
-the same answer `readHeader()` gives by returning `false` for it.
+`Cursor.readHeader()`, and gives a reader the field stream in wire order without
+writing the eight value callbacks. The sequence-*end* marker gets none: it closes
+a scope rather than opening a field, the same answer `readHeader()` gives by
+returning `false` for it.
 
 **Do not apply a schema bound from it.** An element id past the declared `count`
 looks decidable from the id alone, and is not: that bound applies only to a field
 whose *subtype* has confirmed it is the declared one, so it belongs on
 `fixlenBegin`. A message ending inside the fixlen word is `INCOMPLETE` even when
-the id would violate the bound — the low 3 bits of an unfinished varint are
-already arithmetically fixed, and a decoder still must not act on them
-(CORELIB_PLAN §4.1). Rejecting early answers `INVALID` where `INCOMPLETE` is
-required, and makes this path disagree with the cursor on the same bytes.
-Throwing from `fieldBegin` is still how you reject a field the header alone
-settles — an id you will not accept in any shape. Everything schema-shaped stays
-on the later, more informative hook: a fixlen subtype and a declared length on
-`fixlenBegin`, a declared element count on `arrayBegin`.
+the id would violate the bound. Throwing from `fieldBegin` is still how you
+reject a field the header alone settles — an id you will not accept in any shape.
+Everything schema-shaped stays on the later, more informative hook: a fixlen
+subtype and a declared length on `fixlenBegin`, a declared element count on
+`arrayBegin`.
 
 `sequenceBegin(id)` has three answers. Return a visitor and the nested scope's
 fields go to it; return **`null`** and the whole subtree is skipped — no callback
@@ -261,23 +244,19 @@ being offered, and no `sequenceEnd` arrives for what was skipped. Return nothing
 and the current visitor keeps receiving, which merges two id spaces (a nested
 scope's ids are its own) and is rarely what you want.
 
-`null` is what you say about a subtree you have no destination for. The bytes are
-still parsed — a sequence is framed by markers rather than by a length, so its end
-has to be found — but nothing is decoded into existence for it: no payload views,
-no boxed values, and the caps in `DecodeLimits` do not fire, because they bound
-what *this reader* is handed and a skipped scope hands it nothing. Format ceilings
-(`ARRAY_MAX`, `FIXLEN_MAX`, `MAX_DEPTH`, the varint bound) apply inside a skipped
-subtree exactly as outside it: they bound what the wire may express, which is not
-the reader's to waive.
+A skipped subtree is still parsed — a sequence is framed by markers rather than
+by a length, so its end has to be found — but nothing is decoded into existence
+for it: no payload views, no boxed values, and the caps in `DecodeLimits` do not
+fire. Format ceilings (`ARRAY_MAX`, `FIXLEN_MAX`, `MAX_DEPTH`, the varint bound)
+apply inside a skipped subtree exactly as outside it.
 
 ### Deserialize stream
 
-`IStream` resumes across chunk boundaries, so feed it whatever the transport hands
-you — from any source — and read the outcome from what `feed()` **returns**: the
-three-valued status for the bytes consumed so far (CORELIB_PLAN §5.2/§6). There is
-no end / finalize step; `status()` re-reads that same value whenever you want it
-later. String / blob payloads arrive as one or more chunks tagged with the field's
-`total` length and byte `offset`:
+`IStream` resumes across chunk boundaries: feed it whatever the transport hands
+you and read the outcome from what `feed()` **returns**, the three-valued status
+for the bytes consumed so far. There is no end / finalize step. String / blob
+payloads arrive as one or more chunks tagged with the field's `total` length and
+byte `offset`:
 
 ```ts
 import { IStream, DecodeStatus, type Visitor } from "@sofa-buffers/corelib";
@@ -301,18 +280,15 @@ if (status !== DecodeStatus.Complete) {
 }
 ```
 
-`status()` returns exactly what the last `feed()` returned, for a caller that
-would rather ask later than thread the value through — it is a pure accessor and
-never changes the verdict. (`end()` is a deprecated alias of `status()`, kept so
-existing code compiles; the spec's decoder has no "end" step.)
+`status()` returns exactly what the last `feed()` returned; it is a pure accessor
+and never changes the verdict. (`end()` is a deprecated alias of it, kept so
+existing code compiles.)
 
-`INVALID` is **terminal** (CORELIB_PLAN §5.2): no later bytes can make malformed
-input valid. `INVALID` is the one outcome `feed()` does not return: it travels on
-the error channel, as a thrown `INVALID_MSG`. A stream that has thrown it is
-poisoned for good — every further `feed` re-throws it without consuming a byte or
-calling the visitor, and `status()` answers `INVALID` however many well-formed
-chunks follow. So a caller that catches the throw and keeps going still gets a
-truthful verdict:
+`INVALID` is **terminal**, and is the one outcome `feed()` does not return: it
+travels on the error channel, as a thrown `INVALID_MSG`. A stream that has thrown
+it is poisoned for good — every further `feed` re-throws it without consuming a
+byte or calling the visitor, and `status()` answers `INVALID` however many
+well-formed chunks follow:
 
 ```ts
 import { SofabError, SofabErrorCode } from "@sofa-buffers/corelib";
@@ -327,20 +303,16 @@ is.status(); // INVALID — never COMPLETE, never INCOMPLETE
 ```
 
 A receiver-side cap (`LIMIT_EXCEEDED`, see [Decode limits](#decode-limits)) does
-*not* poison the stream: the bytes are well-formed and the same message decodes
-under a looser limit (§6.2.1), so it is a policy rejection, not the `INVALID`
-outcome.
+*not* poison the stream: it is a policy rejection, not the `INVALID` outcome.
 
 ### 64-bit values without `bigint`
 
 The default 64-bit surface is *number-first*: a value that fits exactly comes
-back as a `number`, and only past `2^53-1` is a `bigint` materialised. That is
-the right default, but it means the runtime type of a `u64` / `i64` depends on
-the value, and a `bigint` in the hot path is expensive.
-
-`Long` — a value carried as two unsigned 32-bit halves (`.low` / `.high`) — is
-the fixed-type alternative. It is **representation-only**: the wire is identical
-to the `number | bigint` path, byte for byte, in both directions.
+back as a `number`, and only past `2^53-1` is a `bigint` materialised — so the
+runtime type of a `u64` / `i64` depends on the value. `Long`, a value carried as
+two unsigned 32-bit halves (`.low` / `.high`), is the fixed-type alternative. It
+is **representation-only**: the wire is identical to the `number | bigint` path,
+byte for byte, in both directions.
 
 ```ts
 import { Long, OStream, Cursor } from "@sofa-buffers/corelib";
@@ -358,8 +330,7 @@ a.toBigInt();       // materialise only the values you actually need
 b.toBigInt(true);   // `signed` reads the high bit as two's complement
 ```
 
-On the push decoders the same channel is opt-in per visitor, so a consumer that
-does not ask for it is unaffected — in values, in cost and in types:
+On the push decoders the same channel is opt-in per visitor:
 
 ```ts
 import { decode, IStream, type LongVisitor } from "@sofa-buffers/corelib";
@@ -375,11 +346,10 @@ decode(bytes, v);                               // and new IStream().feed(chunk,
 ```
 
 The flag is read **once, from the root visitor**, and governs the whole decode: a
-nested scope is driven on the root's channel whatever its own flag says, so a
-message tree is uniformly one or the other. It is not per *field* either — this
-push surface is driven by wire type alone and never learns the schema (the same
-limit that makes a receiver cap apply to every field), so it covers every
-unsigned / signed field and element in the message. Narrowing back is exact:
+nested scope is driven on the root's channel whatever its own flag says. It is
+not per *field* either — this push surface is driven by wire type alone and never
+learns the schema — so it covers every unsigned / signed field and element in the
+message. Narrowing back is exact:
 `value.low` for `u8`..`u32`, and `value.low | 0` for `i8`..`i32`.
 
 ### Code generator
@@ -388,9 +358,8 @@ unsigned / signed field and element in the message. Narrowing back is exact:
 (chaining `OStream` writes) and **two** decoders: a `static decode` driven by a
 monomorphic pull `Cursor` — one `switch` over `c.id` — for a message already in
 one buffer, and a `static decoder()` bound to `IStream` for one arriving in
-chunks. The pair is the point: the same generated type is driven whole-buffer or
-incrementally, and only the drive changes. A hand-written stand-in of both
-halves, encoded and decoded each way:
+chunks — the same generated type driven whole-buffer or incrementally. A
+hand-written stand-in of both halves, encoded and decoded each way:
 
 ```ts
 import {
@@ -500,32 +469,29 @@ Who owns the bytes:
 
 - **Encode (`OStream`).** Every buffer the encoder writes into is
   **caller-supplied**: the library allocates none of its own and never grows or
-  reallocates one it was handed (CORELIB_PLAN §5.1) — `new OStream(buf, offset?,
-  flush?)` writes into `buf` and into nothing else. When it fills it drains a
+  reallocates one it was handed — `new OStream(buf, offset?, flush?)` writes into
+  `buf` and into nothing else. When it fills it drains a
   view to the `flush` sink (valid only during that callback) and continues; with
   no sink it throws `BUFFER_FULL`. `bytes()` returns a **view** of what is in the
   buffer — with a sink, only the not-yet-flushed tail — so `.slice()` it if it
   must outlive the next write.
-- **The `offset` belongs to the installation, not to the buffer** (§5.1). It
-  reserves room at the front of the unit the buffer-set begins — the constructor
-  or `setBuffer` — and handing that unit to the sink **consumes** it: a sink that
+- **The `offset` belongs to the installation, not to the buffer.** It reserves
+  room at the front of the unit the buffer-set begins — the constructor or
+  `setBuffer` — and handing that unit to the sink **consumes** it: a sink that
   returns without installing a buffer has *copied*, so the encoder keeps writing
   into the same buffer and resumes at `0`, with the whole buffer usable from
   there. A sink that wants header room in **every** flushed unit — one framing
   header per packet — re-arms it by calling `setBuffer(buf, offset)` from inside
-  the callback; passing the buffer it already has counts, a buffer-set is a new
-  installation like any other. A sink that *takes* the buffer (hands it to a
-  transport, queues it, gives it to DMA) must install a replacement before
-  returning, for the same reason: returning bare says "reuse the storage".
-  Either way the bytes are the same — only the unit sizes differ. `reset()` and
-  `bytes()` follow the current installation, so after a flush they are relative
-  to `0`; on a sink-less stream, which can never flush, the reservation stands
-  for the life of the encode.
+  the callback; passing the buffer it already has counts. A sink that *takes* the
+  buffer (hands it to a transport, queues it, gives it to DMA) must install a
+  replacement before returning. Either way the bytes are the same — only the unit
+  sizes differ. `reset()` and `bytes()` follow the current installation, so after
+  a flush they are relative to `0`; on a sink-less stream, which can never flush,
+  the reservation stands for the life of the encode.
 - **Encode into memory (`growingOStream()`, `BufferOwner`).** The allocating
-  half is the caller's role (§5.1: "the generated-object layer allocates; the
-  corelib does not"), and a caller that owns its storage names a `BufferOwner`:
-  when the buffer fills, the encoder asks it for the next one — at least
-  `used + needed` bytes, holding the first `used` of the old — instead of
+  half is the caller's role, and a caller that owns its storage names a
+  `BufferOwner`: when the buffer fills, the encoder asks it for the next one — at
+  least `used + needed` bytes, holding the first `used` of the old — instead of
   enlarging what it was handed. `growingOStream(initialCapacity?)` is that owner
   ready-made, a doubling accumulator: it never throws `BUFFER_FULL`, its
   `bytes()` is the **whole** message (a view — `.slice()` it if it must outlive
@@ -536,13 +502,11 @@ Who owns the bytes:
   alias for `growingOStream()` and will be removed.
 
   Its storage is **carved from a shared slab** while it is small enough (up to
-  4 KiB of an 8 KiB slab), the way Node's own `Buffer.allocUnsafe` pools: a
-  typed array over 64 bytes lands outside the JS heap on V8, at ~20x the
-  allocation cost, which for a short message was more than the encode itself. A
-  carve is handed out once and never recycled, so no two encoders ever share
-  bytes and no message can read another's; what it changes is *lifetime* — a
-  retained `bytes()` view keeps its slab alive, so `.slice()` (already the advice
-  for a view that outlives the next write) is also what releases it.
+  4 KiB of an 8 KiB slab). A carve is handed out once and never recycled, so no
+  two encoders ever share bytes and no message can read another's; what it
+  changes is *lifetime* — a retained `bytes()` view keeps its slab alive, so
+  `.slice()` (already the advice for a view that outlives the next write) is also
+  what releases it.
 - **`MIN_OUTPUT_BUFFER` = `1`.** The smallest buffer this port accepts *for
   streaming*, exported from the package so a caller can size from it. It is `1`
   because the encoder splits every atomic unit — field header, fixlen word,
@@ -553,9 +517,8 @@ Who owns the bytes:
   `buf.length - offset` must be at least `MIN_OUTPUT_BUFFER`, and a smaller
   window is rejected right there with `ARGUMENT` — never partway through a
   message — leaving the encoder on the buffer it already had. A buffer installed
-  **without** a sink has no minimum: no flush can occur, so nothing can be split.
-  That is the one-shot `MAX_SIZE` case and it stays exact — a two-byte message
-  encodes into a two-byte buffer.
+  **without** a sink has no minimum: no flush can occur, so nothing can be split,
+  and a two-byte message encodes into a two-byte buffer.
 - **Decode (`decode()` / `Cursor` / `IStream`).** Input payload bytes are
   zero-copy: string / blob chunks and `Cursor.readBlob` are `subarray` **views**
   aliasing the input (or, for `IStream`, the chunk you fed). A visitor chunk is
@@ -568,23 +531,20 @@ Who owns the bytes:
   `INVALID_MSG`. A visitor `string` chunk is *raw wire bytes* and is not
   validated — it may even end mid-code-point — so a visitor that materializes one
   itself owns that check. `decodeUtf8(bytes)` is that check, exported for exactly
-  this: it is what `Cursor.readString` uses, it rejects malformed bytes as
-  `INVALID_MSG` rather than as a platform `TypeError`, and it is faster than a
-  bare `TextDecoder` on the short payloads a message is mostly made of. Rolling
-  your own instead means `new TextDecoder("utf-8", { fatal: true })` — the
-  default `TextDecoder` silently substitutes `U+FFFD`, which the format forbids
-  in either direction; the encoder likewise refuses an unpaired surrogate with
-  `ARGUMENT` rather than replacing it.
+  this: it is what `Cursor.readString` uses, and it rejects malformed bytes as
+  `INVALID_MSG` rather than as a platform `TypeError`. Rolling your own instead
+  means `new TextDecoder("utf-8", { fatal: true })` — the default `TextDecoder`
+  silently substitutes `U+FFFD`, which the format forbids in either direction,
+  and `TextEncoder` does the same to an unpaired surrogate where this encoder
+  refuses it with `ARGUMENT`.
 - **Reassembly is the caller's, with a helper.** Nothing in the library holds a
-  payload across `feed` calls, so a consumer that wants a *value* rather than a
-  stream of chunks joins them itself. `PayloadAcc` does that join — one per
-  decoder, since only one payload is ever in flight — and allocates only for a
-  payload that actually straddled a chunk boundary; one arriving whole is handed
-  straight back, still a view into the chunk and still valid only for that call.
-  `StringSeq` / `BlobSeq` build on it to collect the elements of a `string` /
-  `blob` array, and `elementsEqual` is the array form of the omit-if-default test
-  an encoder applies before writing a field. These four are the support layer
-  generated code calls instead of carrying its own copy.
+  payload across `feed` calls. `PayloadAcc` joins the chunks — one accumulator
+  per decoder, since only one payload is ever in flight — and allocates only for
+  a payload that actually straddled a chunk boundary; one arriving whole is
+  handed straight back, still a view into the chunk and still valid only for that
+  call. `StringSeq` / `BlobSeq` build on it to collect the elements of a
+  `string` / `blob` array, and `elementsEqual` is the array form of the
+  omit-if-default test an encoder applies before writing a field.
 
 ### Decode limits
 
@@ -604,19 +564,14 @@ An over-limit array count or string / blob length is rejected at the field's
 header — **before** the array is sized or any payload is decoded or streamed to
 the visitor — by throwing `SofabError` with code
 `SofabErrorCode.LimitExceeded`. The decoder never clamps or truncates. Each limit
-is independent, and an omitted one means **no cap** (the default is today's
-unlimited behavior — the corelib invents no default). `LimitExceeded` is distinct
-from `INVALID_MSG`: exceeding a receiver-configured limit is policy, not a
-malformed message — so, unlike `INVALID_MSG`, it does not poison an `IStream`
-(see [Deserialize stream](#deserialize-stream)). Generated code supplies these
-values from the sofabgen config.
+is independent, and an omitted one means **no cap**. Unlike `INVALID_MSG`,
+`LimitExceeded` does not poison an `IStream` (see
+[Deserialize stream](#deserialize-stream)). Generated code supplies these values
+from the sofabgen config.
 
-A limit applies **only to a field the schema leaves unbounded** (§6.2.1). Where
-the schema declares a `count` / `maxlen`, that bound governs and an over-bound
-value is `INVALID_MSG`, never `LimitExceeded` — a schema bound states what is
-*valid*, a receiver limit only what this deployment has the *capacity* for, and
-two receivers with the same schema and different limits must not disagree about a
-bounded field. On the pull `Cursor` this is automatic: passing the schema bound
+A limit applies **only to a field the schema leaves unbounded**. Where the schema
+declares a `count` / `maxlen`, that bound governs and an over-bound value is
+`INVALID_MSG`, never `LimitExceeded`. On the pull `Cursor` this is automatic: passing the schema bound
 (`readString(maxlen)`, `readUnsignedArray(count)`, …) both enables the `INVALID`
 check and takes the field out of the cap's reach, so a bounded field decodes
 normally even when its size exceeds the configured cap. The push surfaces
@@ -625,10 +580,6 @@ there the caps apply to every field; a caller that needs the distinction on a
 bounded field decodes it through `Cursor`, or leaves the cap unset and enforces
 the schema bound itself from `fixlenBegin` / `arrayBegin`, which carry the
 declared size.
-
-## Feature flags
-
-None — the build always ships every wire type.
 
 ## Build & test
 
@@ -641,13 +592,13 @@ npm run build          # tsup -> ESM + CJS + IIFE + .d.ts in dist/
 npm run smoke          # cross-runtime smoke test of the built bundle
 ```
 
-Tests live in `test/` as focused suites, including `vectors.test.ts` (encode +
-decode every shared conformance vector), `istream.chunked.test.ts` (every vector
-fed one byte at a time), `cursor.test.ts`, `errors.test.ts`, `ostream.test.ts`,
-`roundtrip.test.ts` and more. CI type-checks, tests and builds on Node 20 / 22 /
-24 / 26, smoke-tests the bundle on Node, Deno and Bun, and publishes coverage
-badges;
-a separate `docs.yml` deploys the TypeDoc API reference to GitHub Pages.
+Tests live in `test/` as focused vitest suites, including `vectors.test.ts`
+(encode + decode every shared conformance vector) and `istream.chunked.test.ts`
+(every vector fed one byte at a time).
+
+CI type-checks, tests and builds on Node 20 / 22 / 24 / 26, smoke-tests the
+bundle on Node, Deno and Bun, and publishes coverage badges; a separate
+`docs.yml` deploys the TypeDoc API reference to GitHub Pages.
 
 ## Benchmarks
 
@@ -671,23 +622,20 @@ cross-port parity checks (`perf` = 170 bytes, `blob 1MB` = 1,000,005,
 `composite` = 956); `test/bench-datasets.test.ts` holds the datasets to them, and
 `test/bench-grammar.test.ts` holds the tools to the output grammar.
 
-Every encode row writes into a **caller-supplied buffer** (CORELIB_PLAN §5.1)
-rather than the accumulator, so the rows measure this encoder and not V8's
-allocator. The `blob 1MB` rows are the ones that exercise streaming end to end:
+Every encode row writes into a **caller-supplied buffer** rather than the
+accumulator. The `blob 1MB` rows are the ones that exercise streaming end to end:
 `one-shot` is a single contiguous write into a 1,000,005-byte buffer, `streaming`
 is the same bytes through a **4096-byte** buffer with a flush sink (~245
-flushes), and `decode: blob 1MB` is fed back in 4096-byte chunks. Read those two
-encode rows *against each other* — five bytes of that message are metadata and a
-million are payload, so their MB/s is this machine's memory bandwidth; their
-**difference** is what the divisible-run flush path costs, and it is legible only
-under `Ir/op`. BENCH_SPEC's optional `blob 1MB passthrough` row is absent: this
-port grants no pass-through permission, so every `string`/`blob` run is copied
-through the output buffer.
+flushes), and `decode: blob 1MB` is fed back in 4096-byte chunks. The
+**difference** between the two encode rows is what the divisible-run flush path
+costs, and it is legible only under `Ir/op`. BENCH_SPEC's optional
+`blob 1MB passthrough` row is absent: this port grants no pass-through
+permission, so every `string`/`blob` run is copied through the output buffer.
 
 Since JS engines expose no portable cycle counter, `perf` uses CPU time/op as the
 code-cost proxy; `bench:callgrind` counts instructions/op under Valgrind (two rep
 counts per workload, subtracted, on a `--predictable` V8) for a fully
-machine-independent figure. Running the same tools under Node (V8) and Bun
-(JavaScriptCore) gives directly comparable numbers. `tsx bench/bench.ts --smoke`
+machine-independent figure. The same tools under Node (V8) and Bun
+(JavaScriptCore) give directly comparable numbers. `tsx bench/bench.ts --smoke`
 runs every row exactly once — a liveness check for the rows, never a
 measurement.
