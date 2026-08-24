@@ -31,7 +31,7 @@ export type { BufferOwner, FlushSink } from "./encode/sink.js";
 // The one decode surface (CORELIB_PLAN §5.3.1): a visitor, driven by IStream.
 // There is no pull parser, iterator or cursor to export beside it.
 export { IStream, decode } from "./decode/istream.js";
-export type { Visitor } from "./decode/istream.js";
+export type { ArrayTarget, Visitor } from "./decode/istream.js";
 export type { DecodeLimits } from "./decode/limits.js";
 
 // The generated layer's support (ARCHITECTURE §8): schema-free helpers that a

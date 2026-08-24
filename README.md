@@ -367,6 +367,41 @@ decode(bytes, v);
 Narrowing back is exact:
 `value.low` for `u8`..`u32`, and `value.low | 0` for `i8`..`i32`.
 
+#### Taking a whole array at once
+
+A flat visitor pays its per-callback routing *per element*, and for an array that
+is most of the cost of decoding it. `arrayBulk` hands the destination over once
+instead — the decoder fills it directly and no element callback fires:
+
+```ts
+import { ArrayKind, decode, type ArrayTarget, type Visitor } from "@sofa-buffers/corelib";
+
+const out: number[] = [];
+// One target, reused: the decoder holds it only for the array it belongs to.
+const target: ArrayTarget = { out, min: 0, max: 0xffff_ffff };
+
+const v: Visitor = {
+  arrayBulk: (id, kind, count) =>
+    id === 3 && kind === ArrayKind.Unsigned ? target : null,
+  // Still needed: it is what runs for every array the offer declines.
+  arrayUnsigned(id, i, value) { /* … */ },
+};
+decode(bytes, v);
+```
+
+`min`/`max` are the element's **declared width**, and the decoder applies them as
+it fills: a value outside is `INVALID`, reported at the element that carries it,
+never truncated. They have to travel with the destination because this is the last
+point at which the consumer can state them — once the array is filled, an element
+that a truncation stopped from arriving can no longer be judged.
+
+Returning `null` — the default — decodes element by element exactly as before, so
+adopting this is additive and can be done per array. The offer is made only for an
+`Unsigned` or `Signed` array of at least 16 elements, and only accepted for a
+`max` at or below `2^32-1`: below that length the call costs more than the fill
+saves, and above that width the elements are not exactly representable in the
+destination. Everything else keeps the element callbacks.
+
 ### Code generator
 
 `sofabgen` compiles a schema to one class per message with a `serialize` (chaining

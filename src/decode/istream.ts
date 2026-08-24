@@ -58,6 +58,24 @@ import { DecoderState } from "./state.js";
  * storage it owns. {@link PayloadAcc} and {@link decodeUtf8} are the ready-made
  * way to do that.
  */
+/**
+ * A destination for a bulk array fill, handed over by {@link Visitor.arrayBulk}.
+ *
+ * It belongs to the **consumer**, not to the codec: the decoder writes into `out`
+ * and keeps the reference only for the array's lifetime (§6.6 — it allocates
+ * nothing here, and holds nothing of the caller's once {@link Visitor.arrayEnd}
+ * has fired). A visitor is free to keep one of these and re-point `out` per array,
+ * which is what generated code does, so a bulk decode allocates nothing at all.
+ */
+export interface ArrayTarget {
+  /** Where the elements go, written at `out[index]` for `index` in `0..count-1`. */
+  out: number[];
+  /** Inclusive lower bound on every element; below it is `INVALID` (§7.1). */
+  min: number;
+  /** Inclusive upper bound on every element; above it is `INVALID` (§7.1). */
+  max: number;
+}
+
 export interface Visitor {
   /**
    * A field **header**: its `id` and `wire` type, announced the moment the header
@@ -194,6 +212,44 @@ export interface Visitor {
   arrayFp32?(id: number, index: number, value: number, bits: number): void;
   /** One fp64 array element. `value` is exact — see {@link fp64}. */
   arrayFp64?(id: number, index: number, value: number): void;
+  /**
+   * Offer a **destination** for a whole integer array, instead of receiving it one
+   * element at a time.
+   *
+   * A flat visitor pays its per-callback routing *per element*, and for an array
+   * that is the whole cost of decoding it: measured against the withdrawn cursor
+   * path, a `u32` element cost 177 Ir to read in bulk and 1067 Ir through
+   * {@link arrayUnsigned}. This hands the destination over once instead —
+   * {@link arrayBegin} announces the array, this offers somewhere to put it, and
+   * the decoder writes the elements straight in with **no element callback at
+   * all**.
+   *
+   * Return `null` — the default — to decode element by element exactly as before.
+   * That is what makes this additive: a visitor written before this method existed
+   * behaves identically, and a visitor that implements it may still decline per
+   * array (a `u64` destination cannot take a plain `number`, an `fp32` array whose
+   * consumer wants the raw wire bits needs them per element).
+   *
+   * **The bounds are not decoration.** `min`/`max` are the element's *declared
+   * width* (MESSAGE_SPEC §7.1), and the decoder applies them as it fills: a value
+   * outside is `INVALID`, reported at the element that carries it, never
+   * truncated silently. They have to travel here because this is the last point
+   * where the consumer can state them — once the array has been filled, an element
+   * that a truncation stopped from arriving can no longer be judged (§5.2.3). This
+   * is the one place the codec judges a value against something the *consumer*
+   * supplied rather than against the format; it is paid for by the pass it removes.
+   *
+   * Offered only for an `Unsigned` or `Signed` array — the two whose elements are
+   * plain numbers — and only where `max` can bound them: a destination is
+   * meaningful exactly when every element fits a JS `number` exactly, which
+   * `max <= 2^32-1` guarantees. A wider array keeps the element callbacks.
+   *
+   * Called **once per array**, at the count word, after {@link arrayBegin}. The
+   * decoder holds the target for the array's lifetime — across chunk boundaries
+   * included, so a suspend anywhere inside the fill is invisible — and drops it at
+   * {@link arrayEnd}, which still fires.
+   */
+  arrayBulk?(id: number, kind: ArrayKind, count: number): ArrayTarget | null;
   /** End of an array. */
   arrayEnd?(id: number): void;
   /**

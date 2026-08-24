@@ -63,6 +63,19 @@ export const ArrayKind = {
 /** An array field's element kind: one of the {@link ArrayKind} values. */
 export type ArrayKind = (typeof ArrayKind)[keyof typeof ArrayKind];
 
+/**
+ * Fewest elements an array must announce before the decoder offers the visitor a
+ * bulk destination ({@link Visitor.arrayBulk}).
+ *
+ * The offer costs a call out to the visitor, which routes it by scope and id
+ * before it can answer — ~1300 Ir per array, measured. The fill it enables saves
+ * ~435-730 Ir per element, so the offer breaks even at about three. The threshold
+ * sits well above that: below it every short array in a message pays the call for
+ * nothing, above it the win grows with the array, and an asymmetry like that is
+ * an argument for being conservative rather than exact.
+ */
+export const BULK_MIN = 16;
+
 /** Largest permitted field id and fixlen length / array count: `INT32_MAX`. */
 export const ID_MAX = 0x7fff_ffff;
 /** Largest permitted fixlen byte length: `INT32_MAX`. */
