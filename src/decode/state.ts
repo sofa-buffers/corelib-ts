@@ -64,6 +64,14 @@ const enum S {
   ArrayCount,
   ArrayUElem,
   ArraySElem,
+  // The bulk twins of the two above: entered instead of them, once, at the count
+  // word, when the visitor handed over a destination. A separate STATE rather than
+  // a flag the element arms test, so the ordinary per-element path keeps exactly
+  // the instructions it had — a reference field to null out per array and a load
+  // to test per drain measured +0.24% on every decode, for machinery those arrays
+  // never use.
+  ArrayUBulk,
+  ArraySBulk,
   ArrayElemWord,
   ArrayFp,
 }
@@ -290,13 +298,109 @@ export class DecoderState {
    */
   private offerBulk(count: number): void {
     const t = this.cur.arrayBulk?.(this.id, this.arrKind, count);
-    if (t == null || t.max > 0xffff_ffff || t.min < -0x8000_0000) {
-      this.arrDst = null;
-      return;
-    }
+    if (t == null || t.max > 0xffff_ffff || t.min < -0x8000_0000) return;
     this.arrDst = t.out;
     this.arrMin = t.min;
     this.arrMax = t.max;
+    this.state = this.state === S.ArrayUElem ? S.ArrayUBulk : S.ArraySBulk;
+  }
+
+  /**
+   * Fill an `Unsigned` array straight into the destination the visitor handed over,
+   * with no element callback (see {@link Visitor.arrayBulk}).
+   *
+   * Returns the new input offset, or **-1** to suspend — an element straddling the
+   * chunk, which the caller answers by returning from `push` so the next chunk
+   * resumes here. Kept out of `push` deliberately: that method is one large switch
+   * and V8 keeps it cheap only up to a size, and #162 measured that inlining a
+   * drain into it taxed every other decode path by ~0.4% for code they never run.
+   *
+   * The width verdict is two comparisons. `vHi` covers everything the offered
+   * bound does not: a value with a high half is above 2^32-1, and offerBulk only
+   * accepts a destination whose `max` is at or below it.
+   */
+  private bulkDrainU(input: Uint8Array, i: number, n: number): number {
+    const dst = this.arrDst!;
+    const count = this.arrCount;
+    const safeEnd = n - VARINT_MAX_BYTES;
+    let idx = this.arrIndex;
+    // Never bulk-decode over a pending partial varint: it lives in the
+    // accumulator, and `varintFull` would start a fresh one and drop it.
+    if (this.vBytes === 0) {
+      while (idx < count && i <= safeEnd) {
+        i = this.varintFull(input, i);
+        const v = this.vLo >>> 0;
+        if (this.vHi !== 0 || v > this.arrMax) this.bulkReject(v);
+        dst[idx] = v;
+        this.arrIndex = ++idx;
+      }
+    }
+    if (idx === count) {
+      this.state = S.Header;
+      this.arrDst = null;
+      this.cur.arrayEnd?.(this.id);
+      return i;
+    }
+    if (i >= n) return i;
+    i = this.varintStep(input, i);
+    if (!this.vComplete) return -1;
+    const v = this.vLo >>> 0;
+    if (this.vHi !== 0 || v > this.arrMax) this.bulkReject(v);
+    dst[idx] = v;
+    this.endBulkElement();
+    return i;
+  }
+
+  /**
+   * The `Signed` twin of {@link bulkDrainU}, with zig-zag undone inline on the low
+   * half. A value that needs the high half is outside any width offerBulk accepts,
+   * so the sign extension it would carry can only be the rejected case.
+   */
+  private bulkDrainS(input: Uint8Array, i: number, n: number): number {
+    const dst = this.arrDst!;
+    const count = this.arrCount;
+    const safeEnd = n - VARINT_MAX_BYTES;
+    let idx = this.arrIndex;
+    if (this.vBytes === 0) {
+      while (idx < count && i <= safeEnd) {
+        i = this.varintFull(input, i);
+        const v = ((this.vLo >>> 1) ^ -(this.vLo & 1)) | 0;
+        if (this.vHi !== 0 || v < this.arrMin || v > this.arrMax) this.bulkReject(v);
+        dst[idx] = v;
+        this.arrIndex = ++idx;
+      }
+    }
+    if (idx === count) {
+      this.state = S.Header;
+      this.arrDst = null;
+      this.cur.arrayEnd?.(this.id);
+      return i;
+    }
+    if (i >= n) return i;
+    i = this.varintStep(input, i);
+    if (!this.vComplete) return -1;
+    const v = ((this.vLo >>> 1) ^ -(this.vLo & 1)) | 0;
+    if (this.vHi !== 0 || v < this.arrMin || v > this.arrMax) this.bulkReject(v);
+    dst[idx] = v;
+    this.endBulkElement();
+    return i;
+  }
+
+  /**
+   * {@link advanceArray} for a bulk fill: it drops the destination as well.
+   *
+   * The reference belongs to the caller, so holding it past the array would keep
+   * that storage alive for as long as the decoder lives (§6.6) — and a pooled
+   * machine outlives the decode. `advanceArray` itself stays untouched: it is the
+   * per-element path's, which never has one, and paying for a store there was
+   * exactly the cost this shape exists to avoid.
+   */
+  private endBulkElement(): void {
+    if (++this.arrIndex === this.arrCount) {
+      this.state = S.Header;
+      this.arrDst = null;
+      this.cur.arrayEnd?.(this.id);
+    }
   }
 
   /** The §7.1 width verdict for one bulk element, taken as it is written. */
@@ -535,12 +639,10 @@ export class DecoderState {
             this.state = this.arrKind === ArrayKind.Unsigned ? S.ArrayUElem : S.ArraySElem;
             this.cur.arrayBegin?.(this.id, this.arrKind, count);
             // The threshold is tested HERE, not inside offerBulk: below it there is
-            // nothing to ask and a short array should not pay a call to find that
-            // out. Most arrays in most messages are short, so this branch is the
-            // one that runs — a compare and a store, against the ~1300 Ir the
-            // offer itself costs. (Measured: hoisting it out of offerBulk took a
-            // short-array message from 781326 back to 777xxx Ir/op.)
-            this.arrDst = null;
+            // nothing to ask, and a short array should not pay a call to find that
+            // out. One integer compare — and on the branch it takes, nothing else
+            // at all: the state above already says "element by element", so a
+            // declining array leaves this arm having done no extra work.
             if (count >= BULK_MIN) this.offerBulk(count);
           }
           break;
@@ -566,34 +668,6 @@ export class DecoderState {
           // is the whole width test the offer's bound does not already cover — a
           // value with a high half is above 2^32-1, and offerBulk only accepts a
           // destination whose max is at or below it.
-          const dst = this.arrDst;
-          if (dst !== null) {
-            if (this.vBytes === 0) {
-              while (idx < count && i <= safeEnd) {
-                i = this.varintFull(input, i);
-                const v = this.vLo >>> 0;
-                if (this.vHi !== 0 || v > this.arrMax) this.bulkReject(v);
-                dst[idx] = v;
-                this.arrIndex = ++idx;
-              }
-            }
-            if (idx === count) {
-              this.state = S.Header;
-              this.arrDst = null;
-              cur.arrayEnd?.(id);
-              break;
-            }
-            if (i >= n) break;
-            i = this.varintStep(input, i);
-            if (!this.vComplete) return;
-            {
-              const v = this.vLo >>> 0;
-              if (this.vHi !== 0 || v > this.arrMax) this.bulkReject(v);
-              dst[idx] = v;
-            }
-            this.advanceArray();
-            break;
-          }
           if (this.vBytes === 0) {
             while (idx < count && i <= safeEnd) {
               i = this.varintFull(input, i);
@@ -624,34 +698,6 @@ export class DecoderState {
           // inline on the low half: a value that needs the high half is outside
           // any width offerBulk accepts, so the sign-extension it would carry can
           // only be the rejected case.
-          const sdst = this.arrDst;
-          if (sdst !== null) {
-            if (this.vBytes === 0) {
-              while (idx < count && i <= safeEnd) {
-                i = this.varintFull(input, i);
-                const v = ((this.vLo >>> 1) ^ -(this.vLo & 1)) | 0;
-                if (this.vHi !== 0 || v < this.arrMin || v > this.arrMax) this.bulkReject(v);
-                sdst[idx] = v;
-                this.arrIndex = ++idx;
-              }
-            }
-            if (idx === count) {
-              this.state = S.Header;
-              this.arrDst = null;
-              cur.arrayEnd?.(id);
-              break;
-            }
-            if (i >= n) break;
-            i = this.varintStep(input, i);
-            if (!this.vComplete) return;
-            {
-              const v = ((this.vLo >>> 1) ^ -(this.vLo & 1)) | 0;
-              if (this.vHi !== 0 || v < this.arrMin || v > this.arrMax) this.bulkReject(v);
-              sdst[idx] = v;
-            }
-            this.advanceArray();
-            break;
-          }
           // See the unsigned arm: never bulk-decode over a pending partial varint.
           if (this.vBytes === 0) {
             while (idx < count && i <= safeEnd) {
@@ -690,6 +736,20 @@ export class DecoderState {
             );
           }
           this.advanceArray();
+          break;
+        }
+
+        case S.ArrayUBulk: {
+          const r = this.bulkDrainU(input, i, n);
+          if (r < 0) return;
+          i = r;
+          break;
+        }
+
+        case S.ArraySBulk: {
+          const r = this.bulkDrainS(input, i, n);
+          if (r < 0) return;
+          i = r;
           break;
         }
 
@@ -951,11 +1011,6 @@ export class DecoderState {
   private advanceArray(): void {
     if (++this.arrIndex === this.arrCount) {
       this.state = S.Header;
-      // The bulk destination belongs to the array that just ended; holding it any
-      // longer would keep the caller's storage alive past the field (§6.6) and,
-      // worse, could let the NEXT array inherit a destination its own arrayBulk
-      // declined. Dropped on this exit as on the two inside the drains.
-      this.arrDst = null;
       this.cur.arrayEnd?.(this.id);
     }
   }
