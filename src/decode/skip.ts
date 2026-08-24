@@ -1,21 +1,22 @@
-import type { AnyVisitor } from "./istream.js";
+import type { Visitor } from "./istream.js";
 
 /**
- * The scope a consumer declined — what goes in the slot when
- * {@link Visitor.sequenceBegin} returns `null`.
+ * The scope a consumer declined — what the decoder dispatches to while it
+ * consumes a subtree {@link Visitor.sequenceBegin} answered `false` for.
  *
- * It declares no callback at all, so every dispatch short-circuits on it
- * through the optional call the decoders already use, and the arguments are
- * never evaluated: nothing inside a skipped subtree is decoded into existence.
- * Nesting needs no bookkeeping either — with no `sequenceBegin` of its own, a
- * scope opened inside a skipped one falls through to "keep the current visitor"
- * and stays skipped by construction.
+ * It declares no callback at all, so every dispatch short-circuits on it through
+ * the optional call the decoder already uses, and the arguments are never
+ * evaluated: nothing inside a declined subtree is decoded into existence, and no
+ * piece of a payload is reported.
  *
- * A sentinel rather than `null` in a nullable slot, and the difference is
- * measured. The nullable version put a null check on every dispatch of every
- * decode, skipped or not, and cost `decode: typical message` 5162 → 5366 Ir/op
- * (+4%). This costs a live decode nothing: the two places that do ask — the
- * receiver caps and the payload view — are exactly the two places where
- * skipping is supposed to save something.
+ * A sentinel rather than a `skipping` flag tested at each dispatch, and the
+ * difference is measured: the flag put a branch on every dispatch of every
+ * decode, declined or not, and cost `decode: typical message` about 4% Ir/op.
+ * This costs a live decode nothing — the two places that do ask
+ * (`this.cur !== SKIP`) are the receiver caps, which are exactly where declining
+ * is supposed to save something.
+ *
+ * Frozen and empty, so it adds one hidden class to the decoder's dispatch sites
+ * and no more.
  */
-export const SKIP: AnyVisitor = Object.freeze({});
+export const SKIP: Visitor = Object.freeze({});

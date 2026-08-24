@@ -1,14 +1,14 @@
 /**
- * The varint contract, pinned on the **shipped** surfaces.
+ * The varint contract, pinned on the **shipped** entry points.
  *
  * §4.1's rules — the length ladder, the 10-byte / 64-bit bound, truncation
  * versus overflow — used to be exercised against a general `encodeVarint` /
  * `decodeVarint` pair in `src/varint/leb128.ts` that no production path called:
- * a fourth reader whose only job was to be kept in lockstep with the three that
- * ship (corelib-ts#82, #88, #99/#100, #113, #131 each had to be applied to it as
- * well). The pair is gone; the rules are asserted here through the encoder and
- * the three decode surfaces that actually read bytes — the one place a
- * divergence would matter.
+ * a reader whose only job was to be kept in lockstep with the ones that ship
+ * (corelib-ts#82, #88, #99/#100, #113, #131 each had to be applied to it as well).
+ * The pair is gone; the rules are asserted here through the encoder and the one
+ * decoder that actually reads bytes, at both entry points and every chunking —
+ * the one place a divergence would matter.
  *
  * The reference LEB128 is written out locally, below: an oracle a test owns is
  * worth more than one that shares an implementation with the code under test.
@@ -16,15 +16,13 @@
 
 import { describe, expect, it } from "vitest";
 import {
-  Cursor,
   DecodeStatus,
   IStream,
   OStream,
   SofabError,
   SofabErrorCode,
   U64_MAX,
-  decode,
-} from "../src/index.js";
+  decode, growingOStream } from "../src/index.js";
 
 /** Reference LEB128 of a non-negative `bigint` — the test's own oracle. */
 function varint(value: bigint): number[] {
@@ -56,21 +54,29 @@ function codeOf(fn: () => unknown): SofabErrorCode {
 
 /** The value bytes of a one-field message: id 0, so the header is one byte. */
 function payload(write: (os: OStream) => void): number[] {
-  const os = new OStream();
+  const os = growingOStream();
   write(os);
   return Array.from(os.bytes()).slice(1);
 }
 
-/** Feed `buf` to a resumable IStream one byte at a time. */
+/**
+ * Feed `buf` to a resumable IStream one byte at a time, reporting the outcome the
+ * way the one-shot entry point does: a code for INVALID (thrown) or INCOMPLETE
+ * (the status the caller judges), "COMPLETE" otherwise.
+ */
 const chunked = (buf: Uint8Array): void => {
-  const is = new IStream();
-  for (const b of buf) is.feed(Uint8Array.of(b), {});
+  const is = new IStream({});
+  for (const b of buf) is.feed(Uint8Array.of(b));
+  if (is.status() === DecodeStatus.Incomplete) {
+    throw new SofabError(SofabErrorCode.Incomplete, "input ends inside a field");
+  }
 };
 
-/** Drive the pull decoder over `buf`, reading each field as an unsigned scalar. */
-const pull = (buf: Uint8Array): void => {
-  const c = new Cursor(buf);
-  while (c.readHeader()) c.readUnsigned();
+/** Decode `buf` in one shot, reading every unsigned scalar it carries. */
+const whole = (buf: Uint8Array): (number | bigint)[] => {
+  const seen: (number | bigint)[] = [];
+  decode(buf, { unsigned: (_id, v) => void seen.push(v) });
+  return seen;
 };
 
 const BOUNDARIES = [0n, 1n, 127n, 128n, 16383n, 16384n, 2097151n, 2097152n, U64_MAX];
@@ -82,15 +88,13 @@ describe("varint round-trip", () => {
     }
   });
 
-  it("reads every length boundary back, on both whole-buffer surfaces", () => {
+  it("reads every length boundary back", () => {
     for (const value of BOUNDARIES) {
-      const os = new OStream();
+      const os = growingOStream();
       os.writeUnsigned(0, value);
       const wire = os.bytes().slice();
 
-      const c = new Cursor(wire);
-      expect(c.readHeader()).toBe(true);
-      expect(BigInt(c.readUnsigned())).toBe(value);
+      expect(BigInt(whole(wire)[0]!)).toBe(value);
 
       let seen: bigint | undefined;
       decode(wire, { unsigned: (_id, v) => void (seen = BigInt(v)) });
@@ -103,7 +107,7 @@ describe("varint round-trip", () => {
     // bytes could complete it, so INCOMPLETE, not INVALID.
     const buf = Uint8Array.from([0x80, 0x80]);
     expect(codeOf(() => decode(buf, {}))).toBe(SofabErrorCode.Incomplete);
-    expect(codeOf(() => pull(buf))).toBe(SofabErrorCode.Incomplete);
+    expect(codeOf(() => chunked(buf))).toBe(SofabErrorCode.Incomplete);
   });
 });
 
@@ -118,9 +122,7 @@ describe("overlong (>64-bit) varint is INVALID (#53)", () => {
 
   it("accepts the 2^64-1 maximum (10th byte = 0x01) as the control", () => {
     const wire = field(...nine(), 0x01);
-    const c = new Cursor(wire);
-    expect(c.readHeader()).toBe(true);
-    expect(c.readUnsigned()).toBe(U64_MAX);
+    expect(BigInt(whole(wire)[0]!)).toBe(U64_MAX);
 
     let seen: bigint | undefined;
     decode(wire, { unsigned: (_id, v) => void (seen = BigInt(v)) });
@@ -133,10 +135,9 @@ describe("overlong (>64-bit) varint is INVALID (#53)", () => {
     // 10th byte 0x81: the low bit fits bit 63, but the continuation flag demands
     // an 11th byte, which is past the 10-byte maximum.
     ["a continuation into an 11th byte", [...nine(), 0x81, 0x00]],
-  ])("rejects %s on all three decode surfaces", (_what, value) => {
+  ])("rejects %s on both entry points", (_what, value) => {
     const wire = field(...value);
     expect(codeOf(() => decode(wire, {}))).toBe(SofabErrorCode.InvalidMsg);
-    expect(codeOf(() => pull(wire))).toBe(SofabErrorCode.InvalidMsg);
     expect(codeOf(() => chunked(wire))).toBe(SofabErrorCode.InvalidMsg);
   });
 });
@@ -146,9 +147,9 @@ describe("overlong (>64-bit) varint is INVALID (#53)", () => {
 // 10-byte / 64-bit maximum — so they are malformed on the bytes already in hand,
 // whatever (if anything) follows. §5.2 gives that INVALID precedence over the
 // INCOMPLETE of input that merely stops there, and the verdict must not depend on
-// where the input happens to end. All three decode surfaces in this repo — the
-// contiguous `decode()`, the pull `Cursor` and the resumable `IStream` — must
-// therefore return the same code for the same bytes.
+// where the input happens to end. Both entry points in this repo — the
+// one-shot `decode()` and the resumable `IStream` — must therefore return the
+// same code for the same bytes.
 describe("ten continuation bytes then end of input are INVALID (#113)", () => {
   /** `n` bytes that all set the continuation flag and carry no payload. */
   const cont = (n: number): number[] => Array<number>(n).fill(0x80);
@@ -156,20 +157,19 @@ describe("ten continuation bytes then end of input are INVALID (#113)", () => {
   /** id 0, wire 0 (unsigned): the value varint follows the header immediately. */
   const field = (n: number): Uint8Array => Uint8Array.from([0x00, ...cont(n)]);
 
-  it("the three decode surfaces agree on INVALID", () => {
+  it("both entry points agree on INVALID", () => {
     const ten = field(10);
     expect(codeOf(() => decode(ten, {}))).toBe(SofabErrorCode.InvalidMsg);
-    expect(codeOf(() => pull(ten))).toBe(SofabErrorCode.InvalidMsg);
     expect(codeOf(() => chunked(ten))).toBe(SofabErrorCode.InvalidMsg);
   });
 
-  it("the three decode surfaces agree on INCOMPLETE for nine (control)", () => {
+  it("both entry points agree on INCOMPLETE for nine (control)", () => {
     const nine = field(9);
     expect(codeOf(() => decode(nine, {}))).toBe(SofabErrorCode.Incomplete);
-    expect(codeOf(() => pull(nine))).toBe(SofabErrorCode.Incomplete);
-    const is = new IStream();
+    expect(codeOf(() => chunked(nine))).toBe(SofabErrorCode.Incomplete);
+    const is = new IStream({});
     let status: DecodeStatus = DecodeStatus.Complete;
-    for (const b of nine) status = is.feed(Uint8Array.of(b), {});
+    for (const b of nine) status = is.feed(Uint8Array.of(b));
     expect(status).toBe(DecodeStatus.Incomplete);
   });
 });
@@ -202,11 +202,11 @@ describe("zig-zag", () => {
 
   it("reads every signed boundary back through it", () => {
     for (const v of VALUES) {
-      const os = new OStream();
+      const os = growingOStream();
       os.writeSigned(0, v);
-      const c = new Cursor(os.bytes());
-      expect(c.readHeader()).toBe(true);
-      expect(BigInt(c.readSigned())).toBe(v);
+      let seen: bigint | undefined;
+      decode(os.bytes(), { signed: (_id, x) => void (seen = BigInt(x)) });
+      expect(seen).toBe(v);
     }
   });
 });

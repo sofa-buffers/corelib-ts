@@ -1,8 +1,8 @@
 /**
  * `decodeUtf8` — the strict UTF-8 materializer, now part of the public surface.
  *
- * It was internal to {@link Cursor} until corelib-ts#147, so the only coverage it
- * had was whatever the pull path happened to exercise. As an exported entry point
+ * It was internal to the decoder until corelib-ts#147, so the only coverage it had
+ * was whatever a decode happened to exercise. As an exported entry point
  * it is also what the *push* path uses — generated code reassembles a payload and
  * decodes it here rather than building a `TextDecoder` of its own — so both of
  * its edges need pinning directly:

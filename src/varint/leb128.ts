@@ -10,7 +10,7 @@
  * There is no varint *reader* in this module. Each decode surface reads varints
  * in the shape its own control flow needs — the resumable byte-at-a-time
  * accumulator in `decode/state.ts`, the unrolled whole-buffer ladder shared by
- * `Cursor` and `decode()` in `decode/reader.ts` — and a third, general reader
+ * the decoder's own varint paths in `decode/state.ts` — and a general reader
  * with no production caller was only ever a fourth copy of the same overflow and
  * truncation rules to keep in lockstep (it had to be fixed alongside them in
  * corelib-ts#82, #88, #99/#100, #113, #131). The rules are pinned on the shipped

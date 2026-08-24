@@ -11,15 +11,14 @@ import {
   decode,
   getKernel,
   jsKernel,
-  setKernel,
-} from "../src/index.js";
+  setKernel, growingOStream } from "../src/index.js";
 import { bytesToHex } from "./helpers/hex.js";
 
 /** The 8-byte header of a valid, empty WebAssembly module. */
 const EMPTY_WASM = Uint8Array.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
 
 function encodeArrays(): string {
-  const os = new OStream();
+  const os = growingOStream();
   os.writeUnsignedArray(1, [1n, 2n, 1n << 40n]);
   os.writeSignedArray(2, [-1, -2, -1000000]);
   os.writeFp32Array(3, [1.5, 2.5, 3.5]);
@@ -111,19 +110,19 @@ describe("kernel parity: the inlined bulk writer matches the shared helper", () 
   const numeric = [0, 1, 127, 128, 16383, 16384, 2 ** 31, Number.MAX_SAFE_INTEGER];
 
   it("agrees with a per-element encodeVarint for the whole corpus", () => {
-    const viaKernel = new OStream();
+    const viaKernel = growingOStream();
     viaKernel.writeUnsignedArray(1, corpus);
 
     // Reference: the same values, each written as its own unsigned scalar, so
     // the payload bytes come from OStream's non-bulk `encodeVarintLoHi` route.
-    const ref = new OStream();
+    const ref = growingOStream();
     for (const v of corpus) ref.writeUnsigned(1, v);
 
     // Strip the array header + count from one and the per-field headers from
     // the other by comparing only the varint payload runs.
     const kernelHex = bytesToHex(viaKernel.bytes());
     let refPayload = "";
-    const refOne = new OStream();
+    const refOne = growingOStream();
     for (const v of corpus) {
       refOne.reset();
       refOne.writeUnsigned(0, v);
@@ -134,11 +133,11 @@ describe("kernel parity: the inlined bulk writer matches the shared helper", () 
   });
 
   it("agrees for number-typed elements too", () => {
-    const viaKernel = new OStream();
+    const viaKernel = growingOStream();
     viaKernel.writeUnsignedArray(1, numeric);
 
     let refPayload = "";
-    const refOne = new OStream();
+    const refOne = growingOStream();
     for (const v of numeric) {
       refOne.reset();
       refOne.writeUnsigned(0, v);
@@ -148,7 +147,7 @@ describe("kernel parity: the inlined bulk writer matches the shared helper", () 
   });
 
   it("round-trips the whole corpus through the decoder", () => {
-    const os = new OStream();
+    const os = growingOStream();
     os.writeUnsignedArray(7, corpus);
     const seen: bigint[] = [];
     decode(os.bytes(), {

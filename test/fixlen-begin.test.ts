@@ -5,7 +5,7 @@
  * not by the payload. Without this hook a visitor first learns `total` when
  * payload bytes arrive, so a message that ends right after an over-bound length
  * word escapes the check and degrades to INCOMPLETE — while the same bytes
- * through `Cursor.readString` are INVALID. §5.2 gives INVALID precedence over
+ * materialized through `decodeUtf8` are INVALID. §5.2 gives INVALID precedence over
  * INCOMPLETE for input already known to be malformed, so the two paths have to
  * agree.
  *
@@ -15,7 +15,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { FixlenSubtype, IStream, OStream, type Visitor } from "../src/index.js";
+import { FixlenSubtype, IStream, OStream, type Visitor, growingOStream } from "../src/index.js";
 
 type Ev =
   | { k: "begin"; id: number; sub: FixlenSubtype; total: number }
@@ -35,17 +35,17 @@ class Rec implements Visitor {
 }
 
 function encode(build: (os: OStream) => void): Uint8Array {
-  const os = new OStream();
+  const os = growingOStream();
   build(os);
   return os.bytes().slice();
 }
 
 function feed(bytes: Uint8Array, chunkSize: number): Ev[] {
   const rec = new Rec();
-  const is = new IStream();
-  if (chunkSize <= 0) is.feed(bytes, rec);
+  const is = new IStream(rec);
+  if (chunkSize <= 0) is.feed(bytes);
   else for (let i = 0; i < bytes.length; i += chunkSize) {
-    is.feed(bytes.subarray(i, i + chunkSize), rec);
+    is.feed(bytes.subarray(i, i + chunkSize));
   }
   return rec.ev;
 }

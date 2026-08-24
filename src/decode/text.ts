@@ -32,13 +32,16 @@
  * validation it always got — the fast path can never accept bytes the platform
  * would refuse.
  *
- * {@link decodeUtf8} is **public** because both decode surfaces need it and only
- * one of them is inside this library: {@link Cursor} calls it on the pull path,
- * while the push path hands out raw, unvalidated chunks (§6.4) and leaves
- * materialization — and therefore the UTF-8 check — to whoever reassembles them.
- * Generated code lives on that side, so without an exported entry point every
- * generated package builds a plain fatal `TextDecoder` of its own and pays the
- * full 2006 Ir/op per short string instead of 858.
+ * {@link decodeUtf8} is **public** because the code that needs it is not in this
+ * library. The decoder reports raw, unvalidated payload pieces (§6.4.5 puts the
+ * UTF-8 check where a string is *materialized*, and a piece may end mid-code-point),
+ * so materialization — and therefore the check — belongs to whoever wants the
+ * value. Generated code is that whoever, and without an exported entry point every
+ * generated package builds a plain fatal `TextDecoder` of its own and pays the full
+ * 2006 Ir/op per short string instead of 858.
+ *
+ * It is **static helper layer**, not codec (§6.6.1): it allocates the string it
+ * returns, and no codec path calls it.
  */
 
 import { invalidMsgError } from "../errors.js";

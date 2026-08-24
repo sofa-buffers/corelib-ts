@@ -75,7 +75,7 @@ function main(): void {
   });
   const dec = run(size, () => {
     const c = new Checksum();
-    new IStream().feed(wire, c);
+    new IStream(c).feed(wire);
     sink(c.acc);
   });
 

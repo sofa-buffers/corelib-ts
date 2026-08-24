@@ -104,6 +104,24 @@ export const VARINT_MAX_BYTES = 10;
 export const MIN_OUTPUT_BUFFER = 1;
 
 /**
+ * This port's default cap on the element count of a **schema-unbounded** array
+ * (CORELIB_PLAN §6.2.1).
+ *
+ * §6.2.1 requires every receiver to carry finite caps — "unbounded by the schema
+ * is still bounded by the receiver", with no unset state and no unlimited mode —
+ * while leaving the *values* to generated code, which knows the schema and the
+ * target. This is what a decoder built without any gets instead: bounded, not
+ * open. Override it per decoder with {@link DecodeLimits}.
+ */
+export const DEFAULT_MAX_DYN_ARRAY_COUNT = 1_048_576; // 2^20 elements
+
+/** This port's default cap on a schema-unbounded `string` payload, in bytes (§6.2.1). */
+export const DEFAULT_MAX_DYN_STRING_LEN = 16_777_216; // 16 MiB
+
+/** This port's default cap on a schema-unbounded `blob` payload, in bytes (§6.2.1). */
+export const DEFAULT_MAX_DYN_BLOB_LEN = 67_108_864; // 64 MiB
+
+/**
  * Maximum nested-sequence depth (§4.9 / §6.2). An encoder must not open more
  * than this many nested sequences, and a decoder must reject a message that
  * nests deeper with an `InvalidMessage` error rather than risk unbounded
@@ -129,10 +147,10 @@ export const MAX_DEPTH = 255;
  * {@link IStream.status} re-reads that same value at any point. An `Invalid`
  * message throws from `feed` *and* latches there, so `status()` reports
  * `Invalid` from then on and every further `feed` re-throws without consuming
- * input. The one-shot {@link decode} /
- * {@link Cursor} path signals `Incomplete` and `Invalid` by throwing a
- * {@link SofabError} whose `code` is {@link SofabErrorCode.Incomplete} or
- * {@link SofabErrorCode.InvalidMsg}, and `Complete` by returning normally.
+ * input. The one-shot {@link decode} — the same stream, fed once — signals
+ * `Incomplete` and `Invalid` by throwing a {@link SofabError} whose `code` is
+ * {@link SofabErrorCode.Incomplete} or {@link SofabErrorCode.InvalidMsg}, and
+ * `Complete` by returning normally.
  */
 export const DecodeStatus = {
   /** The bytes ended exactly at a field boundary — a valid message. */

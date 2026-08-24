@@ -3,12 +3,11 @@
  * whole-buffer ones: a chunk boundary must never change the verdict
  * (CORELIB_PLAN §5.2 / §6.4).
  *
- * The push state machine (`src/decode/state.ts`) is a separate implementation
- * from the two contiguous readers (`fast.ts` / `cursor.ts`) — it suspends
- * mid-varint and mid-word, and it carries a whole-varint fast path that only
- * runs when ten bytes are already in hand. So each rejection has to be asserted
- * on *this* path too, and at several chunkings, not just on the one-shot
- * surfaces the vector suite drives:
+ * There is one decoder (`src/decode/state.ts`), but two ways through it: the fast
+ * lane, which runs while a whole field is known to be in the chunk, and the
+ * resumable ladder, which suspends mid-varint and mid-word. So each rejection is
+ * asserted at several chunkings, not just on the one-shot path the vector suite
+ * drives:
  *
  *  - an `array<fixlen>` element word that is neither `fp32`/4 nor `fp64`/8
  *    (§4.8) — including the empty-array case, where the word is the only thing
@@ -23,19 +22,31 @@
 
 import { describe, expect, it } from "vitest";
 import {
-  Cursor,
   DecodeStatus,
   IStream,
   OStream,
   SofabError,
   SofabErrorCode,
   decode,
-  type Visitor,
-} from "../src/index.js";
+  type Visitor, growingOStream } from "../src/index.js";
 
 function bytes(...n: number[]): Uint8Array {
   return Uint8Array.from(n);
 }
+
+/**
+ * Receiver caps raised to the format ceilings.
+ *
+ * §6.2.1 makes the caps mandatory and finite, so a `FIXLEN_MAX`-sized length word
+ * is a *capacity* rejection under the port's defaults. These tests are about the
+ * FORMAT ceiling and about truncation, so they run with the caps opened to the
+ * largest the wire can express — where the only thing left to reject is the bytes.
+ */
+const WIDE_OPEN = {
+  maxArrayCount: 0x7fff_ffff,
+  maxStringLen: 0x7fff_ffff,
+  maxBlobLen: 0x7fff_ffff,
+};
 
 /** Run `fn` and return the `SofabError` code it throws, or `"COMPLETE"`. */
 function codeOf(fn: () => void): string {
@@ -50,24 +61,16 @@ function codeOf(fn: () => void): string {
 
 /** Feed `msg` to a fresh `IStream` in `size`-byte chunks; report the outcome. */
 function feedInChunks(msg: Uint8Array, size: number, visitor: Visitor = {}): string {
-  const is = new IStream();
+  const is = new IStream(visitor, WIDE_OPEN);
   try {
     for (let i = 0; i < msg.length; i += size) {
-      is.feed(msg.subarray(i, Math.min(i + size, msg.length)), visitor);
+      is.feed(msg.subarray(i, Math.min(i + size, msg.length)));
     }
   } catch (e) {
     if (e instanceof SofabError) return e.code;
     throw e;
   }
   return is.status();
-}
-
-/** Drive `msg` through the pull cursor, reading whatever each header announces. */
-function pull(msg: Uint8Array): string {
-  const c = new Cursor(msg);
-  return codeOf(() => {
-    while (c.readHeader()) c.skip(c.wire);
-  });
 }
 
 describe("array<fixlen> element word must be fp32/4 or fp64/8 (§4.8)", () => {
@@ -91,8 +94,7 @@ describe("array<fixlen> element word must be fp32/4 or fp64/8 (§4.8)", () => {
 
   it.each(cases)("%s is INVALID on the whole-buffer paths too", (_name, count, word) => {
     const msg = bytes(0x0d, count, word, 0, 0, 0, 0, 0, 0, 0, 0);
-    expect(codeOf(() => decode(msg, {}))).toBe(SofabErrorCode.InvalidMsg);
-    expect(pull(msg)).toBe(SofabErrorCode.InvalidMsg);
+    expect(codeOf(() => decode(msg, {}, WIDE_OPEN))).toBe(SofabErrorCode.InvalidMsg);
   });
 
   it("accepts the two legal element words as the control", () => {
@@ -103,12 +105,12 @@ describe("array<fixlen> element word must be fp32/4 or fp64/8 (§4.8)", () => {
   });
 
   it("latches the verdict: a caught rejection cannot be decoded past", () => {
-    const is = new IStream();
+    const is = new IStream({});
     const msg = bytes(0x0d, 0x02, (4 << 3) | 2);
-    expect(() => is.feed(msg, {})).toThrow(SofabError);
+    expect(() => is.feed(msg)).toThrow(SofabError);
     expect(is.status()).toBe(DecodeStatus.Invalid);
     // A well-formed continuation must not resurrect the stream (§5.2: terminal).
-    expect(() => is.feed(bytes(0x08, 0x01), {})).toThrow(SofabError);
+    expect(() => is.feed(bytes(0x08, 0x01))).toThrow(SofabError);
     expect(is.status()).toBe(DecodeStatus.Invalid);
   });
 });
@@ -134,8 +136,7 @@ describe("a fixlen length word above FIXLEN_MAX is INVALID, not INCOMPLETE (§4.
     ["blob", 3],
   ])("%s: the over-range word is INVALID on every surface", (_name, sub) => {
     const msg = fixlenHeader(TOO_BIG, sub);
-    expect(codeOf(() => decode(msg, {}))).toBe(SofabErrorCode.InvalidMsg);
-    expect(pull(msg)).toBe(SofabErrorCode.InvalidMsg);
+    expect(codeOf(() => decode(msg, {}, WIDE_OPEN))).toBe(SofabErrorCode.InvalidMsg);
     expect(feedInChunks(msg, msg.length)).toBe(SofabErrorCode.InvalidMsg);
     expect(feedInChunks(msg, 1)).toBe(SofabErrorCode.InvalidMsg);
   });
@@ -147,7 +148,7 @@ describe("a fixlen length word above FIXLEN_MAX is INVALID, not INCOMPLETE (§4.
     // The control that makes the case above mean something: the same shape one
     // count lower is a representable field whose payload merely has not arrived.
     const msg = fixlenHeader(AT_MAX, sub);
-    expect(codeOf(() => decode(msg, {}))).toBe(SofabErrorCode.Incomplete);
+    expect(codeOf(() => decode(msg, {}, WIDE_OPEN))).toBe(SofabErrorCode.Incomplete);
     expect(feedInChunks(msg, 1)).toBe(DecodeStatus.Incomplete);
   });
 });
@@ -163,8 +164,7 @@ describe("a varint past the 64-bit bound is INVALID wherever the chunks fall (§
     for (let size = 1; size <= msg.length; size++) {
       expect(feedInChunks(msg, size)).toBe(SofabErrorCode.InvalidMsg);
     }
-    expect(codeOf(() => decode(msg, {}))).toBe(SofabErrorCode.InvalidMsg);
-    expect(pull(msg)).toBe(SofabErrorCode.InvalidMsg);
+    expect(codeOf(() => decode(msg, {}, WIDE_OPEN))).toBe(SofabErrorCode.InvalidMsg);
   });
 
   it("same verdict at every single split point of the 11-byte varint", () => {
@@ -172,10 +172,10 @@ describe("a varint past the 64-bit bound is INVALID wherever the chunks fall (§
     // ten-bytes-in-hand fast path only for a chunk that already holds them, so
     // the first cut decides which implementation sees the overflow.
     for (let cut = 0; cut <= ELEVEN.length; cut++) {
-      const is = new IStream();
+      const is = new IStream({});
       const code = codeOf(() => {
-        is.feed(ELEVEN.subarray(0, cut), {});
-        is.feed(ELEVEN.subarray(cut), {});
+        is.feed(ELEVEN.subarray(0, cut));
+        is.feed(ELEVEN.subarray(cut));
       });
       expect(code, `cut at ${cut}`).toBe(SofabErrorCode.InvalidMsg);
       expect(is.status()).toBe(DecodeStatus.Invalid);
@@ -183,7 +183,7 @@ describe("a varint past the 64-bit bound is INVALID wherever the chunks fall (§
   });
 
   it("accepts 2^64-1 — the largest legal varint — at every chunk size", () => {
-    const os = new OStream();
+    const os = growingOStream();
     os.writeUnsigned(1, 0xffff_ffff_ffff_ffffn);
     const msg = os.bytes().slice();
     for (let size = 1; size <= msg.length; size++) {
@@ -208,7 +208,7 @@ describe("a sequence still open at the end of the input is INCOMPLETE (§4.9/§7
   ];
 
   it.each(cases)("%s", (_name, msg) => {
-    expect(codeOf(() => decode(msg, {}))).toBe(SofabErrorCode.Incomplete);
+    expect(codeOf(() => decode(msg, {}, WIDE_OPEN))).toBe(SofabErrorCode.Incomplete);
     expect(feedInChunks(msg, msg.length)).toBe(DecodeStatus.Incomplete);
     expect(feedInChunks(msg, 1)).toBe(DecodeStatus.Incomplete);
   });
@@ -237,7 +237,7 @@ describe("the streaming decoder reads every varint length like the whole-buffer 
     0xffff_ffff_ffff_ffffn,
   ];
 
-  const os = new OStream();
+  const os = growingOStream();
   values.forEach((v, i) => os.writeUnsigned(i + 1, v));
   os.writeBlob(99, new Uint8Array(12));
   const msg = os.bytes().slice();
@@ -252,14 +252,14 @@ describe("the streaming decoder reads every varint length like the whole-buffer 
   const expected = values.map((v, i) => `${i + 1}=${v}`);
 
   it("in one chunk", () => {
-    expect(fields((v) => void new IStream().feed(msg, v))).toStrictEqual(expected);
+    expect(fields((v) => void new IStream(v).feed(msg))).toStrictEqual(expected);
   });
 
   it("one byte at a time", () => {
     expect(
       fields((v) => {
-        const is = new IStream();
-        for (const b of msg) is.feed(Uint8Array.of(b), v);
+        const is = new IStream(v);
+        for (const b of msg) is.feed(Uint8Array.of(b));
       }),
     ).toStrictEqual(expected);
   });

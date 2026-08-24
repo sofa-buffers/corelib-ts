@@ -102,27 +102,3 @@ export function fp64FromBits(lo: number, hi: number): number {
   SCRATCH.setUint32(4, hi, true);
   return SCRATCH.getFloat64(0, true);
 }
-
-// The raw fp32 channel gets its own 4-byte scratch and its own persistent view,
-// deliberately *not* the one pack/unpack use. The whole point of the channel is
-// decode-then-re-encode, so the view is live while the consumer calls back into
-// the encoder — and sharing a buffer with `packFp32` would let that re-encode
-// overwrite the very bytes it is reading. The view is allocated once, so
-// handing it out costs no allocation per element.
-const RAW_FP32_BUF = new ArrayBuffer(4);
-const RAW_FP32_DV = new DataView(RAW_FP32_BUF);
-const RAW_FP32_VIEW = new Uint8Array(RAW_FP32_BUF);
-
-/**
- * The 4 wire bytes of an fp32 packed word, as a `Uint8Array` view — the raw
- * channel that lets a bit-exact consumer keep a signaling NaN (§4.6/§6.5).
- *
- * The view aliases a shared scratch and, exactly like the string / blob `chunk`
- * views the decoder hands out, is valid only until the next delivered fp32; a
- * consumer that retains it must copy.
- */
-export function rawFp32Bytes(bits: number): Uint8Array {
-  RAW_FP32_DV.setUint32(0, bits, true);
-  return RAW_FP32_VIEW;
-}
-

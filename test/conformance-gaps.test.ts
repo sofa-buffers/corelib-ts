@@ -13,15 +13,13 @@
 import { describe, expect, it } from "vitest";
 import {
   ArrayKind,
-  Cursor,
   IStream,
   MAX_DEPTH,
   OStream,
   SofabError,
   SofabErrorCode,
   decode,
-  type Visitor,
-} from "../src/index.js";
+  type Visitor, growingOStream } from "../src/index.js";
 import { bytesToHex } from "./helpers/hex.js";
 import { RecordingVisitor, TranscodeVisitor } from "./helpers/recording-visitor.js";
 
@@ -38,32 +36,32 @@ function codeOf(fn: () => void): string {
 
 /** Decode `bytes` one byte at a time through the resumable state machine. */
 function decodeChunked(bytes: Uint8Array, visitor: Visitor): void {
-  const is = new IStream();
-  for (let i = 0; i < bytes.length; i++) is.feed(bytes.subarray(i, i + 1), visitor);
-  is.end();
+  const is = new IStream(visitor);
+  for (let i = 0; i < bytes.length; i++) is.feed(bytes.subarray(i, i + 1));
+  is.status();
 }
 
 describe("zero-count arrays encode to the canonical empty form", () => {
   it("unsigned array (id 0) -> 03 00", () => {
-    const os = new OStream();
+    const os = growingOStream();
     os.writeUnsignedArray(0, []);
     expect(bytesToHex(os.bytes())).toBe("0300");
   });
 
   it("signed array (id 0) -> 04 00", () => {
-    const os = new OStream();
+    const os = growingOStream();
     os.writeSignedArray(0, []);
     expect(bytesToHex(os.bytes())).toBe("0400");
   });
 
   it("fp32 array (id 0) -> 05 00 20 (fixlen_word, no payload)", () => {
-    const os = new OStream();
+    const os = growingOStream();
     os.writeFp32Array(0, []);
     expect(bytesToHex(os.bytes())).toBe("050020");
   });
 
   it("fp64 array (id 0) -> 05 00 41 (fixlen_word, no payload)", () => {
-    const os = new OStream();
+    const os = growingOStream();
     os.writeFp64Array(0, []);
     expect(bytesToHex(os.bytes())).toBe("050041");
   });
@@ -81,7 +79,7 @@ describe("zero-count arrays round-trip to an empty array", () => {
 
   for (const [name, write, kind] of cases) {
     it(`${name}: fast decode delivers begin(count 0)+end with no elements`, () => {
-      const os = new OStream();
+      const os = growingOStream();
       write(os);
       const seen = new RecordingVisitor();
       decode(os.bytes(), seen);
@@ -89,7 +87,7 @@ describe("zero-count arrays round-trip to an empty array", () => {
     });
 
     it(`${name}: streaming decode (one byte at a time) matches`, () => {
-      const os = new OStream();
+      const os = growingOStream();
       write(os);
       const bytes = os.bytes().slice();
       const seen = new RecordingVisitor();
@@ -121,7 +119,7 @@ describe("MAX_DEPTH (255) is enforced", () => {
   });
 
   it("encoder allows exactly 255 nested sequences but refuses a 256th", () => {
-    const os = new OStream();
+    const os = growingOStream();
     for (let i = 0; i < MAX_DEPTH; i++) os.writeSequenceBeginLazy(0);
     expect(codeOf(() => os.writeSequenceBeginLazy(0))).toBe(SofabErrorCode.Argument);
   });
@@ -181,38 +179,30 @@ function seqWithEndId(end: number[]): Uint8Array {
   return Uint8Array.from([...header(14n, SEQ_START), ...end]);
 }
 
-/** Decode `buf` on all three surfaces; returns each surface's error code. */
+/**
+ * Decode `buf` through both entry points — one-shot and chunked — and, for each,
+ * both with a visitor that declines the sequence (so it is consumed by the
+ * decoder's own skip path) and with one that descends into it. There is one decode
+ * *surface* (§5.3.1), but a declined subtree and a read one are still two paths
+ * through it, and the guard under test has to hold on both.
+ */
 function codesOnEverySurface(buf: Uint8Array): Record<string, string> {
+  const declines: Visitor = { sequenceBegin: () => false };
   return {
-    fast: codeOf(() => decode(buf, {})),
+    oneShot: codeOf(() => decode(buf, {})),
     streaming: codeOf(() => decodeChunked(buf, {})),
-    cursor: codeOf(() => {
-      const c = new Cursor(buf);
-      while (c.readHeader()) c.skip(c.wire);
-    }),
-    // The Cursor *skip* path (skipSequence) is a separate guard from readHeader:
-    // enter the sequence via readHeader, then skip its body wholesale.
-    cursorSkip: codeOf(() => {
-      const c = new Cursor(buf);
-      c.readHeader();
-      c.skip(SEQ_START);
-    }),
+    oneShotDeclined: codeOf(() => decode(buf, declines)),
+    streamingDeclined: codeOf(() => decodeChunked(buf, declines)),
   };
 }
 
-/** Decode `buf` on all three surfaces, asserting none of them throws. */
+/** The same four paths, asserting none of them throws. */
 function acceptedOnEverySurface(buf: Uint8Array): void {
+  const declines: Visitor = { sequenceBegin: () => false };
   expect(() => decode(buf, {})).not.toThrow();
   expect(() => decodeChunked(buf, {})).not.toThrow();
-  expect(() => {
-    const c = new Cursor(buf);
-    while (c.readHeader()) c.skip(c.wire);
-  }).not.toThrow();
-  expect(() => {
-    const c = new Cursor(buf);
-    c.readHeader();
-    c.skip(SEQ_START);
-  }).not.toThrow();
+  expect(() => decode(buf, declines)).not.toThrow();
+  expect(() => decodeChunked(buf, declines)).not.toThrow();
 }
 
 describe("a sequence-end header's id is bounded by ID_MAX (§4.9/§6.2)", () => {
@@ -225,10 +215,10 @@ describe("a sequence-end header's id is bounded by ID_MAX (§4.9/§6.2)", () => 
 
     const codes = codesOnEverySurface(buf);
     expect(codes).toEqual({
-      fast: SofabErrorCode.InvalidMsg,
+      oneShot: SofabErrorCode.InvalidMsg,
       streaming: SofabErrorCode.InvalidMsg,
-      cursor: SofabErrorCode.InvalidMsg,
-      cursorSkip: SofabErrorCode.InvalidMsg,
+      oneShotDeclined: SofabErrorCode.InvalidMsg,
+      streamingDeclined: SofabErrorCode.InvalidMsg,
     });
   });
 
@@ -236,9 +226,9 @@ describe("a sequence-end header's id is bounded by ID_MAX (§4.9/§6.2)", () => 
     // INVALID on the id alone — it must not depend on the unbalanced-end check.
     const buf = Uint8Array.from(header(ID_MAX + 1n, SEQ_END));
     const codes = codesOnEverySurface(buf);
-    expect(codes.fast).toBe(SofabErrorCode.InvalidMsg);
+    expect(codes.oneShot).toBe(SofabErrorCode.InvalidMsg);
     expect(codes.streaming).toBe(SofabErrorCode.InvalidMsg);
-    expect(codes.cursor).toBe(SofabErrorCode.InvalidMsg);
+    expect(codes.oneShotDeclined).toBe(SofabErrorCode.InvalidMsg);
   });
 
   it("accepts the three controls: end-marker ids 0, 3 and ID_MAX", () => {
@@ -256,7 +246,7 @@ describe("a sequence-end header's id is bounded by ID_MAX (§4.9/§6.2)", () => 
 
     // It decodes as an ordinary sequence end and re-encodes to the canonical
     // `0x07` — accept-and-normalize, not accept-and-preserve.
-    const out = new OStream();
+    const out = growingOStream();
     decode(nonMinimal, new TranscodeVisitor(out));
     expect(bytesToHex(out.bytes())).toBe("7607");
   });

@@ -1,350 +1,299 @@
 /**
- * The SofaBuffers decoder.
+ * The SofaBuffers decoder: `IStream`, and the visitor it drives.
  *
- * `IStream` is a push parser: feed it bytes with {@link IStream.feed} and it
- * drives a {@link Visitor}, calling one method per decoded field. It is a
- * resumable state machine, so the chunks you feed can be any size — a whole
- * message, a network packet, or a single byte — and a field that straddles a
- * chunk boundary is picked up seamlessly on the next call.
+ * The **visitor is the only decode surface** (CORELIB_PLAN §5.3.1). There is no
+ * pull parser, no iterator, no cursor and no convenience wrapper that decodes by
+ * another route: a second surface is a second implementation of every rule in the
+ * spec, and the divergences that produces are invisible to the shared vectors,
+ * which exercise whichever surface the driver happened to pick.
  *
- * Nesting is hierarchical: {@link Visitor.sequenceBegin} may return a child
- * visitor, and the decoder routes the nested fields to it until the matching
- * end. Generated message classes use this directly — a class implements
- * `Visitor`, and a nested-message field returns the child instance.
+ * `IStream` is a push parser: bind a {@link Visitor} at construction, feed bytes
+ * with {@link IStream.feed}, and it calls one method per decoded field. It is a
+ * resumable state machine, so the chunks can be any size — a whole message, a
+ * network packet, or a single byte — and a field that straddles a chunk boundary
+ * is picked up seamlessly on the next call.
  *
- * There is no finish / finalize step (CORELIB_PLAN §5.2 / MESSAGE_SPEC §7):
- * {@link IStream.feed} *returns* the three-valued decode outcome for the bytes
- * consumed so far, and {@link IStream.status} re-reads it at any time. A message
- * that merely ends inside a field is reported — never thrown — as
- * {@link DecodeStatus.Incomplete}; only a *malformed* message throws
- * ({@link SofabErrorCode.InvalidMsg}), which is this port's channel for
- * {@link DecodeStatus.Invalid}. The caller owns end-of-input and decides whether
- * a trailing `Incomplete` is a truncation error.
+ * The visitor is **flat**: one object receives the whole message, and nesting is
+ * reported as {@link Visitor.sequenceBegin} / {@link Visitor.sequenceEnd} events
+ * carrying the sequence's id and depth. A visitor per nested scope would make
+ * every dispatch site here megamorphic — one hidden class per generated message
+ * class in the tree — and would put a per-scope object on the decode path; one
+ * flat visitor keeps the call sites (bi)morphic and the decoder allocation-free
+ * (§6.6). Descending and skipping are unchanged by that choice: `sequenceBegin`
+ * answers `false` to decline a subtree whole, and a field whose callback the
+ * visitor does not implement is skipped.
+ *
+ * There is no finish / finalize step (§5.2.4): {@link IStream.feed} *returns* the
+ * three-valued decode outcome for the bytes consumed so far, and
+ * {@link IStream.status} re-reads it at any time. A message that merely ends
+ * inside a field is reported — never thrown — as {@link DecodeStatus.Incomplete};
+ * only a *malformed* message throws ({@link SofabErrorCode.InvalidMsg}), which is
+ * this port's channel for {@link DecodeStatus.Invalid}. The caller owns
+ * end-of-input and decides whether a trailing `Incomplete` is a truncation error.
  */
 
-import type {
-  ArrayKind,
-  DecodeStatus,
-  FixlenSubtype,
-  WireType,
-} from "../constants.js";
-import type { Long } from "../long.js";
-import { decodeContiguous } from "./fast.js";
+import { DecodeStatus } from "../constants.js";
+import type { ArrayKind, FixlenSubtype, WireType } from "../constants.js";
+import { incompleteError } from "../errors.js";
 import type { DecodeLimits } from "./limits.js";
 import { DecoderState } from "./state.js";
 
 /**
- * Receives decoded fields from an {@link IStream}. Every method is optional and
- * defaults to a no-op, so a visitor implements only the fields it cares about
- * and silently skips the rest.
+ * Receives decoded fields from an {@link IStream} — the one decode surface
+ * (§5.3.1). Every method is optional and defaults to a no-op, so a visitor
+ * implements only the fields it cares about and silently skips the rest, which is
+ * the `skip` half of the two per-field intents §6.7.2 allows (the other being
+ * `read`: take the value, in the call).
  *
- * String and blob payloads arrive as one or more `chunk`s, each tagged with the
- * field's `total` length and the `offset` of the chunk within the field, so a
- * large payload never has to be held in one piece. Array elements arrive one at
- * a time between {@link Visitor.arrayBegin} and {@link Visitor.arrayEnd}.
+ * **One visitor per message, not per scope.** Nested sequences arrive as
+ * {@link sequenceBegin} / {@link sequenceEnd} events on this same object, each
+ * carrying the sequence's `id` and its `depth` (1 for a sequence opened at the
+ * root). Generated code routes on those two numbers, which it knows statically
+ * from the schema.
  *
- * `TInt` is how the four integer hooks deliver a value, and it exists only so
- * the opt-in {@link Visitor.longs} channel can be typed exactly. Leave it at its
- * default and `Visitor` means precisely what it always did — number-first
- * `number | bigint`; write {@link LongVisitor} for the `Long` channel. Nothing
- * needs a union of the two: the decoders are implemented against
- * {@link AnyVisitor}, which both shapes satisfy.
+ * **Nothing handed to a visitor outlives the call.** A `string` / `blob` payload
+ * is reported in pieces as a range of the caller's *own* fed chunk (§6.6.3): the
+ * decoder creates no view over it and holds no storage of its own (§6.6, §6.7),
+ * so a consumer that wants the value copies it out — during the call — into
+ * storage it owns. {@link PayloadAcc} and {@link decodeUtf8} are the ready-made
+ * way to do that.
  */
-export interface Visitor<TInt = number | bigint> {
+export interface Visitor {
   /**
-   * Opt in to the {@link Long} channel on {@link unsigned} / {@link signed} /
-   * {@link arrayUnsigned} / {@link arraySigned}: with this set, all four deliver
-   * a `Long` — the raw 32-bit halves the varint reader already holds — instead of
-   * the number-first `number | bigint`. Off by default, so a consumer that does
-   * not set it sees exactly what it saw before and pays nothing. Symmetric with
-   * {@link fp32Raw}, and the streaming counterpart of
-   * {@link Cursor.readUnsignedLong} / {@link Cursor.readSignedLong}, so a field
-   * that generated code holds as a `Long` has that same runtime type through
-   * *every* decode API rather than one type per path.
+   * A field **header**: its `id` and `wire` type, announced the moment the header
+   * varint is complete — before the value, and before the value's own header word
+   * (a fixlen length word, an array count word, the fields of a nested sequence).
    *
-   * Set it through {@link LongVisitor}, which pairs the flag with `TInt = Long`;
-   * setting it on a plain `Visitor` makes the decoder deliver `Long`s the
-   * declared type does not admit.
+   * An observation point for a reader that wants the field stream as it arrives —
+   * which id, in which scope, in which order — without implementing the value
+   * callbacks it would otherwise take to see the same thing.
    *
-   * **Read once, from the root visitor, for the whole decode.** A nested scope
-   * does not get its own answer: the flag is read at the root and every child
-   * visitor is driven on that channel, whatever its own flag says. That is the
-   * useful semantics — a generated message tree is uniformly one channel or the
-   * other — and it is also the affordable one: re-reading the property at each
-   * sequence transition is a megamorphic load, and it measured at +1.1% Ir/op on
-   * `decode: typical message` for consumers that never opt in at all.
-   *
-   * It is not per **field** either: this push surface is driven by wire type
-   * alone and never learns the schema (the same limit that puts receiver caps on
-   * every field — see {@link "./fast"}), so it covers every unsigned / signed
-   * field and element in the message, whatever its declared width. Narrowing back
-   * is exact and cheap — for `u8`..`u32` the value is `value.low`, and for
-   * `i8`..`i32` it is `value.low | 0`.
-   */
-  readonly longs?: boolean;
-  /**
-   * A field **header**: its `id` and `wire` type, announced the moment the
-   * header varint is complete — before the value, and before the value's own
-   * header word (a fixlen length word, an array count word, the fields of a
-   * nested sequence).
-   *
-   * The push twin of {@link Cursor.readHeader}, and that is the whole of its
-   * job: an observation point for a reader that wants the field stream as it
-   * arrives — which id, in which scope, in which order — without implementing
-   * the eight value callbacks it would otherwise take to see the same thing.
-   *
-   * **A schema bound does not belong here.** The header settles `id` and
-   * `wire`, and nothing else. An element id past the schema `count`
-   * (MESSAGE_SPEC §7.1/§5.1) looks decidable from the id alone, and it is not:
-   * §7.3 applies that bound only to a field whose *subtype* has confirmed it is
-   * the declared one, and a contradicting subtype is skipped rather than
-   * rejected. The subtype arrives in the fixlen word, so the verdict is due at
-   * {@link fixlenBegin} — which is where generated code puts it. CORELIB_PLAN
-   * §4.1 makes the timing normative: a message ending inside that word is
-   * `INCOMPLETE` "even when the field's id would violate a schema bound
-   * (MESSAGE_SPEC §7.1) once the subtype confirmed the field is the declared
-   * one", because the low 3 bits of an unfinished varint must not influence an
-   * outcome even though they are already arithmetically fixed. Rejecting from
-   * here answers `INVALID` where §4.1 requires `INCOMPLETE`, and, since the
-   * pull path waits for the complete word, makes the two surfaces disagree on
-   * the same bytes — the divergence corelib-ts#97 reported, now closed from the
-   * other end.
+   * **A schema bound does not belong here.** The header settles `id` and `wire`,
+   * and nothing else. An element id past the schema `count` (MESSAGE_SPEC
+   * §7.1/§5.1) looks decidable from the id alone, and it is not: §7.3 applies that
+   * bound only to a field whose *subtype* has confirmed it is the declared one,
+   * and a contradicting subtype is skipped rather than rejected. The subtype
+   * arrives in the fixlen word, so the verdict is due at {@link fixlenBegin}.
+   * CORELIB_PLAN §4.1.1 makes the timing normative: a message ending inside that
+   * word is `INCOMPLETE` even when the id would violate a schema bound, because
+   * the low 3 bits of an unfinished varint must not influence an outcome even
+   * though they are already arithmetically fixed.
    *
    * Called exactly once per field, in every scope, for every wire type — the
-   * sequence *end* marker excepted: it closes a scope rather than opening a
-   * field and its id is discarded, which is the same answer the pull twin gives
-   * by returning `false` from {@link Cursor.readHeader} instead of publishing a
-   * header. For a nested sequence it fires on the *enclosing* visitor, before
+   * sequence *end* marker excepted: it closes a scope rather than opening a field
+   * and its id is discarded (§4.9). For a nested sequence it fires before
    * {@link sequenceBegin}.
    *
-   * Throwing from it rejects the field, exactly as from {@link fixlenBegin} —
-   * for a verdict the header really does settle on its own, such as an id this
-   * reader will not accept in any shape. Anything schema-shaped belongs on the
-   * later, more informative hook: a fixlen *subtype* mismatch and a declared
-   * length on {@link fixlenBegin}, a declared element count on
-   * {@link arrayBegin}.
+   * Throwing from it rejects the field — for a verdict the header really does
+   * settle on its own, such as an id this reader will not accept in any shape.
    */
   fieldBegin?(id: number, wire: WireType): void;
   /**
-   * An unsigned integer field. Number-first: `value` is a `number` when it fits
-   * exactly (`≤ 2^53-1`, covering ids, u8..u32 and small u64s) and a `bigint`
-   * only beyond that, so the common case avoids a per-value bigint allocation.
-   * It is a {@link Long} instead — always, never the other two — on a
-   * {@link LongVisitor}.
+   * An unsigned integer field.
+   *
+   * `value` is number-first: a `number` when the value fits exactly
+   * (`≤ 2^53-1`, covering ids, u8..u32 and small u64s) and a `bigint` only beyond
+   * that. `lo` / `hi` are the exact 64 bits as two unsigned 32-bit halves — the
+   * ones the varint reader already holds — for a consumer that wants the value
+   * bit-exactly without going through `bigint` arithmetic ({@link Long.fromBits}
+   * builds a `Long` from them). Both describe the same value; use whichever fits.
    */
-  unsigned?(id: number, value: TInt): void;
-  /** A signed integer field. Number-first like {@link unsigned} (`|value| ≤ 2^53-1` ⇒ `number`), or a {@link Long} on a {@link LongVisitor}. */
-  signed?(id: number, value: TInt): void;
+  unsigned?(id: number, value: number | bigint, lo: number, hi: number): void;
   /**
-   * Opt in to the raw-bytes channel on {@link fp32} / {@link arrayFp32}. Off by
-   * default so a value-only consumer pays nothing: when this is not `true` the
-   * decoder never allocates the per-value little-endian view (which, per fp32
-   * element, roughly quartered array-decode throughput in a microbenchmark). Set
-   * it `true` only in a bit-exact consumer (transcode / raw-bits oracle) that
-   * needs `raw` to preserve a signaling NaN.
+   * A signed integer field. `value` is number-first like {@link unsigned}
+   * (`|value| ≤ 2^53-1` ⇒ `number`); `lo` / `hi` are the **decoded**
+   * (zig-zag-undone) two's-complement halves.
    */
-  readonly fp32Raw?: boolean;
+  signed?(id: number, value: number | bigint, lo: number, hi: number): void;
   /**
-   * An IEEE-754 32-bit float field. When you set {@link fp32Raw} to `true`,
-   * `raw` is a zero-copy little-endian view of the exact 4 wire bytes; use it —
-   * not `value` — when the bytes must round-trip bit-for-bit (§4.6). `value` is
-   * a JS `number` (a 64-bit double), and widening a *signaling* NaN into a
-   * double quiets it (sets the is-quiet bit), so `value` cannot represent an
-   * fp32 sNaN faithfully. The view aliases the decoder's working buffer and is
-   * valid only for the duration of the call — copy it if you retain it, exactly
-   * as with a string/blob `chunk`. Without {@link fp32Raw}, `raw` is `undefined`
-   * (no allocation). fp64 needs no such channel: a double holds all 64 bits
-   * verbatim (see {@link fp64}).
+   * An IEEE-754 32-bit float field.
+   *
+   * `value` is a JS `number` — a 64-bit double — and widening a *signaling* NaN
+   * into a double quiets it (sets the is-quiet bit), so `value` cannot represent
+   * an fp32 sNaN faithfully. `bits` is the exact 4 wire bytes as one little-endian
+   * 32-bit word, which can: re-encode from it with
+   * {@link OStream.writeFp32Bits} and the payload round-trips bit-for-bit
+   * (§4.6/§6.5). It is the "32-bit bits accessor" §6.5 names, and it is always
+   * present — a number costs nothing to pass and needs no opt-in flag, where the
+   * byte view it replaces was an allocation per value and a borrowed slice §6.7
+   * forbids.
    */
-  fp32?(id: number, value: number, raw?: Uint8Array): void;
+  fp32?(id: number, value: number, bits: number): void;
   /** An IEEE-754 64-bit double field. `value` is exact — a double is 64 bits wide. */
   fp64?(id: number, value: number): void;
   /**
-   * Start of a `string`/`blob` field: `total` payload bytes follow, in one or
-   * more {@link string}/{@link blob} calls.
+   * Start of a `string`/`blob` field: `total` payload bytes follow, in one or more
+   * {@link string}/{@link blob} calls.
    *
    * The counterpart of {@link arrayBegin}, and it exists for the same reason: a
    * receiver-side bound on the *declared length* is decided by this word, not by
-   * the payload. Without it a visitor can only see `total` once payload bytes
-   * arrive, so a message that ends right after an over-bound length word escapes
-   * the check and degrades to `INCOMPLETE` — while the same bytes through
-   * {@link Cursor.readString} are `INVALID`. §5.2 gives INVALID precedence over
-   * INCOMPLETE for input already known to be malformed, so the two paths have to
-   * agree, and this is where the verdict is available.
+   * the payload. Without it a visitor could only see `total` once payload bytes
+   * arrive, so a message that ends right after an over-bound length word would
+   * escape the check and degrade to `INCOMPLETE`, where §5.2.3 requires `INVALID`.
    *
    * Called exactly once per field, before any payload call — including for a
    * zero-length payload, which is still announced here and then delivered as one
-   * empty chunk.
+   * empty range.
    */
   fixlenBegin?(id: number, subtype: FixlenSubtype, total: number): void;
   /**
-   * A chunk of a UTF-8 string field: `chunk` are the raw wire bytes at `offset`
-   * of a `total`-byte payload, as a zero-copy view valid only for this call.
+   * A piece of a UTF-8 string field: the bytes `src[start..end)`, at `offset` of
+   * a `total`-byte payload.
    *
-   * They are **not validated**. §6.4 puts the UTF-8 check where a string is
-   * *materialized* — a chunk may end mid-code-point, and a skipped field is
-   * never validated at all — so on this path the caller who materializes owns
-   * the check. {@link decodeUtf8} is it: the same strict decoder
-   * {@link Cursor.readString} uses, reporting invalid UTF-8 as `INVALID_MSG`.
-   * A hand-rolled one must be built **fatal**,
-   * `new TextDecoder("utf-8", { fatal: true })` — JavaScript's default
-   * `TextDecoder` substitutes `U+FFFD`, and §6.4 forbids that silent replacement
-   * in either direction. Decode `total`-sized reassembled payloads
-   * ({@link PayloadAcc} joins them), not individual chunks, unless a chunk is the
-   * whole payload.
+   * `src` is the **caller's own chunk** — the exact array passed to
+   * {@link IStream.feed} (or to {@link decode}) — handed back with the piece's
+   * coordinates (§6.6.3). The decoder builds no view over it, keeps no storage,
+   * and hands out no borrowed slice of its own (§6.6, §6.7). Once `feed` returns,
+   * the caller may reuse that memory, so a consumer that wants the value copies it
+   * out **during the call**: {@link PayloadAcc} joins pieces into a buffer it
+   * owns, and {@link decodeUtf8} turns a range straight into a string.
+   *
+   * The bytes are **not validated**. §6.4.5 puts the UTF-8 check where a string is
+   * *materialized* — a piece may end mid-code-point, and a skipped field is never
+   * validated at all — so on this surface the caller who materializes owns the
+   * check. {@link decodeUtf8} is it, and a hand-rolled one must be built **fatal**
+   * (`new TextDecoder("utf-8", { fatal: true })`): JavaScript's default
+   * `TextDecoder` substitutes `U+FFFD`, which §6.4 forbids in either direction.
    */
-  string?(id: number, total: number, offset: number, chunk: Uint8Array): void;
-  /** A chunk of a blob field. */
-  blob?(id: number, total: number, offset: number, chunk: Uint8Array): void;
+  string?(
+    id: number,
+    total: number,
+    offset: number,
+    src: Uint8Array,
+    start: number,
+    end: number,
+  ): void;
+  /** A piece of a blob field — see {@link string} for the `src`/`start`/`end` contract. */
+  blob?(
+    id: number,
+    total: number,
+    offset: number,
+    src: Uint8Array,
+    start: number,
+    end: number,
+  ): void;
   /** Start of an array; `count` elements of `kind` follow. */
   arrayBegin?(id: number, kind: ArrayKind, count: number): void;
-  /** One unsigned array element. Number-first like {@link unsigned}, or a {@link Long} on a {@link LongVisitor}. */
-  arrayUnsigned?(id: number, index: number, value: TInt): void;
-  /** One signed array element. Number-first like {@link signed}, or a {@link Long} on a {@link LongVisitor}. */
-  arraySigned?(id: number, index: number, value: TInt): void;
-  /** One fp32 array element. `raw` (the element's 4 wire bytes) is present only under {@link fp32Raw} — see {@link fp32}. */
-  arrayFp32?(id: number, index: number, value: number, raw?: Uint8Array): void;
+  /** One unsigned array element — `value` / `lo` / `hi` as in {@link unsigned}. */
+  arrayUnsigned?(
+    id: number,
+    index: number,
+    value: number | bigint,
+    lo: number,
+    hi: number,
+  ): void;
+  /** One signed array element — `value` / `lo` / `hi` as in {@link signed}. */
+  arraySigned?(
+    id: number,
+    index: number,
+    value: number | bigint,
+    lo: number,
+    hi: number,
+  ): void;
+  /** One fp32 array element — `bits` is the element's 4 wire bytes, see {@link fp32}. */
+  arrayFp32?(id: number, index: number, value: number, bits: number): void;
   /** One fp64 array element. `value` is exact — see {@link fp64}. */
   arrayFp64?(id: number, index: number, value: number): void;
   /** End of an array. */
   arrayEnd?(id: number): void;
   /**
-   * Start of a nested sequence. Three answers:
+   * Start of a nested sequence — a fresh id scope (§4.9) — opened by field `id`
+   * at `depth` (1 at the root).
    *
-   * * a {@link Visitor} — route the nested fields to it; its
-   *   {@link Visitor.sequenceEnd} fires at the matching end;
-   * * `null` — **skip this subtree**. No callback of any kind fires inside it,
-   *   nesting included, and nothing in it can reach a visitor again: a scope
-   *   opened inside a skipped one is skipped too, without being offered.
-   * * nothing (`undefined`) — keep using the current visitor, so the nested
-   *   scope's fields arrive here. Note that a nested scope's ids are its own
-   *   (§4.9), so this merges two id spaces and is rarely what a reader wants.
+   * Return **`false`** to decline the whole subtree: no callback of any kind fires
+   * inside it, nesting included, its own {@link sequenceEnd} included, and a scope
+   * opened within it is never offered either. Return anything else (or nothing) to
+   * descend, and the nested fields arrive on this same visitor with their own ids
+   * and `depth + 1`.
    *
-   * `null` is what a reader says about a subtree it has no destination for —
-   * an unknown id, a field it does not care about. It is worth saying: a
-   * skipped scope is still parsed (a sequence is framed by markers, not by a
-   * length, so its end has to be found), but nothing is decoded into
-   * existence for it. Payload views are not built, values are not boxed, and
-   * the receiver caps of {@link DecodeLimits} do not fire — they bound what
-   * this reader is handed, and a skipped scope hands it nothing. Format
-   * ceilings (`ARRAY_MAX`, `FIXLEN_MAX`, `MAX_DEPTH`, the varint bound) still
-   * apply everywhere, skipped or not: they bound what the wire may express.
-   *
-   * The child carries the parent's `TInt`, which is exactly right: {@link longs}
-   * is read once from the **root**, so a whole message tree is on one channel or
-   * the other and a child never sees a different representation than its parent.
+   * A declined subtree is still *parsed* — a sequence is framed by markers, not by
+   * a length, so its end has to be found — but nothing in it is decoded into
+   * existence: no piece is reported, no value is built, and the receiver caps of
+   * {@link DecodeLimits} do not fire, since they bound what this reader is handed
+   * and a declined scope hands it nothing. Format ceilings (`ARRAY_MAX`,
+   * `FIXLEN_MAX`, `MAX_DEPTH`, the varint bound) still apply everywhere: they
+   * bound what the wire may express.
    */
-  sequenceBegin?(id: number): Visitor<TInt> | null | void;
-  /** End of the nested sequence this visitor was handling. */
-  sequenceEnd?(): void;
+  sequenceBegin?(id: number, depth: number): boolean | void;
+  /** End of the nested sequence opened by field `id` at `depth`. */
+  sequenceEnd?(id: number, depth: number): void;
 }
 
 /**
- * A {@link Visitor} on the {@link Long} channel: the four integer hooks deliver
- * a {@link Long} and {@link Visitor.longs} is set, which is what turns the
- * channel on. The two go together — the flag decides what the decoder passes and
- * `TInt` decides what the hooks declare — so this pairing is the supported way to
- * opt in.
+ * Push parser for the SofaBuffers wire format, and the library's only decode
+ * surface (§5.3.1).
  *
- * {@link decode} and {@link IStream.feed} are overloaded on this shape *first*,
- * which is what makes an inline visitor literal work without an annotation: a
- * literal that sets `longs: true` matches here and gets its four integer hooks
- * contextually typed with `Long`, while one that does not cannot match (the flag
- * is required) and falls through to plain {@link Visitor} — where the hooks are
- * still typed `number | bigint`, exactly as before this channel existed.
- */
-export type LongVisitor = Visitor<Long> & { readonly longs: true };
-
-/**
- * Either visitor shape — the parameter type the decoders are *implemented*
- * against, since they call the integer hooks with whichever representation the
- * flag selected. {@link Visitor} and {@link LongVisitor} are both assignable to
- * it, so a caller that holds one of those needs no cast.
- */
-export type AnyVisitor = Visitor<number | bigint | Long>;
-
-/**
- * Push parser for the SofaBuffers wire format. Feed it bytes in chunks of any
- * size with {@link IStream.feed} and it drives a {@link Visitor}, one call per
- * decoded field, resuming cleanly across chunk boundaries. Every `feed` returns
- * the decode outcome for the bytes so far — whether the message has finished on
- * a field boundary — so no end / finalize call is needed;
- * {@link IStream.status} re-reads that same outcome. When the whole message is
- * already in one buffer, prefer the faster {@link decode}.
+ * Bind a {@link Visitor} and, optionally, the receiver-side {@link DecodeLimits}
+ * at construction, then feed bytes in chunks of any size with {@link feed}: it
+ * calls one visitor method per decoded field and resumes cleanly across chunk
+ * boundaries. Every `feed` returns the decode outcome for the bytes so far, so no
+ * end / finalize call is needed; {@link status} re-reads that same outcome.
+ *
+ * Constructing one is the only allocating step (§6.6): `feed` itself allocates
+ * nothing at all. The one-shot {@link decode} is exactly this class fed once.
  */
 export class IStream {
   private readonly state: DecoderState;
 
   /**
-   * @param limits Optional opt-in decode caps ({@link DecodeLimits}). An
-   * over-limit array count or string / blob length throws {@link SofabError}
-   * (`LIMIT_EXCEEDED`) from {@link feed}, at the offending field's header and
-   * before any of its payload is streamed to the visitor. Omit for no caps.
+   * @param visitor The field handler this stream drives, for its whole life.
+   * @param limits Receiver-side caps (§6.2.1). Every cap is finite: an omitted
+   * one takes this port's documented default rather than meaning "no limit" —
+   * there is no unset state and no unlimited mode. An over-limit array count or
+   * string / blob length throws {@link SofabError} (`LIMIT_EXCEEDED`) from
+   * {@link feed}, at the offending field's header and before any of its payload
+   * reaches the visitor.
    */
-  constructor(limits?: DecodeLimits) {
-    this.state = new DecoderState(limits);
+  constructor(visitor: Visitor, limits?: DecodeLimits) {
+    this.state = new DecoderState(visitor, limits);
   }
 
   /**
-   * Feed a chunk of bytes, dispatching decoded fields to `visitor`, and
-   * **return** the decode outcome for the bytes consumed so far (CORELIB_PLAN
-   * §6): {@link DecodeStatus.Complete} when they end exactly at a field
-   * boundary, {@link DecodeStatus.Incomplete} when they end *inside* a field (a
-   * partial varint, an unfinished payload / array, or a still-open nested
-   * sequence). Running out of bytes mid-field is not an error — the decode
-   * merely suspends until the next chunk, and the caller owns end-of-input.
+   * Feed a chunk of bytes, dispatching decoded fields to the bound visitor, and
+   * **return** the decode outcome for the bytes consumed so far (§5.2.1):
+   * {@link DecodeStatus.Complete} when they end exactly at a field boundary,
+   * {@link DecodeStatus.Incomplete} when they end *inside* a field (a partial
+   * varint, an unfinished payload / array, or a still-open nested sequence).
+   * Running out of bytes mid-field is not an error — the decode merely suspends
+   * until the next chunk, and the caller owns end-of-input.
    *
-   * There is no finish / finalize step (§5.2): the status returned here *is* the
+   * The chunk is borrowed **only for the duration of this call** (§6.0): once it
+   * returns, the caller may reuse, overwrite or free that memory, and the decoded
+   * message is unaffected — the decoder retains nothing that points into it.
+   *
+   * There is no finish / finalize step (§5.2.4): the status returned here *is* the
    * answer at that byte boundary, and {@link status} re-reads the same value
    * without consuming anything.
    *
    * `INVALID` travels on the error channel — this port's idiomatic surfacing of
    * it: *malformed* bytes throw {@link SofabError} (`INVALID_MSG`) instead of
-   * returning a status. That verdict is **terminal** (§5.2): the stream latches
-   * it, so a caller that catches the throw and feeds on gets the same error
-   * again from every later call — no further byte is consumed and no visitor
-   * method is invoked — and {@link status} answers {@link DecodeStatus.Invalid}
-   * from then on. A receiver-limit rejection (`LIMIT_EXCEEDED`,
-   * {@link DecodeLimits}) does *not* latch: the bytes are well-formed, and it is
-   * a policy rejection rather than the `INVALID` outcome.
+   * returning a status. That verdict is **terminal** (§5.2.1): the stream latches
+   * it, so a caller that catches the throw and feeds on gets the same error again
+   * from every later call — no further byte is consumed and no visitor method is
+   * invoked — and {@link status} answers {@link DecodeStatus.Invalid} from then
+   * on. A receiver-limit rejection (`LIMIT_EXCEEDED`, {@link DecodeLimits}) does
+   * *not* latch: the bytes are well-formed, and it is a policy rejection rather
+   * than the `INVALID` outcome (§6.2.1).
    */
-  feed(chunk: Uint8Array, visitor: LongVisitor): DecodeStatus;
-  feed(chunk: Uint8Array, visitor: Visitor): DecodeStatus;
-  feed(chunk: Uint8Array, visitor: AnyVisitor): DecodeStatus {
-    this.state.push(chunk, visitor);
+  feed(chunk: Uint8Array): DecodeStatus {
+    this.state.push(chunk);
     return this.state.finish();
   }
 
   /**
    * Re-read the outcome for the bytes fed so far — the same value the last
    * {@link feed} returned: {@link DecodeStatus.Complete} at a clean field
-   * boundary, {@link DecodeStatus.Incomplete} if the input ends inside a field,
-   * or {@link DecodeStatus.Invalid} once it has been proved malformed —
-   * permanently, since `INVALID` is terminal and outranks `INCOMPLETE` (§5.2).
-   * `Invalid` is the one outcome {@link feed} never returns (it throws it), so
-   * this is how a caller that caught the `INVALID_MSG` reads the verdict as a
-   * status.
+   * boundary, {@link DecodeStatus.Incomplete} if the input ends inside a field, or
+   * {@link DecodeStatus.Invalid} once it has been proved malformed — permanently,
+   * since `INVALID` is terminal and outranks `INCOMPLETE` (§5.2.3). `Invalid` is
+   * the one outcome {@link feed} never returns (it throws it), so this is how a
+   * caller that caught the `INVALID_MSG` reads the verdict as a status.
    *
-   * A convenience, never an obligation: the finish-less spec (§5.2 / MESSAGE_SPEC
-   * §7) requires no end step, and this is a pure accessor — it never throws,
-   * consumes nothing, and never promotes an incomplete decode to an error.
+   * A convenience, never an obligation: the finish-less spec (§5.2.4) requires no
+   * end step, and this is a pure accessor — it never throws, consumes nothing, and
+   * never promotes an incomplete decode to an error.
    */
   status(): DecodeStatus {
-    return this.state.finish();
-  }
-
-  /**
-   * Deprecated alias for {@link status}, kept so existing callers compile
-   * unchanged.
-   *
-   * The name is a misnomer under the finish-less spec (CORELIB_PLAN §5.2): the
-   * decoder needs no "end" step — {@link feed} already returns the outcome and
-   * {@link status} re-reads it. Behaviourally identical to {@link status}: a
-   * pure accessor that never throws.
-   *
-   * @deprecated Use {@link status} — or the value {@link feed} returns.
-   */
-  end(): DecodeStatus {
     return this.state.finish();
   }
 }
@@ -352,29 +301,49 @@ export class IStream {
 /**
  * Decode a complete message held in one contiguous buffer, in a single call.
  *
- * This is the non-streaming convenience — and the fast path: with the whole
- * message in hand it advances one cursor over the buffer instead of running the
- * resumable per-byte state machine, so it is markedly faster than feeding the
- * same bytes through
- * {@link IStream}. Use {@link IStream} when the message arrives in chunks; use
- * this when you already have it whole.
+ * The non-streaming convenience, and **not** a second decoder: it is one
+ * {@link IStream.feed} of the whole buffer, so it runs the same code, applies the
+ * same rules and has the same memory behaviour as a chunked decode — §6.7.1
+ * forbids the one-shot path from differing, right down to holding no view into
+ * the buffer it was handed. Feeding a whole message is also the case the decoder's
+ * fast lane is built for, so nothing is given up by having one implementation.
  *
- * The whole buffer *is* the end of input, so the two failure outcomes both
- * throw a {@link SofabError} the caller tells apart by `code` (MESSAGE_SPEC §7):
- * malformed input throws `INVALID_MSG`, while input that ends inside a field —
- * truncation or an unclosed sequence — throws `INCOMPLETE`. A complete message
- * returns normally.
+ * The whole buffer *is* the end of input, so the two failure outcomes both throw a
+ * {@link SofabError} the caller tells apart by `code` (MESSAGE_SPEC §7): malformed
+ * input throws `INVALID_MSG`, while input that ends inside a field — truncation or
+ * an unclosed sequence — throws `INCOMPLETE`. A complete message returns normally.
  *
- * Pass `limits` ({@link DecodeLimits}) to cap array counts and string / blob
- * lengths; an over-limit field throws `LIMIT_EXCEEDED` at its header, before it
- * is materialized. Omit for no caps (the default).
+ * Pass `limits` ({@link DecodeLimits}) to override this port's default
+ * receiver-side caps; an over-limit field throws `LIMIT_EXCEEDED` at its header,
+ * before it is materialized.
  */
-export function decode(bytes: Uint8Array, visitor: LongVisitor, limits?: DecodeLimits): void;
-export function decode(bytes: Uint8Array, visitor: Visitor, limits?: DecodeLimits): void;
 export function decode(
   bytes: Uint8Array,
-  visitor: AnyVisitor,
+  visitor: Visitor,
   limits?: DecodeLimits,
 ): void {
-  decodeContiguous(bytes, visitor, limits);
+  // One machine, re-bound per call. Constructing a decoder is the only allocating
+  // step there is (§6.6) — and on a small message it is most of the cost — so the
+  // one-shot path keeps one and rebinds it. A decode started *inside* a visitor
+  // callback finds the pool empty and builds its own, so nesting stays safe, and
+  // the machine goes back to the pool even when the decode throws.
+  const state = pooled ?? new DecoderState();
+  pooled = null;
+  try {
+    state.begin(visitor, limits);
+    state.push(bytes);
+    // A malformed message has already thrown `INVALID_MSG`; what is left to report
+    // is truncation, which streaming leaves to the caller's framing (§5.2.4) and
+    // which a one-shot caller has, by construction, already decided is an error —
+    // the whole buffer *is* the end of input.
+    if (state.finish() !== DecodeStatus.Complete) {
+      throw incompleteError("truncated message: input ends inside a field");
+    }
+  } finally {
+    state.release(); // keep nothing of the caller's alive in the pool
+    pooled = state;
+  }
 }
+
+/** The machine {@link decode} reuses; `null` while a decode is running on it. */
+let pooled: DecoderState | null = null;

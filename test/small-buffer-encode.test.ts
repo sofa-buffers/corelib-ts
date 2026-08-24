@@ -20,13 +20,13 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { Long, MIN_OUTPUT_BUFFER, OStream, SofabError, SofabErrorCode } from "../src/index.js";
+import { Long, MIN_OUTPUT_BUFFER, OStream, SofabError, SofabErrorCode, growingOStream } from "../src/index.js";
 
 /** Encode through a fixed caller buffer of `size`, collecting everything flushed. */
 function streamed(size: number, write: (os: OStream) => void, offset = 0): number[] {
   const out: number[] = [];
-  const os = new OStream(new Uint8Array(size + offset), offset, (b) => {
-    for (const byte of b) out.push(byte);
+  const os = new OStream(new Uint8Array(size + offset), offset, (buf, start, end) => {
+    for (let i = start; i < end; i++) out.push(buf[i]!);
   });
   write(os);
   os.flush();
@@ -35,7 +35,7 @@ function streamed(size: number, write: (os: OStream) => void, offset = 0): numbe
 
 /** Encode the same fields one-shot, through the growable in-memory path. */
 function grown(write: (os: OStream) => void): number[] {
-  const os = new OStream();
+  const os = growingOStream();
   write(os);
   return Array.from(os.bytes());
 }
@@ -112,8 +112,8 @@ describe("encoding through a buffer smaller than a single write (§5.1)", () => 
     // Byte-identity alone would also pass if the encoder quietly grew its own
     // buffer; this pins that the caller's buffer is the one being filled.
     let chunks = 0;
-    const os = new OStream(new Uint8Array(1), 0, (b) => {
-      expect(b.length).toBe(1);
+    const os = new OStream(new Uint8Array(1), 0, (_buf, start, end) => {
+      expect(end - start).toBe(1);
       chunks++;
     });
     os.writeFp64(1, 3.5);
@@ -125,8 +125,8 @@ describe("encoding through a buffer smaller than a single write (§5.1)", () => 
     // A sink is allowed to hand the encoder a new buffer (`setBuffer`) instead
     // of copying — including from inside a value that is being split.
     const out: number[] = [];
-    const os = new OStream(new Uint8Array(1), 0, (b) => {
-      out.push(...b);
+    const os = new OStream(new Uint8Array(1), 0, (buf, start, end) => {
+      for (let i = start; i < end; i++) out.push(buf[i]!);
       os.setBuffer(new Uint8Array(1));
     });
     const write = CASES[0]![1];
@@ -208,7 +208,9 @@ describe("MIN_OUTPUT_BUFFER (§5.1)", () => {
     // "never partway through a message": the rejected hand-over must not have
     // swapped anything, so the stream keeps encoding into what it already had.
     const out: number[] = [];
-    const os = new OStream(new Uint8Array(64), 0, (b) => out.push(...b));
+    const os = new OStream(new Uint8Array(64), 0, (buf, start, end) => {
+      for (let i = start; i < end; i++) out.push(buf[i]!);
+    });
     os.writeUnsigned(1, 42);
     expect(codeOf(() => os.setBuffer(new Uint8Array(UNDERSIZED))))
       .toBe(SofabErrorCode.Argument);

@@ -23,7 +23,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { Cursor, SofabError, SofabErrorCode, decode, type Visitor } from "../src/index.js";
+import { SofabError, SofabErrorCode, decode, decodeUtf8, type Visitor } from "../src/index.js";
 
 const ROOT = new URL("../", import.meta.url);
 
@@ -79,8 +79,8 @@ describe("why the fatal decoder is required on the visitor path", () => {
   it("hands the visitor the raw invalid bytes and still completes", () => {
     const chunks: Uint8Array[] = [];
     const sink: Visitor = {
-      string: (_id, _total, _off, chunk) => {
-        chunks.push(chunk.slice());
+      string: (_id, _total, _off, src, start, end) => {
+        chunks.push(src.slice(start, end));
       },
     };
     expect(() => decode(bad, sink)).not.toThrow();
@@ -100,12 +100,15 @@ describe("why the fatal decoder is required on the visitor path", () => {
     ).toThrow();
   });
 
-  it("the same bytes through Cursor.readString are INVALID_MSG", () => {
-    const c = new Cursor(bad);
-    expect(c.readHeader()).toBe(true);
+  it("the same bytes through decodeUtf8 are INVALID_MSG", () => {
+    // decodeUtf8 is the strict decoder the docs point generated code at: it maps
+    // the platform decoder's bare TypeError onto the INVALID verdict every other
+    // malformation reports (§6.4).
     try {
-      c.readString();
-      expect.unreachable("readString must reject invalid UTF-8");
+      decode(bad, {
+        string: (_id, _total, _offset, src, start, end) => void decodeUtf8(src, start, end),
+      });
+      expect.unreachable("decodeUtf8 must reject invalid UTF-8");
     } catch (e) {
       expect(e).toBeInstanceOf(SofabError);
       expect((e as SofabError).code).toBe(SofabErrorCode.InvalidMsg);

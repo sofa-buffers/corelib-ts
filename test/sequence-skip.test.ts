@@ -1,5 +1,5 @@
 /**
- * `Visitor.sequenceBegin` returning `null` — skip this subtree.
+ * `Visitor.sequenceBegin` returning `false` — decline this subtree.
  *
  * Before it existed, a reader with no destination for a scope had to supply a
  * visitor that swallowed everything, and every generated TypeScript module
@@ -7,11 +7,11 @@
  *
  *     const _DEAD: Visitor = { sequenceBegin(): Visitor { return _DEAD; } };
  *
- * The dummy stood in for a decoder state that was missing, so a discarded
- * subtree still paid for payload views, property lookups and the receiver caps
- * of a reader that was never going to see it. `null` says the thing directly,
- * and corelib-dart already had it (`onSequenceStart` returning null sets
- * `_skipDepth`). corelib-ts#149, epic sofa-buffers/generator#345.
+ * The dummy stood in for a decoder state that was missing, so a discarded subtree
+ * still paid for property lookups and the receiver caps of a reader that was never
+ * going to see it. `false` says the thing directly, and corelib-dart already had
+ * it (`onSequenceStart` returning null sets `_skipDepth`). corelib-ts#149, epic
+ * sofa-buffers/generator#345.
  *
  * What a skip does NOT change: the subtree is still parsed — a sequence is
  * framed by markers, not by a length, so its end has to be found — and every
@@ -28,8 +28,7 @@ import {
   SofabError,
   SofabErrorCode,
   decode,
-  type Visitor,
-} from "../src/index.js";
+  type Visitor, growingOStream } from "../src/index.js";
 
 const CHUNKINGS = [1, 2, 3, 5, 8, 16, 64];
 
@@ -43,9 +42,9 @@ class Rec implements Visitor {
   arrayBegin(id: number, k: ArrayKind, n: number): void { this.ev.push(`arr ${id} ${k} ${n}`); }
   arrayUnsigned(id: number, i: number): void { this.ev.push(`ae ${id} ${i}`); }
   arrayEnd(id: number): void { this.ev.push(`arrEnd ${id}`); }
-  sequenceBegin(id: number): Visitor | null {
+  sequenceBegin(id: number): boolean {
     this.ev.push(`seq ${id}`);
-    return id === this.skipId ? null : new Rec(this.ev, this.skipId);
+    return id !== this.skipId;
   }
   sequenceEnd(): void { this.ev.push("seqEnd"); }
 }
@@ -56,7 +55,7 @@ class Rec implements Visitor {
  * fire. Id 9 after it proves the parent scope resumes.
  */
 function message(): Uint8Array {
-  const os = new OStream();
+  const os = growingOStream();
   os.writeUnsigned(1, 5);
   os.writeSequenceBeginLazy(7);
   os.writeUnsigned(1, 99);
@@ -72,11 +71,11 @@ function message(): Uint8Array {
 }
 
 /** Feed in `size`-byte chunks (0 = one feed), returning the outcome. */
-function feed(bytes: Uint8Array, size: number, v: Visitor, limits?: ConstructorParameters<typeof IStream>[0]): DecodeStatus {
-  const is = new IStream(limits);
+function feed(bytes: Uint8Array, size: number, v: Visitor, limits?: ConstructorParameters<typeof IStream>[1]): DecodeStatus {
+  const is = new IStream(v, limits);
   try {
-    if (size <= 0) is.feed(bytes, v);
-    else for (let i = 0; i < bytes.length; i += size) is.feed(bytes.subarray(i, i + size), v);
+    if (size <= 0) is.feed(bytes);
+    else for (let i = 0; i < bytes.length; i += size) is.feed(bytes.subarray(i, i + size));
   } catch (e) {
     if (e instanceof SofabError) {
       if (e.code === SofabErrorCode.InvalidMsg) return DecodeStatus.Invalid;
@@ -84,10 +83,10 @@ function feed(bytes: Uint8Array, size: number, v: Visitor, limits?: ConstructorP
     }
     throw e;
   }
-  return is.end();
+  return is.status();
 }
 
-describe("sequenceBegin returning null", () => {
+describe("sequenceBegin returning false", () => {
   const LIVE = ["field 1", "u 1", "field 7", "seq 7", "field 9", "u 9"];
 
   it("delivers nothing from the subtree, on the contiguous path", () => {
@@ -116,17 +115,29 @@ describe("sequenceBegin returning null", () => {
     expect(r.ev).not.toContain("seqEnd");
   });
 
-  it("keeps 'return nothing' meaning 'stay on this visitor'", () => {
-    // The unchanged third answer: the nested scope's fields arrive HERE.
+  it("keeps 'return nothing' meaning 'descend'", () => {
+    // The other answer: the nested scope's fields arrive on this same visitor —
+    // which, with a flat visitor, is where they always arrive. A reader that wants
+    // to tell the scopes apart routes on the (id, depth) pair sequenceBegin gives
+    // it; one that does not sees all three id spaces merged, as here.
     const ev: string[] = [];
     const stay: Visitor = {
       unsigned: (id, v) => void ev.push(`${id}=${v}`),
       sequenceBegin: () => undefined,
     };
     decode(message(), stay);
-    // Id 1 arrives three times — the root's, the subtree's, and the nested
-    // scope's — because all three id spaces were merged into this one visitor.
     expect(ev).toEqual(["1=5", "1=99", "1=1", "9=6"]);
+  });
+
+  it("reports the id and depth of each scope, and of its end", () => {
+    // What replaces a child visitor: the events carry enough for a flat reader to
+    // route by itself, and they nest.
+    const ev: string[] = [];
+    decode(message(), {
+      sequenceBegin: (id, depth) => void ev.push(`begin ${id}@${depth}`),
+      sequenceEnd: (id, depth) => void ev.push(`end ${id}@${depth}`),
+    });
+    expect(ev).toEqual(["begin 7@1", "begin 5@2", "end 5@2", "end 7@1"]);
   });
 });
 
@@ -135,7 +146,7 @@ describe("a skipped subtree and the two kinds of bound", () => {
   // skipped scope hands it nothing. corelib-dart takes the same position —
   // its cap sits inside `if (read)`, and `_decideRead` is false while skipping.
   const CAPS = { maxStringLen: 4, maxBlobLen: 2, maxArrayCount: 1 };
-  const skipper: Visitor = { sequenceBegin: () => null };
+  const skipper: Visitor = { sequenceBegin: () => false };
 
   it("does not apply the receiver caps inside it (contiguous)", () => {
     expect(() => decode(message(), skipper, CAPS)).not.toThrow();
@@ -148,7 +159,7 @@ describe("a skipped subtree and the two kinds of bound", () => {
   }
 
   it("still applies them outside it", () => {
-    const os = new OStream();
+    const os = growingOStream();
     os.writeString(1, "far too long");
     try {
       decode(os.bytes().slice(), skipper, CAPS);
@@ -187,7 +198,7 @@ describe("a skipped subtree and the two kinds of bound", () => {
   });
 
   it("still counts the skipped scope as open: truncation is INCOMPLETE, not COMPLETE", () => {
-    const os = new OStream();
+    const os = growingOStream();
     os.writeSequenceBeginLazy(7);
     os.writeUnsigned(1, 1);
     const bytes = os.bytes().slice(); // no sequence end
@@ -196,7 +207,7 @@ describe("a skipped subtree and the two kinds of bound", () => {
   });
 
   it("still rejects an unbalanced sequence end after one", () => {
-    const os = new OStream();
+    const os = growingOStream();
     os.writeSequenceBeginLazy(7);
     os.writeSequenceEnd();
     const bytes = new Uint8Array([...os.bytes().slice(), 0x07]); // one end too many

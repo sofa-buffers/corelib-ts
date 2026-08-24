@@ -11,9 +11,11 @@
  *   plus the throwaway `Uint8Array` it allocates and the second copy into the
  *   buffer — which V8 profiling showed to be the encoder's dominant cost (a
  *   short string cost ~700 ns almost entirely in `TextEncoder`).
- * - {@link encodeUtf8} — a validated wrapper over the shared {@link TextEncoder},
- *   still used by the streaming path where the payload is drained in chunks
- *   through a small buffer.
+ * - {@link utf8WriteSink} — the same walk, emitting one byte at a time into a
+ *   {@link ByteSink}, for the streaming path where the output buffer is narrower
+ *   than the payload and the encoder drains between bytes. It replaces a
+ *   `TextEncoder.encode` into a throwaway array, which was an allocation on a
+ *   codec path and so is not available to it (CORELIB_PLAN §6.6).
  *
  * **Strict UTF-8 (MESSAGE_SPEC §8, CORELIB_PLAN §6.4).** A `string` is UTF-8
  * text; the encode side is always strict for this Unicode-string target. The
@@ -29,8 +31,6 @@
 
 import { argumentError, type SofabError } from "../errors.js";
 
-const UTF8 = new TextEncoder();
-
 /** An unpaired surrogate at `index` cannot be encoded as valid UTF-8 (§8/§6.4). */
 function unpairedSurrogate(index: number): SofabError {
   return argumentError(
@@ -38,18 +38,10 @@ function unpairedSurrogate(index: number): SofabError {
   );
 }
 
-/**
- * Encode `text` to UTF-8 bytes (no null terminator). Throws
- * {@link SofabError} (`ARGUMENT`) on an unpaired surrogate — `TextEncoder` alone
- * would silently substitute `U+FFFD`, the lossy mutation §8 forbids, so the
- * string is validated first and only well-formed input reaches the encoder.
- */
-export function encodeUtf8(text: string): Uint8Array {
-  // utf8Length is a full unpaired-surrogate scan that throws on the first one;
-  // reuse it as the validator so both encode paths share one rule, then hand the
-  // now-known-well-formed string to TextEncoder (byte-identical for valid input).
-  utf8Length(text);
-  return UTF8.encode(text);
+/** Anything that takes UTF-8 one byte at a time — in practice, the encoder itself. */
+export interface ByteSink {
+  /** @internal Append one byte, draining to the flush sink when the buffer is full. */
+  putByte(b: number): void;
 }
 
 /**
@@ -150,4 +142,45 @@ export function utf8Write(text: string, out: Uint8Array, pos: number): number {
     }
   }
   return pos;
+}
+
+/**
+ * Write `text` as UTF-8 one byte at a time into `sink` — {@link utf8Write}'s walk
+ * for an output buffer that cannot take the payload contiguously, where the
+ * encoder flushes between bytes (§5.1.3: a payload run is divisible at any byte).
+ *
+ * Byte-for-byte identical to {@link utf8Write}, unpaired-surrogate rejection
+ * included; it differs only in where the bytes go. `writeString` has already run
+ * {@link utf8Length}, so a string that cannot be encoded was rejected before the
+ * header went out and this walk never meets one.
+ */
+export function utf8WriteSink(text: string, sink: ByteSink): void {
+  const n = text.length;
+  for (let i = 0; i < n; i++) {
+    let c = text.charCodeAt(i);
+    if (c < 0x80) {
+      sink.putByte(c);
+    } else if (c < 0x800) {
+      sink.putByte(0xc0 | (c >> 6));
+      sink.putByte(0x80 | (c & 0x3f));
+    } else if (c >= 0xd800 && c <= 0xdbff) {
+      const c2 = i + 1 < n ? text.charCodeAt(i + 1) : 0;
+      if (c2 >= 0xdc00 && c2 <= 0xdfff) {
+        i++;
+        c = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+        sink.putByte(0xf0 | (c >> 18));
+        sink.putByte(0x80 | ((c >> 12) & 0x3f));
+        sink.putByte(0x80 | ((c >> 6) & 0x3f));
+        sink.putByte(0x80 | (c & 0x3f));
+      } else {
+        throw unpairedSurrogate(i);
+      }
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      throw unpairedSurrogate(i);
+    } else {
+      sink.putByte(0xe0 | (c >> 12));
+      sink.putByte(0x80 | ((c >> 6) & 0x3f));
+      sink.putByte(0x80 | (c & 0x3f));
+    }
+  }
 }

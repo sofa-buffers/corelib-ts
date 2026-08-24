@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { OStream, decode, type Visitor } from "../src/index.js";
+import { OStream, decode, type Visitor, growingOStream } from "../src/index.js";
 
 function everyKind(os: OStream): void {
   os.writeUnsigned(1, 7);
@@ -26,13 +26,13 @@ function everyKind(os: OStream): void {
 
 describe("visitor defaults", () => {
   it("a no-op visitor silently drops every field kind", () => {
-    const os = new OStream();
+    const os = growingOStream();
     everyKind(os);
     expect(() => decode(os.bytes(), {})).not.toThrow();
   });
 
   it("a partial visitor sees only the methods it defines", () => {
-    const os = new OStream();
+    const os = growingOStream();
     everyKind(os);
 
     const seen: string[] = [];

@@ -140,7 +140,9 @@ describe("array elements are range-checked on the streaming path too", () => {
 
   it("accepts the domain boundaries on that same path", () => {
     const flushed: number[] = [];
-    const os = new OStream(new Uint8Array(4), 0, (c) => flushed.push(...c));
+    const os = new OStream(new Uint8Array(4), 0, (buf, start, end) => {
+      for (let i = start; i < end; i++) flushed.push(buf[i]!);
+    });
     os.writeUnsignedArray(1, [0n, 0xffff_ffff_ffff_ffffn]);
     os.writeSignedArray(2, [-(1n << 63n), (1n << 63n) - 1n]);
     os.flush();

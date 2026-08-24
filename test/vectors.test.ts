@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { OStream, decode } from "../src/index.js";
+import { OStream, decode, growingOStream } from "../src/index.js";
 import { bytesToHex, hexToBytes } from "./helpers/hex.js";
 import { TranscodeVisitor } from "./helpers/recording-visitor.js";
 import { encodeFields, loadVectors } from "./helpers/vectors.js";
@@ -22,7 +22,7 @@ describe("conformance vectors", () => {
 
   describe.each(vectors.map((v) => [v.name, v] as const))("%s", (_name, vector) => {
     it("encodes to the reference bytes", () => {
-      const os = new OStream();
+      const os = growingOStream();
       encodeFields(os, vector.fields);
       expect(bytesToHex(os.bytes())).toBe(vector.serialized.hex);
     });
@@ -43,7 +43,7 @@ describe("conformance vectors", () => {
     });
 
     it("decodes and round-trips back to the reference bytes", () => {
-      const out = new OStream();
+      const out = growingOStream();
       decode(hexToBytes(vector.serialized.hex), new TranscodeVisitor(out));
       expect(bytesToHex(out.bytes())).toBe(vector.serialized.hex);
     });

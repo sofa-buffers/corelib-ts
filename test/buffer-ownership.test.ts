@@ -50,9 +50,9 @@ function collect(): { sink: FlushSink; bytes: () => Uint8Array; stores: ArrayBuf
   const acc: number[] = [];
   const stores: ArrayBufferLike[] = [];
   return {
-    sink: (c) => {
-      if (stores[stores.length - 1] !== c.buffer) stores.push(c.buffer);
-      for (let i = 0; i < c.length; i++) acc.push(c[i]!);
+    sink: (buf, start, end) => {
+      if (stores[stores.length - 1] !== buf.buffer) stores.push(buf.buffer);
+      for (let i = start; i < end; i++) acc.push(buf[i]!);
     },
     bytes: () => Uint8Array.from(acc),
     stores,
@@ -125,7 +125,7 @@ describe("output-buffer ownership (§5.1)", () => {
     // Kept as a deprecated alias for one release (corelib-ts#108). It is the
     // caller-role accumulator — an owned buffer, hence no BUFFER_FULL and no
     // foreign hand-over — not a second ownership model inside OStream.
-    const os = new OStream();
+    const os = growingOStream();
     write(os);
     expect(os.bytes()).toEqual(reference());
     expect(codeOf(() => os.setBuffer(new Uint8Array(64)))).toBe(SofabErrorCode.Argument);

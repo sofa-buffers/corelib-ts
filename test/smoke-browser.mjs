@@ -63,7 +63,9 @@ if (failures === 0) {
     const got = {};
     decode(bytes, {
       unsigned(id, v) { got[id] = v; },
-      string(id, total, offset, chunk) { got[id] = new TextDecoder().decode(chunk.slice()); },
+      string(id, total, offset, src, start, end) {
+        got[id] = new TextDecoder().decode(src.slice(start, end));
+      },
     });
     return got[1] === 42 && got[2] === 2n ** 60n && got[3] === "sofa🛋";
   })()`, sandbox);

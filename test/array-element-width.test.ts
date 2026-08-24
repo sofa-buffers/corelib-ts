@@ -1,70 +1,113 @@
 /**
  * An array element outside its declared width is rejected AT THAT ELEMENT.
  *
- * CORELIB_PLAN §5.2 makes INVALID dominate INCOMPLETE: once the bytes seen so
+ * CORELIB_PLAN §5.2.3 makes INVALID dominate INCOMPLETE: once the bytes seen so
  * far are already malformed, running out of input cannot downgrade the verdict.
  * An element carrying a value wider than the field's declared type is fully
  * established by that element, so truncating the message immediately after it
- * must still be INVALID — which only holds if the bound is applied during the
- * read rather than to the assembled array (generator#267).
+ * must still be INVALID (generator#267).
+ *
+ * The declared width is **schema** knowledge, and the corelib never learns a
+ * schema (§6.2.1) — so what is tested here is the property the corelib owes the
+ * generated layer that does know it: **elements are delivered as they arrive**,
+ * one call per element, before the decoder discovers that the array is truncated.
+ * A visitor can therefore reject at the element, and its verdict wins.
  */
 
 import { describe, expect, it } from "vitest";
-import { Cursor, OStream, SofabError, SofabErrorCode } from "../src/index.js";
+import {
+  SofabError,
+  SofabErrorCode,
+  decode,
+  growingOStream,
+  type Visitor,
+} from "../src/index.js";
 
 function arrayBytes(id: number, values: number[], signed: boolean): Uint8Array {
-  const os = new OStream();
+  const os = growingOStream();
   if (signed) os.writeSignedArray(id, values);
   else os.writeUnsignedArray(id, values);
   return os.bytes().slice();
 }
 
-function read(bytes: Uint8Array, signed: boolean, count?: number, min?: number, max?: number) {
-  const c = new Cursor(bytes);
-  c.readHeader();
-  return signed ? c.readSignedArray(count, min, max) : c.readUnsignedArray(count, max);
+/**
+ * A generated-layer stand-in: it knows the declared element range and rejects an
+ * element outside it, exactly where the element is handed over.
+ */
+function widthChecked(
+  out: (number | bigint)[],
+  min?: number,
+  max?: number,
+): Visitor {
+  const check = (v: number | bigint): void => {
+    const n = typeof v === "bigint" ? v : BigInt(v);
+    if ((min !== undefined && n < BigInt(min)) || (max !== undefined && n > BigInt(max))) {
+      throw new SofabError(
+        SofabErrorCode.InvalidMsg,
+        `element ${v} outside the declared width`,
+      );
+    }
+    out.push(v);
+  };
+  return {
+    arrayUnsigned: (_id, _i, v) => check(v),
+    arraySigned: (_id, _i, v) => check(v),
+  };
+}
+
+/** Decode `bytes`, bounding elements to `[min, max]`; returns the elements read. */
+function read(
+  bytes: Uint8Array,
+  min?: number,
+  max?: number,
+): (number | bigint)[] {
+  const out: (number | bigint)[] = [];
+  decode(bytes, widthChecked(out, min, max));
+  return out;
+}
+
+/** The `SofabError` code `fn` throws, or `undefined` if it does not throw. */
+function code(fn: () => void): unknown {
+  try {
+    fn();
+  } catch (e) {
+    return (e as SofabError).code;
+  }
+  return undefined;
 }
 
 describe("array element width bound", () => {
   it("accepts elements inside the declared width", () => {
-    expect(read(arrayBytes(1, [0, 127, 255], false), false, 5, undefined, 255)).toEqual([0, 127, 255]);
-    expect(read(arrayBytes(1, [-128, 0, 127], true), true, 5, -128, 127)).toEqual([-128, 0, 127]);
+    expect(read(arrayBytes(1, [0, 127, 255], false), undefined, 255)).toEqual([0, 127, 255]);
+    expect(read(arrayBytes(1, [-128, 0, 127], true), -128, 127)).toEqual([-128, 0, 127]);
   });
 
   it("rejects an unsigned element above the declared width", () => {
-    expect(() => read(arrayBytes(1, [1, 300], false), false, 5, undefined, 255))
-      .toThrow(SofabError);
+    expect(() => read(arrayBytes(1, [1, 300], false), undefined, 255)).toThrow(SofabError);
   });
 
   it("rejects a signed element outside the declared width", () => {
-    expect(() => read(arrayBytes(1, [1, 300], true), true, 5, -128, 127)).toThrow(SofabError);
-    expect(() => read(arrayBytes(1, [1, -300], true), true, 5, -128, 127)).toThrow(SofabError);
+    expect(() => read(arrayBytes(1, [1, 300], true), -128, 127)).toThrow(SofabError);
+    expect(() => read(arrayBytes(1, [1, -300], true), -128, 127)).toThrow(SofabError);
   });
 
   it("stays INVALID when the message is truncated right after the bad element", () => {
     // The case the timing is about: cut the array short after the offending
-    // element. Reading the whole array first would raise INCOMPLETE and lose the
-    // INVALID verdict §5.2 requires.
+    // element. A decoder that assembled the whole array before handing anything
+    // over would raise INCOMPLETE and lose the INVALID verdict §5.2.3 requires.
     const whole = arrayBytes(1, [300, 1], true);
     const cut = whole.subarray(0, whole.length - 1);
-    let code: unknown;
-    try {
-      read(cut, true, 5, -128, 127);
-    } catch (e) {
-      code = (e as SofabError).code;
-    }
-    expect(code).toBe(SofabErrorCode.InvalidMsg);
+    expect(code(() => read(cut, -128, 127))).toBe(SofabErrorCode.InvalidMsg);
   });
 
   it("leaves an unbounded array alone", () => {
-    expect(read(arrayBytes(1, [1, 300], false), false)).toEqual([1, 300]);
+    expect(read(arrayBytes(1, [1, 300], false))).toEqual([1, 300]);
   });
 
   // corelib-ts#99. The truncation above cuts one byte off, which leaves
-  // `count <= remaining` — so it never reached the guard that used to decide the
-  // outcome from the count word alone. These cut deeper, to where the declared
-  // count is larger than the bytes that remain: exactly the case in which the
-  // reader used to report INCOMPLETE without examining a single element.
+  // `count <= remaining`. These cut deeper, to where the declared count is larger
+  // than the bytes that remain: the case in which a reader that decided from the
+  // count word alone reported INCOMPLETE without examining a single element.
   describe("a count larger than the bytes left still lets the elements decide", () => {
     // id 1, signed array, count 5, one element = zigzag(5208) = 10416, end.
     // Crucible's width_elem_trunc.bin, without its enclosing sequence.
@@ -74,43 +117,27 @@ describe("array element width bound", () => {
     // ordering fix rather than a blanket reject.
     const inRange = Uint8Array.from([(1 << 3) | 4, 5, 0x02]);
 
-    function code(bytes: Uint8Array): unknown {
-      try {
-        read(bytes, true, 5, -128, 127);
-      } catch (e) {
-        return (e as SofabError).code;
-      }
-      return undefined;
-    }
-
     it("is INVALID when an element already breaches its declared width", () => {
-      expect(code(overWide)).toBe(SofabErrorCode.InvalidMsg);
+      expect(code(() => read(overWide, -128, 127))).toBe(SofabErrorCode.InvalidMsg);
     });
 
     it("is INCOMPLETE when every element in hand is in range", () => {
-      expect(code(inRange)).toBe(SofabErrorCode.Incomplete);
+      expect(code(() => read(inRange, -128, 127))).toBe(SofabErrorCode.Incomplete);
     });
 
     it("is INCOMPLETE when there is no bound to breach", () => {
-      const c = new Cursor(overWide);
-      c.readHeader();
-      let got: unknown;
-      try {
-        c.readSignedArray();
-      } catch (e) {
-        got = (e as SofabError).code;
-      }
-      expect(got).toBe(SofabErrorCode.Incomplete);
+      expect(code(() => read(overWide))).toBe(SofabErrorCode.Incomplete);
     });
 
-    it("still never sizes the destination from the count", () => {
-      // corelib-ts#38's protection, restated as the property it needs rather
-      // than as the rejection it was implemented as: a declared count of ~16
-      // million against five bytes of input must not allocate 16 million slots.
-      // Dropping the guard without capping the allocation would.
+    it("never sizes anything from the count", () => {
+      // corelib-ts#38's protection, restated as the property it needs: a declared
+      // count of ~16 million against five bytes of input must allocate nothing at
+      // all — which is now the general rule (§6.6), not an array special case.
+      // 0x80 0x80 0x80 0x08 = 16,777,216 elements — above the port's default
+      // receiver cap, so the caps are opened to the format ceiling here: what is
+      // on trial is that nothing is *sized* from the count, not that a cap fires.
       const hostile = Uint8Array.from([(1 << 3) | 4, 0x80, 0x80, 0x80, 0x08]);
-      const c = new Cursor(hostile);
-      c.readHeader();
+      const wideOpen = { maxArrayCount: 0x7fff_ffff };
       let biggest = 0;
       const saved = globalThis.Array;
       const spy = new Proxy(saved, {
@@ -119,16 +146,16 @@ describe("array element width bound", () => {
           return Reflect.construct(t, a) as unknown[];
         },
       });
-      let err: unknown;
       (globalThis as { Array: unknown }).Array = spy;
+      let err: unknown;
       try {
-        c.readSignedArray();
+        decode(hostile, {}, wideOpen);
       } catch (e) {
         err = e;
       } finally {
         (globalThis as { Array: unknown }).Array = saved;
       }
-      expect(biggest).toBeLessThanOrEqual(hostile.length);
+      expect(biggest).toBe(0);
       expect(err).toBeInstanceOf(SofabError);
       expect((err as SofabError).code).toBe(SofabErrorCode.Incomplete);
     });

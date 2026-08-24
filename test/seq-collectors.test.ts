@@ -29,8 +29,7 @@ import {
   SofabErrorCode,
   StringSeq,
   decode,
-  type Visitor,
-} from "../src/index.js";
+  type Visitor, growingOStream } from "../src/index.js";
 
 /** The array field's own id in the enclosing scope. */
 const ARRAY_ID = 7;
@@ -40,34 +39,68 @@ const NONE = -1;
 
 /** Wrap `body` — the elements — in the array's wrapper sequence. */
 function wrapper(body: (os: OStream) => void): Uint8Array {
-  const os = new OStream();
+  const os = growingOStream();
   os.writeSequenceBeginLazy(ARRAY_ID);
   body(os);
   os.writeSequenceEndKeep();
   return os.bytes().slice();
 }
 
+/**
+ * The flat-visitor wiring generated code emits around a collector: it knows from
+ * the schema which scope is the wrapper array, tracks whether it is inside it, and
+ * forwards the two element events (§5.3.1 — one visitor, routed by id and depth).
+ */
+function router(
+  seq: { begin: StringSeq["begin"]; element: StringSeq["element"] },
+  kind: FixlenSubtype,
+): Visitor {
+  let inArray = false;
+  const piece = (
+    id: number,
+    total: number,
+    offset: number,
+    src: Uint8Array,
+    start: number,
+    end: number,
+  ): void => {
+    if (inArray) seq.element(id, total, offset, src, start, end);
+  };
+  return {
+    sequenceBegin: (id) => {
+      // A scope *inside* the wrapper is not an element — a string/blob array has
+      // no nested scope of its own, so an unknown one is declined whole (§7.3
+      // forward compatibility). Declining it means nothing in it is reported, so
+      // the router needs no depth counter of its own.
+      if (inArray) return false;
+      if (id === ARRAY_ID) inArray = true;
+      return undefined;
+    },
+    sequenceEnd: (id) => {
+      if (id === ARRAY_ID) inArray = false;
+    },
+    fixlenBegin: (id, subtype, total) => {
+      // `begin` ignores a subtype that is not its own (§7.3), and so does the
+      // routing: an element of the wrong kind is a field this array never had.
+      if (inArray) seq.begin(id, subtype, total);
+    },
+    ...(kind === FixlenSubtype.String ? { string: piece } : { blob: piece }),
+  };
+}
+
 /** Decode `wire` with a {@link StringSeq} bound to the wrapper, returning the elements. */
 function strings(wire: Uint8Array, cap = NONE, elemMax = NONE): string[] {
   const out: string[] = [];
-  const acc = new PayloadAcc();
-  const root: Visitor = {
-    sequenceBegin: (id) =>
-      id === ARRAY_ID ? new StringSeq(out, acc, cap, elemMax, "tags") : undefined,
-  };
-  decode(wire, root);
+  const seq = new StringSeq(out, new PayloadAcc(), cap, elemMax, "tags");
+  decode(wire, router(seq, FixlenSubtype.String));
   return out;
 }
 
 /** The {@link BlobSeq} twin of {@link strings}. */
 function blobs(wire: Uint8Array, cap = NONE, elemMax = NONE): Uint8Array[] {
   const out: Uint8Array[] = [];
-  const acc = new PayloadAcc();
-  const root: Visitor = {
-    sequenceBegin: (id) =>
-      id === ARRAY_ID ? new BlobSeq(out, acc, cap, elemMax, "chunks") : undefined,
-  };
-  decode(wire, root);
+  const seq = new BlobSeq(out, new PayloadAcc(), cap, elemMax, "chunks");
+  decode(wire, router(seq, FixlenSubtype.Blob));
   return out;
 }
 
@@ -125,13 +158,10 @@ describe("StringSeq places elements the way §5.1 requires", () => {
       os.writeString(1, "short");
     });
     const out: string[] = [];
-    const acc = new PayloadAcc();
-    const is = new IStream();
-    const root: Visitor = {
-      sequenceBegin: (id) => (id === ARRAY_ID ? new StringSeq(out, acc, NONE, NONE, "tags") : undefined),
-    };
+    const seq = new StringSeq(out, new PayloadAcc(), NONE, NONE, "tags");
+    const is = new IStream(router(seq, FixlenSubtype.String));
     let st: DecodeStatus = DecodeStatus.Complete;
-    for (let i = 0; i < wire.length; i++) st = is.feed(wire.subarray(i, i + 1), root);
+    for (let i = 0; i < wire.length; i++) st = is.feed(wire.subarray(i, i + 1));
     expect(st).toBe(DecodeStatus.Complete);
     expect(out).toStrictEqual(["a payload longer than any single fed chunk", "short"]);
   });
@@ -159,28 +189,24 @@ describe("BlobSeq places elements the same way, and copies them", () => {
       os.writeBlob(1, Uint8Array.of(0xff));
     });
     const out: Uint8Array[] = [];
-    const acc = new PayloadAcc();
-    const is = new IStream();
-    const root: Visitor = {
-      sequenceBegin: (id) => (id === ARRAY_ID ? new BlobSeq(out, acc, NONE, NONE, "chunks") : undefined),
-    };
+    const seq = new BlobSeq(out, new PayloadAcc(), NONE, NONE, "chunks");
+    const is = new IStream(router(seq, FixlenSubtype.Blob));
     let st: DecodeStatus = DecodeStatus.Complete;
-    for (let i = 0; i < wire.length; i++) st = is.feed(wire.subarray(i, i + 1), root);
+    for (let i = 0; i < wire.length; i++) st = is.feed(wire.subarray(i, i + 1));
     expect(st).toBe(DecodeStatus.Complete);
     expect(out.map((b) => [...b])).toStrictEqual([[...big], [0xff]]);
   });
 
   it("copies out of the fed chunk, so a reused buffer cannot rot an element", () => {
-    // The difference from StringSeq: decoding already produces a value, while a
-    // blob would otherwise be a view into memory the caller may reuse (§6).
+    // What §6.7 requires of the whole path: the element is storage of its own, so
+    // reusing the fed buffer afterwards cannot reach it. (PayloadAcc copies even a
+    // payload that arrived whole, which is where that becomes true.)
     const wire = wrapper((os) => os.writeBlob(0, Uint8Array.of(9, 8, 7)));
     const scratch = wire.slice();
     const out: Uint8Array[] = [];
-    const acc = new PayloadAcc();
-    const is = new IStream();
-    is.feed(scratch, {
-      sequenceBegin: (id) => (id === ARRAY_ID ? new BlobSeq(out, acc, NONE, NONE, "chunks") : undefined),
-    });
+    const seq = new BlobSeq(out, new PayloadAcc(), NONE, NONE, "chunks");
+    const is = new IStream(router(seq, FixlenSubtype.Blob));
+    is.feed(scratch);
     scratch.fill(0xee);
     expect([...out[0]!]).toStrictEqual([9, 8, 7]);
   });
@@ -210,13 +236,9 @@ describe("the schema bounds bind, and bind early (§7.1, §5.2)", () => {
     const wire = wrapper((os) => os.writeString(0, "far too long"));
     const truncated = wire.subarray(0, wire.length - 12);
     const out: string[] = [];
-    const acc = new PayloadAcc();
-    const is = new IStream();
-    expectInvalid(() =>
-      is.feed(truncated, {
-        sequenceBegin: (id) => (id === ARRAY_ID ? new StringSeq(out, acc, NONE, 4, "tags") : undefined),
-      }),
-    );
+    const seq = new StringSeq(out, new PayloadAcc(), NONE, 4, "tags");
+    const is = new IStream(router(seq, FixlenSubtype.String));
+    expectInvalid(() => is.feed(truncated));
     expect(out).toStrictEqual([]);
   });
 
@@ -231,8 +253,8 @@ describe("the schema bounds bind, and bind early (§7.1, §5.2)", () => {
     // produce this, and the point is exactly that the guard runs before the work.
     const out: string[] = [];
     const seq = new StringSeq(out, new PayloadAcc(), 4, NONE, "tags");
-    expectInvalid(() => seq.string(2 ** 31 - 1, 1, 0, Uint8Array.of(0x41)));
-    expectInvalid(() => seq.fixlenBegin(2 ** 31 - 1, FixlenSubtype.String, 1));
+    expectInvalid(() => seq.element(2 ** 31 - 1, 1, 0, Uint8Array.of(0x41), 0, 1));
+    expectInvalid(() => seq.begin(2 ** 31 - 1, FixlenSubtype.String, 1));
     expect(out).toStrictEqual([]);
   });
 
@@ -242,6 +264,73 @@ describe("the schema bounds bind, and bind early (§7.1, §5.2)", () => {
     expect(err.message).toContain("chunks");
     const long = wrapper((os) => os.writeBlob(0, Uint8Array.of(1, 2, 3)));
     expectInvalid(() => blobs(long, NONE, 2));
+  });
+});
+
+describe("a wrapper array the schema left unbounded is bounded by the receiver (§6.2.1)", () => {
+  // §7.2 item 8: a sequence array announces no count, so the element **index** is
+  // the only place a receiver can bound it — and "unbounded by the schema is still
+  // bounded by the receiver" has no exception for the one array shape that carries
+  // no count word. Exceeding it is LIMIT_EXCEEDED (capacity), not INVALID (validity).
+  const cap = 4;
+
+  /** `strings` / `blobs`, with the schema bound left off and a receiver cap set. */
+  function underCap(wire: Uint8Array): string[] {
+    const out: string[] = [];
+    const seq = new StringSeq(out, new PayloadAcc(), NONE, NONE, "tags", cap);
+    decode(wire, router(seq, FixlenSubtype.String));
+    return out;
+  }
+
+  it("accepts the last index the cap allows", () => {
+    expect(underCap(wrapper((os) => os.writeString(cap - 1, "in")))).toHaveLength(cap);
+  });
+
+  it("rejects the next one as LIMIT_EXCEEDED, not INVALID_MSG", () => {
+    const over = wrapper((os) => os.writeString(cap, "out"));
+    try {
+      underCap(over);
+      expect.unreachable("the receiver cap should have fired");
+    } catch (e) {
+      expect(e).toBeInstanceOf(SofabError);
+      expect((e as SofabError).code).toBe(SofabErrorCode.LimitExceeded);
+    }
+  });
+
+  it("extends nothing when it rejects, so a later lower index still lands", () => {
+    const out: string[] = [];
+    const seq = new StringSeq(out, new PayloadAcc(), NONE, NONE, "tags", cap);
+    expect(() => seq.element(cap, 1, 0, Uint8Array.of(0x41), 0, 1)).toThrow(SofabError);
+    expect(out).toStrictEqual([]);
+    seq.element(1, 1, 0, Uint8Array.of(0x42), 0, 1);
+    expect(out).toStrictEqual(["", "B"]);
+  });
+
+  it("bounds a blob array the same way", () => {
+    const out: Uint8Array[] = [];
+    const seq = new BlobSeq(out, new PayloadAcc(), NONE, NONE, "chunks", cap);
+    const over = wrapper((os) => os.writeBlob(cap, Uint8Array.of(1)));
+    try {
+      decode(over, router(seq, FixlenSubtype.Blob));
+      expect.unreachable("the receiver cap should have fired");
+    } catch (e) {
+      expect((e as SofabError).code).toBe(SofabErrorCode.LimitExceeded);
+    }
+    expect(out).toStrictEqual([]);
+  });
+
+  it("defers to the schema bound where there is one — INVALID, not the cap", () => {
+    // A schema `count` is a statement about validity and outranks capacity: with
+    // one present the receiver cap is out of the picture for this field entirely.
+    const out: string[] = [];
+    const seq = new StringSeq(out, new PayloadAcc(), 2, NONE, "tags", cap);
+    const over = wrapper((os) => os.writeString(2, "out"));
+    try {
+      decode(over, router(seq, FixlenSubtype.String));
+      expect.unreachable("the schema bound should have fired");
+    } catch (e) {
+      expect((e as SofabError).code).toBe(SofabErrorCode.InvalidMsg);
+    }
   });
 });
 

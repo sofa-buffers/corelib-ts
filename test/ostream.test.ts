@@ -5,14 +5,14 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { FixlenSubtype, type FlushSink, IStream, Long, MAX_DEPTH, OStream, decode } from "../src/index.js";
+import { FixlenSubtype, type FlushSink, IStream, Long, MAX_DEPTH, OStream, decode, growingOStream } from "../src/index.js";
 import { RecordingVisitor } from "./helpers/recording-visitor.js";
 
 function collect(): { sink: FlushSink; bytes: () => Uint8Array } {
   const acc: number[] = [];
   return {
-    sink: (c) => {
-      for (let i = 0; i < c.length; i++) acc.push(c[i]!);
+    sink: (buf, start, end) => {
+      for (let i = start; i < end; i++) acc.push(buf[i]!);
     },
     bytes: () => Uint8Array.from(acc),
   };
@@ -25,7 +25,7 @@ describe("OStream streaming", () => {
     for (let i = 0; i < 200; i++) streamed.writeUnsigned(i, BigInt(i * 1000));
     streamed.flush();
 
-    const mem = new OStream();
+    const mem = growingOStream();
     for (let i = 0; i < 200; i++) mem.writeUnsigned(i, BigInt(i * 1000));
 
     expect(bytes()).toEqual(mem.bytes());
@@ -34,15 +34,15 @@ describe("OStream streaming", () => {
   it("accepts a brand-new buffer mid-stream via setBuffer", () => {
     const { sink, bytes } = collect();
     let swaps = 0;
-    const os = new OStream(new Uint8Array(8), 0, (chunk) => {
-      sink(chunk); // copy out before swapping
+    const os = new OStream(new Uint8Array(8), 0, (buf, start, end) => {
+      sink(buf, start, end); // copy out before swapping
       os.setBuffer(new Uint8Array(8)); // hand the encoder a fresh buffer each drain
       swaps++;
     });
     for (let i = 0; i < 200; i++) os.writeUnsigned(i, BigInt(i * 1000));
     os.flush();
 
-    const mem = new OStream();
+    const mem = growingOStream();
     for (let i = 0; i < 200; i++) mem.writeUnsigned(i, BigInt(i * 1000));
 
     expect(bytes()).toEqual(mem.bytes());
@@ -67,7 +67,7 @@ describe("OStream streaming", () => {
     build(streamed);
     streamed.flush();
 
-    const mem = new OStream();
+    const mem = growingOStream();
     build(mem);
 
     expect(bytes()).toEqual(mem.bytes());
@@ -95,7 +95,7 @@ describe("OStream streaming", () => {
     build(streamed);
     streamed.flush();
 
-    const mem = new OStream();
+    const mem = growingOStream();
     build(mem);
 
     expect(bytes()).toEqual(mem.bytes());
@@ -127,7 +127,7 @@ describe("OStream streaming", () => {
   });
 
   it("flush() is a no-op without a sink", () => {
-    const os = new OStream();
+    const os = growingOStream();
     os.writeUnsigned(1, 1);
     const before = os.bytesUsed;
     os.flush();
@@ -137,23 +137,23 @@ describe("OStream streaming", () => {
 
 describe("OStream input flexibility", () => {
   it("accepts number and bigint interchangeably", () => {
-    const a = new OStream();
+    const a = growingOStream();
     a.writeUnsigned(1, 42);
-    const b = new OStream();
+    const b = growingOStream();
     b.writeUnsigned(1, 42n);
     expect(a.bytes()).toEqual(b.bytes());
   });
 
   it("accepts typed arrays for array writers", () => {
-    const a = new OStream();
+    const a = growingOStream();
     a.writeUnsignedArray(1, new BigUint64Array([1n, 2n, 3n]));
-    const b = new OStream();
+    const b = growingOStream();
     b.writeUnsignedArray(1, [1n, 2n, 3n]);
     expect(a.bytes()).toEqual(b.bytes());
 
-    const c = new OStream();
+    const c = growingOStream();
     c.writeFp64Array(2, new Float64Array([1.5, 2.5]));
-    const d = new OStream();
+    const d = growingOStream();
     d.writeFp64Array(2, [1.5, 2.5]);
     expect(c.bytes()).toEqual(d.bytes());
   });
@@ -169,9 +169,9 @@ describe("OStream input flexibility", () => {
     os.flush();
 
     const seen = new RecordingVisitor();
-    const is = new IStream();
-    is.feed(bytes(), seen);
-    is.end();
+    const is = new IStream(seen);
+    is.feed(bytes());
+    is.status();
     expect(seen.events.map((e) => e.kind)).toEqual([
       "unsigned",
       "string",
@@ -205,7 +205,7 @@ describe("OStream writeString UTF-8", () => {
 
   it("in-memory fast path matches the TextEncoder streaming path", () => {
     for (const s of cases) {
-      const fast = new OStream();
+      const fast = growingOStream();
       fast.writeString(0, s);
 
       const streamed = new OStream(new Uint8Array(8192), 0);
@@ -218,12 +218,12 @@ describe("OStream writeString UTF-8", () => {
   it("round-trips every string through the decoder", () => {
     const dec = new TextDecoder();
     for (const s of cases) {
-      const os = new OStream();
+      const os = growingOStream();
       os.writeString(0, s);
       let got: string | undefined;
       decode(os.bytes(), {
-        string: (_id, _total, _offset, chunk) => {
-          got = dec.decode(chunk);
+        string: (_id, _total, _offset, src, start, end) => {
+          got = dec.decode(src.subarray(start, end));
         },
       });
       // Every case is valid UTF-8, so it round-trips unchanged.
@@ -239,10 +239,10 @@ describe("OStream reset", () => {
   };
 
   it("rewinds so one pooled encoder reproduces fresh encodes", () => {
-    const pooled = new OStream();
+    const pooled = growingOStream();
 
     write(pooled, 1);
-    const fresh1 = new OStream();
+    const fresh1 = growingOStream();
     write(fresh1, 1);
     expect(pooled.bytes()).toEqual(fresh1.bytes());
 
@@ -250,13 +250,13 @@ describe("OStream reset", () => {
     expect(pooled.bytesUsed).toBe(0);
 
     write(pooled, 5);
-    const fresh2 = new OStream();
+    const fresh2 = growingOStream();
     write(fresh2, 5);
     expect(pooled.bytes()).toEqual(fresh2.bytes());
   });
 
   it("clears nesting depth left by an aborted encode", () => {
-    const os = new OStream();
+    const os = growingOStream();
     // Abort mid-message with an unbalanced sequence, leaving depth > 0.
     os.writeUnsigned(1, 7);
     os.writeSequenceBeginLazy(2);
@@ -269,7 +269,7 @@ describe("OStream reset", () => {
     os.writeSigned(1, -9);
     os.writeSequenceEnd();
 
-    const fresh = new OStream();
+    const fresh = growingOStream();
     fresh.writeUnsigned(1, 7);
     fresh.writeSequenceBeginLazy(2);
     fresh.writeSigned(1, -9);
@@ -288,7 +288,7 @@ describe("OStream reset", () => {
   });
 
   it("drops a held-back sequence header left by an aborted encode", () => {
-    const os = new OStream();
+    const os = growingOStream();
     // Abort with a sequence opened but never closed: its header is pending
     // encoder state, not buffer content, so `pos = start` alone would not clear
     // it and the *next* message would inherit a phantom `begin`.
@@ -305,7 +305,7 @@ describe("OStream reset", () => {
 describe("OStream lazy sequence framing", () => {
   /** Encode with an in-memory stream and return a plain byte array. */
   function enc(body: (os: OStream) => void): number[] {
-    const os = new OStream();
+    const os = growingOStream();
     body(os);
     return Array.from(os.bytes());
   }
@@ -416,14 +416,14 @@ describe("OStream lazy sequence framing", () => {
 
     const { sink, bytes } = collect();
     let flushes = 0;
-    const streamed = new OStream(new Uint8Array(4), 0, (chunk) => {
+    const streamed = new OStream(new Uint8Array(4), 0, (buf, start, end) => {
       flushes++;
-      sink(chunk);
+      sink(buf, start, end);
     });
     body(streamed);
     streamed.flush();
 
-    const mem = new OStream();
+    const mem = growingOStream();
     body(mem);
 
     expect(flushes).toBeGreaterThan(10); // the buffer really did drain, repeatedly
@@ -554,7 +554,7 @@ describe("OStream lazy sequence framing", () => {
     // frame so the array's length (highest present id + 1, §5.1) survives; an
     // all-default field vanishes. Here row id 1 is all-default and the array
     // must still decode as length 2.
-    const os = new OStream();
+    const os = growingOStream();
     os.writeSequenceBeginLazy(3); // the wrapper array
     os.writeSequenceBeginLazy(0); // element 0: has content
     os.writeUnsigned(0, 7);

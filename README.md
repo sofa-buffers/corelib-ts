@@ -22,9 +22,9 @@ JavaScript does (Node.js, browsers, Electron, Deno, Bun, a `<script>` tag).
 
 Like protobuf's `CodedInputStream` / `CodedOutputStream`, it is meant to be
 driven by generated code: the `sofabgen` generator emits one class per message
-with `serialize` / `decode` methods that call these primitives. Two decode models
-are offered — a resumable push / visitor decoder for streaming, and a
-monomorphic pull cursor (`Cursor`) driven by a single `switch` over the field id.
+with `serialize` / `decode` methods that call these primitives. Decoding has one
+surface, the **visitor** (CORELIB_PLAN §5.3.1): a resumable push decoder that takes
+chunks of any size and calls one method per field.
 
 ### Requirements
 
@@ -58,11 +58,13 @@ full type declarations.
 | Runs everywhere | Pure TypeScript over `Uint8Array` / `DataView` / `TextEncoder`, no Node built-ins on the hot path. |
 | Streaming **out** | `OStream` writes into a small caller buffer and calls a `FlushSink` when it fills, so a message can exceed the buffer — by any amount, down to a one-byte buffer: a value too large for the buffer is split across flushes. |
 | Streaming **in** | `IStream` is a resumable state machine fed arbitrary chunks; large string / blob payloads arrive in pieces. |
-| Fast whole-buffer decode | With the whole message in one buffer, `decode()` (push) and `Cursor` (pull) advance a single cursor. |
-| Full 64-bit fidelity | Scalars round-trip the entire `uint64` / `int64` range: `number` when exact, `bigint` beyond `2^53-1` (`Long` offers a `bigint`-free path, for scalars and arrays alike). |
-| Generated-code friendly | The pull `Cursor` gives a monomorphic `readHeader()` + typed `read*` loop; the push `Visitor` has all-optional methods. |
+| One decode surface | The visitor, and nothing beside it (§5.3.1). `decode()` is that decoder fed once, so a whole-buffer decode runs the same code and the same rules as a chunked one. |
+| Full 64-bit fidelity | Scalars round-trip the entire `uint64` / `int64` range: `number` when exact, `bigint` beyond `2^53-1`, and every integer callback carries the exact `lo` / `hi` halves beside the value for a `bigint`-free consumer (`Long`). |
+| Generated-code friendly | One flat `Visitor` per message, all methods optional; nesting arrives as `sequenceBegin` / `sequenceEnd` events carrying id and depth, which generated code routes on. |
 | Reserve-offset | `new OStream(buf, offset)` leaves room at the front for a lower-layer header, saving a copy. The offset belongs to that installation and is consumed by the flush that hands the unit over; `setBuffer(buf, offset)` from inside the sink re-arms it, for header room in every packet. |
 | Caller-owned buffers | The encoder allocates no output buffer and grows none: it writes into yours, and asks the `BufferOwner` you named for the next one when it fills. `growingOStream()` is that owner ready-made. |
+| Heap-free codec | After construction the encoder and decoder allocate nothing (§6.6) — no views, no scratch, no growable state — with one recorded exception, under [Memory handling](#memory-handling). Verified two ways: no allocation primitive on a codec path, and a flat heap over a complete encode and decode. |
+| No views | Nothing the decoder hands over aliases anything it owns (§6.7). A payload arrives as a range of the chunk **you** fed, so what you keep, you copied. |
 | Explicit endianness | IEEE-754 values are read / written little-endian via `DataView`, identical on every engine. |
 | Pluggable acceleration | The encoder's bulk array paths run through a swappable `Kernel`, and that interface is the entire seam: `setKernel(yourKernel)`. **No accelerated backend exists today** — the kernel is the pure-TypeScript one on every host unless you build and install your own (native addon or WASM); the library ships no loader for one. |
 
@@ -142,7 +144,11 @@ small buffer whenever it fills, so the buffer never has to be message-sized:
 import { OStream, type FlushSink } from "@sofa-buffers/corelib";
 
 const out: number[] = [];
-const sink: FlushSink = (chunk) => out.push(...chunk); // or socket / file / stream
+// The sink is handed the installed buffer and the region's bounds — never memory
+// from anywhere else (§5.1.6), and never a view the encoder built (§6.6).
+const sink: FlushSink = (buf, start, end) => {         // or socket / file / stream
+  for (let i = start; i < end; i++) out.push(buf[i]!);
+};
 const os = new OStream(new Uint8Array(16), 0, sink);   // tiny 16-byte buffer
 for (let i = 0; i < 1000; i++) os.writeUnsigned(i, BigInt(i));
 os.flush();                                            // push the tail
@@ -202,8 +208,9 @@ buffer produces the same bytes.
 
 ### Deserialize
 
-`decode()` walks a whole buffer and calls one optional `Visitor` method per field;
-unhandled fields are silently skipped:
+`decode()` walks a whole buffer and calls one optional `Visitor` method per field; a
+field whose callback you did not implement is skipped. The visitor is **flat**: one
+object receives the whole message, nested scopes included.
 
 ```ts
 import { decode, type Visitor } from "@sofa-buffers/corelib";
@@ -219,13 +226,15 @@ class My implements Visitor {
 decode(bytes, new My());
 ```
 
+There are exactly two things to do with a field — **read** it or **skip** it
+(§6.7.2) — and not implementing a callback is how you say the second.
+
 `fieldBegin(id, wire)` is announced first for every field — right after the header
 varint, before the value and before the value's *own* header word (a fixlen length
-word, an array count word, a nested sequence's fields). It is the push twin of
-`Cursor.readHeader()`, and gives a reader the field stream in wire order without
-writing the eight value callbacks. The sequence-*end* marker gets none: it closes
-a scope rather than opening a field, the same answer `readHeader()` gives by
-returning `false` for it.
+word, an array count word, a nested sequence's fields). It gives a reader the field
+stream in wire order without writing the eight value callbacks. The sequence-*end*
+marker gets none: it closes a scope rather than opening a field, and its id is
+discarded (§4.9).
 
 **Do not apply a schema bound from it.** An element id past the declared `count`
 looks decidable from the id alone, and is not: that bound applies only to a field
@@ -237,40 +246,51 @@ Everything schema-shaped stays on the later, more informative hook: a fixlen
 subtype and a declared length on `fixlenBegin`, a declared element count on
 `arrayBegin`.
 
-`sequenceBegin(id)` has three answers. Return a visitor and the nested scope's
-fields go to it; return **`null`** and the whole subtree is skipped — no callback
-of any kind fires inside it, a scope opened within it is skipped too without
-being offered, and no `sequenceEnd` arrives for what was skipped. Return nothing
-and the current visitor keeps receiving, which merges two id spaces (a nested
-scope's ids are its own) and is rarely what you want.
+`sequenceBegin(id, depth)` opens a nested scope and `sequenceEnd(id, depth)` closes
+it — the same visitor receives the scope's fields, with their own ids and
+`depth + 1`. Route on the `(id, depth)` pair, which a schema fixes statically:
 
-A skipped subtree is still parsed — a sequence is framed by markers rather than
-by a length, so its end has to be found — but nothing is decoded into existence
-for it: no payload views, no boxed values, and the caps in `DecodeLimits` do not
-fire. Format ceilings (`ARRAY_MAX`, `FIXLEN_MAX`, `MAX_DEPTH`, the varint bound)
-apply inside a skipped subtree exactly as outside it.
+```ts
+let inChild = false;
+const v: Visitor = {
+  sequenceBegin: (id, depth) => { if (id === 3 && depth === 1) inChild = true; },
+  sequenceEnd:   (id, depth) => { if (id === 3 && depth === 1) inChild = false; },
+  unsigned: (id, value) => { /* `inChild` says which scope this id belongs to */ },
+};
+```
+
+Return **`false`** from `sequenceBegin` to decline the whole subtree: no callback of
+any kind fires inside it, a scope opened within it is never offered either, and no
+`sequenceEnd` arrives for what was declined.
+
+A declined subtree is still parsed — a sequence is framed by markers rather than by
+a length, so its end has to be found — but nothing is decoded into existence for
+it, and the caps in `DecodeLimits` do not fire. Format ceilings (`ARRAY_MAX`,
+`FIXLEN_MAX`, `MAX_DEPTH`, the varint bound) apply inside a declined subtree exactly
+as outside it.
 
 ### Deserialize stream
 
 `IStream` resumes across chunk boundaries: feed it whatever the transport hands
 you and read the outcome from what `feed()` **returns**, the three-valued status
-for the bytes consumed so far. There is no end / finalize step. String / blob
-payloads arrive as one or more chunks tagged with the field's `total` length and
-byte `offset`:
+for the bytes consumed so far. There is no end / finalize step. The visitor is bound
+at construction. String / blob payloads arrive in one or more pieces, each a range
+`[start, end)` of the chunk **you** fed, tagged with the field's `total` length and
+the piece's `offset` within it:
 
 ```ts
 import { IStream, DecodeStatus, type Visitor } from "@sofa-buffers/corelib";
 
 const visitor: Visitor = {
-  blob(id, total, offset, chunk) {
-    /* append `chunk` at `offset`; the field is `total` bytes */
+  blob(id, total, offset, src, start, end) {
+    /* copy `src[start..end)` to `offset` of a `total`-byte destination of yours */
   },
 };
 
-const is = new IStream();
+const is = new IStream(visitor);
 let status = DecodeStatus.Complete;               // zero bytes end on a boundary
 for await (const chunk of source) {
-  status = is.feed(chunk, visitor);               // any async byte source
+  status = is.feed(chunk);                        // any async byte source
 }
 // feed() never throws for a merely incomplete decode and never promotes one to
 // an error (MESSAGE_SPEC §7). The caller owns end-of-input.
@@ -280,9 +300,13 @@ if (status !== DecodeStatus.Complete) {
 }
 ```
 
+The chunk is borrowed **only for the duration of `feed`** (§6.0): once it returns
+you may reuse, overwrite or free it, and what you decoded is unaffected — the
+decoder retains nothing that points into it. Copy what you want to keep, during the
+call; `PayloadAcc` and `decodeUtf8` are the ready-made way.
+
 `status()` returns exactly what the last `feed()` returned; it is a pure accessor
-and never changes the verdict. (`end()` is a deprecated alias of it, kept so
-existing code compiles.)
+and never changes the verdict.
 
 `INVALID` is **terminal**, and is the one outcome `feed()` does not return: it
 travels on the error channel, as a thrown `INVALID_MSG`. A stream that has thrown
@@ -293,9 +317,9 @@ well-formed chunks follow:
 ```ts
 import { SofabError, SofabErrorCode } from "@sofa-buffers/corelib";
 
-const is = new IStream();
+const is = new IStream(visitor);
 try {
-  for await (const chunk of source) is.feed(chunk, visitor);
+  for await (const chunk of source) is.feed(chunk);
 } catch (e) {
   if ((e as SofabError).code !== SofabErrorCode.InvalidMsg) throw e;
 }
@@ -309,65 +333,57 @@ A receiver-side cap (`LIMIT_EXCEEDED`, see [Decode limits](#decode-limits)) does
 
 The default 64-bit surface is *number-first*: a value that fits exactly comes
 back as a `number`, and only past `2^53-1` is a `bigint` materialised — so the
-runtime type of a `u64` / `i64` depends on the value. `Long`, a value carried as
-two unsigned 32-bit halves (`.low` / `.high`), is the fixed-type alternative. It
-is **representation-only**: the wire is identical to the `number | bigint` path,
-byte for byte, in both directions.
+runtime type of a `u64` / `i64` depends on the value. `Long`, a value carried as two
+unsigned 32-bit halves (`.low` / `.high`), is the fixed-type alternative on the
+**encode** side. It is **representation-only**: the wire is identical to the
+`number | bigint` path, byte for byte.
 
 ```ts
-import { Long, OStream, Cursor } from "@sofa-buffers/corelib";
+import { Long, growingOStream } from "@sofa-buffers/corelib";
 
-const os = new OStream();
+const os = growingOStream();
 os.writeUnsignedLong(1, Long.fromValue(2n ** 63n));         // scalar
 os.writeSignedLong(2, Long.fromValue(-(2n ** 62n)));
 os.writeUnsignedArrayLong(3, [1n, 2n].map(Long.fromValue)); // array
-
-const c = new Cursor(os.bytes());
-c.readHeader(); const a = c.readUnsignedLong();   // a Long, whatever the value
-c.readHeader(); const b = c.readSignedLong();
-c.readHeader(); const xs = c.readUnsignedArrayLong();
-a.toBigInt();       // materialise only the values you actually need
-b.toBigInt(true);   // `signed` reads the high bit as two's complement
 ```
 
-On the push decoders the same channel is opt-in per visitor:
+On the decode side there is no channel to switch on: **every** integer callback
+carries the exact 64 bits as two unsigned 32-bit halves, beside the number-first
+value. Read whichever you want — the halves cost nothing to pass and nothing to
+ignore, and a `Long` built from them never goes through `bigint` arithmetic:
 
 ```ts
-import { decode, IStream, type LongVisitor } from "@sofa-buffers/corelib";
+import { decode, Long, type Visitor } from "@sofa-buffers/corelib";
 
-const v: LongVisitor = {
-  longs: true,                                  // turns the channel on
-  unsigned(id, value) { /* value: Long */ },
-  signed(id, value)   { /* value: Long */ },
-  arrayUnsigned(id, i, value) { /* value: Long */ },
-  arraySigned(id, i, value)   { /* value: Long */ },
+const v: Visitor = {
+  unsigned(id, value, lo, hi) { const x = Long.fromBits(lo, hi); },
+  signed(id, value, lo, hi)   { /* lo/hi are the decoded two's-complement halves */ },
+  arrayUnsigned(id, i, value, lo, hi) { /* … per element */ },
+  arraySigned(id, i, value, lo, hi)   { /* … */ },
 };
-decode(bytes, v);                               // and new IStream().feed(chunk, v)
+decode(bytes, v);
 ```
 
-The flag is read **once, from the root visitor**, and governs the whole decode: a
-nested scope is driven on the root's channel whatever its own flag says. It is
-not per *field* either — this push surface is driven by wire type alone and never
-learns the schema — so it covers every unsigned / signed field and element in the
-message. Narrowing back is exact:
+Narrowing back is exact:
 `value.low` for `u8`..`u32`, and `value.low | 0` for `i8`..`i32`.
 
 ### Code generator
 
-`sofabgen` compiles a schema to one class per message with a `serialize`
-(chaining `OStream` writes) and **two** decoders: a `static decode` driven by a
-monomorphic pull `Cursor` — one `switch` over `c.id` — for a message already in
-one buffer, and a `static decoder()` bound to `IStream` for one arriving in
-chunks — the same generated type driven whole-buffer or incrementally. A
-hand-written stand-in of both halves, encoded and decoded each way:
+`sofabgen` compiles a schema to one class per message with a `serialize` (chaining
+`OStream` writes) and two decode entry points: a `static decode` for a message
+already in one buffer, and a `static decoder()` bound to `IStream` for one arriving
+in chunks — the same generated type driven whole-buffer or incrementally. Both
+drive the same visitor, because there is only one decode surface (§5.3.1): what
+changes is the drive, not the reader. A hand-written stand-in of both halves,
+encoded and decoded each way:
 
 ```ts
 import {
   OStream,
   growingOStream,
-  Cursor,
   IStream,
   DecodeStatus,
+  decode,
   type FlushSink,
   type Visitor,
 } from "@sofa-buffers/corelib";
@@ -383,7 +399,7 @@ class Point {
   }
 
   static decode(bytes: Uint8Array): Point {
-    return _decodeFromPoint(new Cursor(bytes));
+    return _decodeIntoPoint(bytes, new Point());
   }
 
   /** The streaming half: a reader bound to the corelib's resumable IStream. */
@@ -392,32 +408,22 @@ class Point {
   }
 }
 
-// The cursor-level steps sit beside the class, not on it: CORELIB_PLAN §6.1.1
+// The decode-into step sits beside the class, not on it: CORELIB_PLAN §6.1.1
 // closes the generated object's surface to encode / decode / try_decode /
 // serialize / deserialize / decoder, and `decode_from` / `decode_into` are two of
-// the spellings it names as forbidden. They stay module-private — reachable from
+// the spellings it names as forbidden. It stays module-private — reachable from
 // the sibling classes that decode into one another, and from nowhere else.
-
-function _decodeFromPoint(c: Cursor): Point {
-  return _decodeIntoPoint(c, new Point());
-}
 
 // Decodes into `o`, so a re-opened sequence continues the scope an earlier
 // opening populated (MESSAGE_SPEC §7.4).
-function _decodeIntoPoint(c: Cursor, o: Point): Point {
-  while (c.readHeader()) {
-    switch (c.id) {
-      case 1: o.x = Number(c.readSigned()); break;
-      case 2: o.y = Number(c.readSigned()); break;
-      // case 3: _decodeIntoChild(c, o.child); break;     // nested sequence
-      default: c.skip(c.wire); break;                     // forward-compatible
-    }
-  }
+function _decodeIntoPoint(bytes: Uint8Array, o: Point): Point {
+  decode(bytes, new PointVisitor(o));
   return o;
 }
 
-// generated alongside it: the visitor that fills a Point, one callback per
-// wire type instead of one `case` per id
+// generated alongside it: the visitor that fills a Point — the library's only
+// decode surface (§5.3.1), one callback per wire type instead of one `case` per id.
+// A visitor *is* the decode-into step: it writes into the object it was handed.
 class PointVisitor implements Visitor {
   private readonly out: Point;
   constructor(out: Point) { this.out = out; }
@@ -433,10 +439,9 @@ class PointVisitor implements Visitor {
 // ...and the handle Point.decoder() returns: an IStream plus its destination
 class PointDecoder {
   readonly message = new Point();
-  private readonly is = new IStream();
-  private readonly vis = new PointVisitor(this.message);
+  private readonly is = new IStream(new PointVisitor(this.message));
 
-  feed(chunk: Uint8Array): DecodeStatus { return this.is.feed(chunk, this.vis); }
+  feed(chunk: Uint8Array): DecodeStatus { return this.is.feed(chunk); }
   status(): DecodeStatus { return this.is.status(); }
 }
 
@@ -447,9 +452,11 @@ const os = growingOStream(); p.serialize(os);
 const wire = os.bytes().slice();
 const got = Point.decode(wire);            // got.x === 3, got.y === 4
 
-// streaming out: the same serialize(), over a 4-byte buffer with a sink
+// streaming out: the same serialize(), over a 4-byte buffer with a sink. The sink
+// is handed the installed buffer and the region's bounds — never memory from
+// anywhere else — so it copies out what it wants to keep.
 const parts: Uint8Array[] = [];
-const sink: FlushSink = (chunk) => { parts.push(chunk.slice()); };
+const sink: FlushSink = (buf, start, end) => { parts.push(buf.slice(start, end)); };
 const so = new OStream(new Uint8Array(4), 0, sink);
 p.serialize(so); so.flush();               // the same bytes, in pieces
 
@@ -460,16 +467,16 @@ for (const part of parts) st = dec.feed(part);
 
 // COMPLETE says the bytes so far ended on a field boundary, not that the
 // message is over — the caller's framing decides that, and a still-INCOMPLETE
-// status once the input really has ended is truncation (§5.2).
+// status once the input really has ended is truncation (§5.2.4).
 const streamed = st === DecodeStatus.Complete ? dec.message : null;
 ```
 
-A generated visitor takes the nested cases the `switch` takes: a nested message
-is a `sequenceBegin(id)` returning the child's visitor, and a compact scalar
-array arrives element by element through `arrayBegin` / `arraySigned`, so no
-part of the message is ever buffered whole. Nothing from a fed chunk is
-retained either — a string is decoded and a blob copied on the way into the
-destination — so a chunk is reusable the moment `feed` returns.
+A generated visitor takes the nested cases too: a nested message switches the
+router into the child's fields on `sequenceBegin(id, depth)`, and a compact scalar
+array arrives element by element through `arrayBegin` / `arraySigned`, so no part of
+the message is ever buffered whole. Nothing from a fed chunk is retained either — a
+string is decoded and a blob copied on the way into the destination — so a chunk is
+reusable the moment `feed` returns.
 
 This example is compiled and executed by the test suite
 (`test/helpers/readme-generator-example.ts`), so it cannot drift from the API.
@@ -481,8 +488,10 @@ Who owns the bytes:
 - **Encode (`OStream`).** Every buffer the encoder writes into is
   **caller-supplied**: the library allocates none of its own and never grows or
   reallocates one it was handed — `new OStream(buf, offset?, flush?)` writes into
-  `buf` and into nothing else. When it fills it drains a
-  view to the `flush` sink (valid only during that callback) and continues; with
+  `buf` and into nothing else. When it fills it calls the `flush` sink with **that
+  buffer** and the region's bounds — `(buffer, start, end)`, never memory from
+  anywhere else and never a view the encoder built, since pass-through is forbidden
+  (§5.1.6) — and continues; the region is valid for the duration of that call. With
   no sink it throws `BUFFER_FULL`. `bytes()` returns a **view** of what is in the
   buffer — with a sink, only the not-yet-flushed tail — so `.slice()` it if it
   must outlive the next write.
@@ -509,8 +518,7 @@ Who owns the bytes:
   the next write or growth), and `reset()` keeps the buffer it grew to, so a
   pooled encoder stops allocating. The buffer belongs to the owner, so
   `setBuffer` on such a stream throws `ARGUMENT`: hand a buffer of your own to a
-  plain `OStream` instead. `new OStream()` with no arguments is a **deprecated**
-  alias for `growingOStream()` and will be removed.
+  plain `OStream` instead.
 
   Its storage is **carved from a shared slab** while it is small enough (up to
   4 KiB of an 8 KiB slab). A carve is handed out once and never recycled, so no
@@ -530,82 +538,132 @@ Who owns the bytes:
   message — leaving the encoder on the buffer it already had. A buffer installed
   **without** a sink has no minimum: no flush can occur, so nothing can be split,
   and a two-byte message encodes into a two-byte buffer.
-- **Decode (`decode()` / `Cursor` / `IStream`).** Input payload bytes are
-  zero-copy: string / blob chunks and `Cursor.readBlob` are `subarray` **views**
-  aliasing the input (or, for `IStream`, the chunk you fed). A visitor chunk is
-  valid **only during that callback**; a `Cursor` view lasts as long as the source
-  buffer lives. Scalars are delivered by value. Copy (`.slice()`) or decode
-  (`Cursor.readString` decodes for you) to retain a payload.
-- **String validity is checked where a string is materialized.** JavaScript
-  strings are a Unicode type, so this port is always strict: `Cursor.readString`
-  builds the string with a fatal `TextDecoder` and rejects invalid UTF-8 as
-  `INVALID_MSG`. A visitor `string` chunk is *raw wire bytes* and is not
-  validated — it may even end mid-code-point — so a visitor that materializes one
-  itself owns that check. `decodeUtf8(bytes)` is that check, exported for exactly
-  this: it is what `Cursor.readString` uses, and it rejects malformed bytes as
-  `INVALID_MSG` rather than as a platform `TypeError`. Rolling your own instead
+- **Decode (`decode()` / `IStream`).** You own the bytes being parsed, and they
+  must stay valid only for the duration of the `feed` (or `decode`) call. After it
+  returns, reuse, overwrite or free them freely: **nothing the decoder produced
+  points into them**.
+- **No views.** The decoder exposes no zero-copy view of a decoded value, no
+  payload-position getter and no borrowed value (§6.7) — on the one-shot path
+  exactly as on the streaming one, with no option that reinstates one. A `string` /
+  `blob` payload is reported in pieces as `(src, start, end)`, where `src` **is**
+  the chunk you fed: the decoder builds no view over it and keeps no storage of its
+  own, so whatever you want to keep, you copy out of memory you already own, during
+  the call. Scalars are delivered by value. If any of this README ever describes a
+  borrowed decoded value, either the README or the port is wrong.
+- **No wire value decides an allocation in the codec.** After construction the
+  encoder and decoder allocate nothing (§6.6): no per-message, per-field or
+  per-chunk allocation, no growable state, and no accumulator for a payload that
+  straddles a chunk — a decoder's whole memory is fixed-size state sized from this
+  format's constants (a `MAX_DEPTH` scope stack, a partial varint, an 8-byte float
+  landing zone). Constructing an `OStream` / `IStream` is the one allocating step,
+  and `decode()` reuses one decoder across calls so a one-shot caller does not pay
+  it per message. A `bigint` for an integer past `2^53` is not an exception: it is a
+  *value*, not storage, and the `lo` / `hi` halves beside it are there for a
+  consumer that would rather not have one.
+- **One recorded deviation from that rule, on the encode side.** A `string` /
+  `blob` payload **split across flushes** is copied with `set(data.subarray(…))`:
+  one view per copied piece. `TypedArray.set` is the only `memcpy` this language
+  exposes and it takes a typed array as its source, so copying a *range* needs a
+  view — an object, and therefore an allocator call §6.6 permits the codec nowhere.
+  The allocation-free alternative is a byte loop, measured at 358 MB/s against
+  10,963 MB/s for `set`, on the one path that exists *because* the payload is
+  large. This port takes the view.
+
+  What the deviation is not: it is **bounded by pieces, never by bytes**, it is
+  confined to that one copy, and the view is consumed by `set` inside `writeRaw`
+  and never handed to anyone — so §6.7 (no borrowed value leaves the codec) and
+  §5.1.6 (the sink is only ever handed the installed buffer) hold unchanged.
+  `heap-free-codec.test.ts` asserts that shape rather than waiving the rule, and
+  every other path — the whole-payload `set`, a `MAX_SIZE` buffer, the accumulator,
+  and the entire decoder — still counts **zero**.
+- **The static helper layer allocates, on your behalf.** `PayloadAcc`,
+  `ElementSeq`, `StringSeq`, `BlobSeq`, `decodeUtf8` and `elementsEqual` are the
+  generated layer's code shipped here for reuse (ARCHITECTURE §8), not part of the
+  codec: the codec never calls them, and they allocate the values they build.
+- **String validity is checked where a string is materialized** (§6.4.5).
+  JavaScript strings are a Unicode type, so this port is always strict — but a
+  `string` payload piece is *raw wire bytes* and is not validated (it may end
+  mid-code-point), so whoever materializes one owns the check.
+  `decodeUtf8(bytes, start?, end?)` is that check, exported for exactly this: it
+  rejects malformed bytes as `INVALID_MSG` rather than as a platform `TypeError`.
+  Rolling your own instead
   means `new TextDecoder("utf-8", { fatal: true })` — the default `TextDecoder`
   silently substitutes `U+FFFD`, which the format forbids in either direction,
   and `TextEncoder` does the same to an unpaired surrogate where this encoder
   refuses it with `ARGUMENT`.
-- **Reassembly is the caller's, with a helper.** Nothing in the library holds a
-  payload across `feed` calls. `PayloadAcc` joins the chunks — one accumulator
-  per decoder, since only one payload is ever in flight — and allocates only for
-  a payload that actually straddled a chunk boundary; one arriving whole is
-  handed straight back, still a view into the chunk and still valid only for that
-  call. `StringSeq` / `BlobSeq` build on it to collect the elements of a
-  `string` / `blob` array, and `elementsEqual` is the array form of the
+- **Reassembly is the caller's, with a helper.** The codec holds no payload across
+  `feed` calls. `PayloadAcc.take(total, offset, src, start, end)` joins the pieces —
+  one accumulator per decoder, since only one payload is ever in flight — and
+  returns storage of its own that aliases nothing, on the whole-payload path exactly
+  as on the split one. `StringSeq` / `BlobSeq` collect the elements of a `string` /
+  `blob` wrapper array and `ElementSeq` holds the index rules for any element kind
+  (index bound, gap fill, last-write-wins); `elementsEqual` is the array form of the
   omit-if-default test an encoder applies before writing a field.
 
 ### Decode limits
 
-For a schema whose `count` / `maxlen` bounds are omitted, the decoder otherwise
-accepts whatever count / length the received message claims. Pass an optional
-`DecodeLimits` object to cap that and protect a receiver from a hostile oversized
-field:
+Every decoder carries receiver-side caps, and there is no unset state and no
+unlimited mode (§6.2.1): a field the schema leaves unbounded is still bounded by the
+receiver. An omitted option takes this port's default rather than switching the cap
+off, and `Infinity` is refused with `ARGUMENT`.
+
+| cap | default | bounds |
+|---|---|---|
+| `maxArrayCount` | `DEFAULT_MAX_DYN_ARRAY_COUNT` = 1,048,576 | elements in a schema-unbounded array |
+| `maxStringLen` | `DEFAULT_MAX_DYN_STRING_LEN` = 16,777,216 | bytes of a schema-unbounded `string` |
+| `maxBlobLen` | `DEFAULT_MAX_DYN_BLOB_LEN` = 67,108,864 | bytes of a schema-unbounded `blob` |
 
 ```ts
 const limits = { maxArrayCount: 65536, maxStringLen: 1 << 20, maxBlobLen: 1 << 20 };
-decode(bytes, visitor, limits);       // one-shot push
-new Cursor(bytes, limits);            // pull
-new IStream(limits);                  // streaming
+decode(bytes, visitor, limits);       // one-shot
+new IStream(visitor, limits);         // streaming
 ```
 
-An over-limit array count or string / blob length is rejected at the field's
-header — **before** the array is sized or any payload is decoded or streamed to
-the visitor — by throwing `SofabError` with code
-`SofabErrorCode.LimitExceeded`. The decoder never clamps or truncates. Each limit
-is independent, and an omitted one means **no cap**. Unlike `INVALID_MSG`,
-`LimitExceeded` does not poison an `IStream` (see
-[Deserialize stream](#deserialize-stream)). Generated code supplies these values
-from the sofabgen config.
+An over-limit array count or string / blob length is rejected at the field's count /
+length header — **before** the array is announced or any payload piece reaches the
+visitor — by throwing `SofabError` with code `SofabErrorCode.LimitExceeded`. The
+decoder rejects, never clamps. A rejection at a count or length word is terminal:
+the stream re-reports it rather than resuming inside the abandoned field. Unlike
+`INVALID_MSG` it is not the `INVALID` outcome — the same bytes decode under a looser
+cap — so `status()` keeps saying so. The values are generated code's to choose, from
+the sofabgen config; the defaults exist so a decoder built without any is bounded.
 
-A limit applies **only to a field the schema leaves unbounded**. Where the schema
+A cap applies **only to a field the schema leaves unbounded**. Where the schema
 declares a `count` / `maxlen`, that bound governs and an over-bound value is
-`INVALID_MSG`, never `LimitExceeded`. On the pull `Cursor` this is automatic: passing the schema bound
-(`readString(maxlen)`, `readUnsignedArray(count)`, …) both enables the `INVALID`
-check and takes the field out of the cap's reach, so a bounded field decodes
-normally even when its size exceeds the configured cap. The push surfaces
-(`decode()`, `IStream`) are driven by wire type and never learn the schema, so
-there the caps apply to every field; a caller that needs the distinction on a
-bounded field decodes it through `Cursor`, or leaves the cap unset and enforces
-the schema bound itself from `fixlenBegin` / `arrayBegin`, which carry the
-declared size.
+`INVALID_MSG`, never `LimitExceeded`. This decoder is driven by wire type and never
+learns a schema, so the split is made where the schema is known: generated code takes
+the declared size from `fixlenBegin` / `arrayBegin` — which carry it before any
+payload or element arrives — and configures caps that do not cut across its own
+declarations. `StringSeq` / `BlobSeq` / `ElementSeq` take both: the schema `count` as
+an index capacity, and a receiver cap for an array the schema left open.
 
 ## Build & test
 
 ```bash
 npm ci
 npm run typecheck      # tsc --noEmit (strict)
-npm test               # vitest run: vectors, chunked feeding, cursor, errors, round-trips
+npm test               # vitest run: vectors, chunked feeding, memory rules, round-trips
 npm run coverage       # vitest run --coverage (v8)
 npm run build          # tsup -> ESM + CJS + IIFE + .d.ts in dist/
 npm run smoke          # cross-runtime smoke test of the built bundle
 ```
 
-Tests live in `test/` as focused vitest suites, including `vectors.test.ts`
-(encode + decode every shared conformance vector) and `istream.chunked.test.ts`
-(every vector fed one byte at a time).
+Tests live in `test/` as focused vitest suites, including `vectors.test.ts` (encode
++ decode every shared conformance vector), `istream.chunked.test.ts` (every vector
+fed one byte at a time), `heap-free-codec.test.ts` (no allocation primitive on a
+codec path, a flat heap over encode and decode, no view into a fed or one-shot
+buffer) and `pooled-decoder-state.test.ts` (a decode aborted at every cut point
+leaves nothing behind for the next one).
+
+`assets/test_vectors.json` carries three blocks and this port runs all three:
+`vectors`, `invalid_utf8`, and `sequence_growth` — the wrapper-array growth cases of
+§7.2 item 8, replayed by `sequence-growth.test.ts` for both element kinds at three
+chunkings. This port declares `dynamic_arrays`: its wrapper-array containers are JS
+arrays that grow at decode time, so the block applies. The cases are cap-relative and
+the run installs `max_dyn_array_count = 8`. Growth **geometry** splits in two: the
+backing store's reallocation strategy is the engine's amortised doubling, which is not
+this port's to pin, while the fill is, and is asserted as one write per slot in a
+single pass.
 
 CI type-checks, tests and builds on Node 20 / 22 / 24 / 26, smoke-tests the
 bundle on Node, Deno and Bun, and publishes coverage badges; a separate
@@ -621,7 +679,6 @@ compare directly across languages:
 npm run perf              # per-op cost on the 170-byte perf message
 npm run bench             # throughput table (MB/s) over the four shared datasets
 npm run bench:callgrind   # machine-independent instructions/op under Valgrind
-npm run bench:bound       # repo-local: hot-path cost of the schema-bound readers
 ```
 
 `bench` prints ten rows over four datasets: a 1000-element `u64` array, the small
@@ -640,8 +697,11 @@ is the same bytes through a **4096-byte** buffer with a flush sink (~245
 flushes), and `decode: blob 1MB` is fed back in 4096-byte chunks. The
 **difference** between the two encode rows is what the divisible-run flush path
 costs, and it is legible only under `Ir/op`. BENCH_SPEC's optional
-`blob 1MB passthrough` row is absent: this port grants no pass-through
-permission, so every `string`/`blob` run is copied through the output buffer.
+`blob 1MB passthrough` row is absent: pass-through is forbidden (§5.1.6), so every
+`string` / `blob` run is copied through the output buffer. Both copies are
+`TypedArray.set` — the whole payload when it fits, a range per flush when it does
+not, the latter being the recorded §6.6 deviation described under
+[Memory handling](#memory-handling).
 
 Since JS engines expose no portable cycle counter, `perf` uses CPU time/op as the
 code-cost proxy; `bench:callgrind` counts instructions/op under Valgrind (two rep

@@ -63,17 +63,17 @@ function feedCatching(
   chunkSize: number,
 ): { status: DecodeStatus; codes: string[]; calls: string[] } {
   const visitor = new RecordingVisitor();
-  const is = new IStream();
+  const is = new IStream(visitor);
   const codes: string[] = [];
   for (let i = 0; i < bytes.length; i += chunkSize) {
     try {
-      is.feed(bytes.subarray(i, i + chunkSize), visitor);
+      is.feed(bytes.subarray(i, i + chunkSize));
     } catch (e) {
       expect(e).toBeInstanceOf(SofabError);
       codes.push((e as SofabError).code);
     }
   }
-  return { status: is.end(), codes, calls: visitor.calls };
+  return { status: is.status(), codes, calls: visitor.calls };
 }
 
 /** Malformed byte in the middle, valid field on either side. */
@@ -101,16 +101,16 @@ describe("INVALID is terminal: a poisoned IStream never answers COMPLETE (§5.2)
   });
 
   it("an overlong (>64-bit) varint poisons the stream", () => {
-    const is = new IStream();
     const visitor = new RecordingVisitor();
-    expect(() => is.feed(new Uint8Array(10).fill(0x80), visitor)).toThrow(
+    const is = new IStream(visitor);
+    expect(() => is.feed(new Uint8Array(10).fill(0x80))).toThrow(
       expect.objectContaining({ code: SofabErrorCode.InvalidMsg }),
     );
     // A well-formed message afterwards must not resurrect the stream.
-    expect(() => is.feed(Uint8Array.of(0x00, 0x01), visitor)).toThrow(
+    expect(() => is.feed(Uint8Array.of(0x00, 0x01))).toThrow(
       expect.objectContaining({ code: SofabErrorCode.InvalidMsg }),
     );
-    expect(is.end()).toBe(DecodeStatus.Invalid);
+    expect(is.status()).toBe(DecodeStatus.Invalid);
     expect(visitor.calls).toEqual([]);
   });
 
@@ -122,32 +122,32 @@ describe("INVALID is terminal: a poisoned IStream never answers COMPLETE (§5.2)
   });
 
   it("every later feed re-throws INVALID_MSG rather than silently accepting bytes", () => {
-    const is = new IStream();
     const visitor = new RecordingVisitor();
-    expect(() => is.feed(Uint8Array.of(0x07), visitor)).toThrow(SofabError);
+    const is = new IStream(visitor);
+    expect(() => is.feed(Uint8Array.of(0x07))).toThrow(SofabError);
     for (let k = 0; k < 3; k++) {
-      expect(() => is.feed(Uint8Array.of(0x00, 0x01), visitor)).toThrow(
+      expect(() => is.feed(Uint8Array.of(0x00, 0x01))).toThrow(
         expect.objectContaining({ code: SofabErrorCode.InvalidMsg }),
       );
     }
-    expect(is.end()).toBe(DecodeStatus.Invalid);
+    expect(is.status()).toBe(DecodeStatus.Invalid);
     expect(visitor.calls).toEqual([]);
   });
 
   it("end() is a pure accessor and stays INVALID when called repeatedly", () => {
-    const is = new IStream();
-    expect(() => is.feed(Uint8Array.of(0x07), {})).toThrow(SofabError);
-    expect(is.end()).toBe(DecodeStatus.Invalid);
-    expect(is.end()).toBe(DecodeStatus.Invalid);
+    const is = new IStream({});
+    expect(() => is.feed(Uint8Array.of(0x07))).toThrow(SofabError);
+    expect(is.status()).toBe(DecodeStatus.Invalid);
+    expect(is.status()).toBe(DecodeStatus.Invalid);
   });
 
   it("an empty feed on a poisoned stream still reports INVALID", () => {
-    const is = new IStream();
-    expect(() => is.feed(Uint8Array.of(0x07), {})).toThrow(SofabError);
-    expect(() => is.feed(new Uint8Array(0), {})).toThrow(
+    const is = new IStream({});
+    expect(() => is.feed(Uint8Array.of(0x07))).toThrow(SofabError);
+    expect(() => is.feed(new Uint8Array(0))).toThrow(
       expect.objectContaining({ code: SofabErrorCode.InvalidMsg }),
     );
-    expect(is.end()).toBe(DecodeStatus.Invalid);
+    expect(is.status()).toBe(DecodeStatus.Invalid);
   });
 
   it("INVALID beats INCOMPLETE: a malformed field then a truncated tail is INVALID", () => {
@@ -173,10 +173,10 @@ describe("INVALID is terminal: a poisoned IStream never answers COMPLETE (§5.2)
     // The bytes are well-formed — the same message decodes under a looser
     // limit — so hitting a configured cap must not poison the stream into the
     // INVALID outcome.
-    const is = new IStream({ maxArrayCount: 1 });
-    expect(() => is.feed(Uint8Array.of(0x03, 0x02, 0x01, 0x02), {})).toThrow(
+    const is = new IStream({}, { maxArrayCount: 1 });
+    expect(() => is.feed(Uint8Array.of(0x03, 0x02, 0x01, 0x02))).toThrow(
       expect.objectContaining({ code: SofabErrorCode.LimitExceeded }),
     );
-    expect(is.end()).not.toBe(DecodeStatus.Invalid);
+    expect(is.status()).not.toBe(DecodeStatus.Invalid);
   });
 });
