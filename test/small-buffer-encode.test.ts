@@ -121,6 +121,61 @@ describe("encoding through a buffer smaller than a single write (§5.1)", () => 
     expect(chunks).toBe(10); // header + fixlen word + 8 payload bytes
   });
 
+  it("survives a taking sink that scrubs the buffer it was handed (§7.2 item 4)", () => {
+    // The half of §5.1.5 the copying sink cannot see. A sink that *takes* the
+    // buffer installs a replacement and then destroys the one it took — a
+    // transport that reuses its scratch, a test that proves it was handed
+    // ownership. An encoder that kept writing into the buffer it gave away
+    // would read the fill pattern back out on the next flush, and the
+    // byte-identity assertions elsewhere in this file would not notice, because
+    // their sinks copy and return.
+    for (const [name, write] of CASES) {
+      const reference = grown(write);
+      for (const size of SIZES) {
+        const out: number[] = [];
+        let taken = 0;
+        const first = new Uint8Array(size);
+        let current = first;
+        const os = new OStream(current, 0, (buf, start, end) => {
+          expect(buf).toBe(current); // still only ever the installed buffer
+          for (let i = start; i < end; i++) out.push(buf[i]!);
+          taken++;
+          const next = new Uint8Array(size);
+          current = next;
+          os.setBuffer(next);
+          // Only now, with the replacement installed, is the taken buffer ours
+          // to destroy (§5.1.5: install before returning).
+          buf.fill(0xee);
+        });
+        write(os);
+        os.flush();
+        expect(out, `${name} @ ${size}`).toEqual(reference);
+        expect(taken).toBeGreaterThan(0);
+        // The first buffer was taken and scrubbed; nothing may have been written
+        // into it afterwards.
+        expect(first.every((b) => b === 0xee)).toBe(true);
+      }
+    }
+  });
+
+  it("agrees with the copying sink on the same message — both halves of §5.1.5", () => {
+    // The pairing §7.2 item 4 asks for: a sink that returns without installing
+    // anything (it copied) and one that takes and replaces must produce the same
+    // bytes, so the handover rule is exercised in both directions.
+    const write = CASES[CASES.length - 1]![1];
+    const reference = grown(write);
+
+    const copied: number[] = [];
+    const shared = new Uint8Array(7);
+    const copying = new OStream(shared, 0, (buf, start, end) => {
+      for (let i = start; i < end; i++) copied.push(buf[i]!);
+    });
+    write(copying);
+    copying.flush();
+
+    expect(copied).toEqual(reference);
+  });
+
   it("lets the sink swap in a fresh buffer mid-value", () => {
     // A sink is allowed to hand the encoder a new buffer (`setBuffer`) instead
     // of copying — including from inside a value that is being split.
