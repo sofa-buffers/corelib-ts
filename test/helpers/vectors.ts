@@ -94,6 +94,76 @@ export function loadInvalidUtf8(): InvalidUtf8Vector[] {
 }
 
 /**
+ * A growth case (top-level `sequence_growth`) — CORELIB_PLAN §7.2 item 8.
+ *
+ * Keyed by a **delivery sequence of element ids**, not by bytes: a wrapper array
+ * carries no count, so its length is *highest present id + 1* (MESSAGE_SPEC §5.1)
+ * and two ports that grow differently emit identical bytes. The port builds the
+ * message from `deliver` and asserts `expect`.
+ *
+ * Indices are **cap-relative**: `id_from_cap` / `length_from_cap` are offsets added
+ * to the port's own configured `max_dyn_array_count`, which §6.2.1 deliberately
+ * leaves per-target. Every case assumes a cap of at least 4.
+ */
+export interface GrowthCase {
+  name: string;
+  group: string;
+  description: string;
+  requires?: string[];
+  /** The wrapper array field's id in the top-level scope. */
+  field_id: number;
+  /** `string` — a leaf element; `struct` — a framed element with one `unsigned` at id 0. */
+  element_type: "string" | "struct";
+  deliver: { id?: number; id_from_cap?: number; value: string | bigint | number }[];
+  expect: {
+    outcome: "complete" | "limit_exceeded";
+    length?: number;
+    length_from_cap?: number;
+    default_ids?: number[];
+    terminal?: boolean;
+    max_length?: number;
+  };
+}
+
+/**
+ * Load the growth cases, or `[]` on a vector file that predates them.
+ *
+ * This port declares `dynamic_arrays`: its wrapper-array containers are JS arrays
+ * that grow at decode time, so the block applies (a statically bounded profile
+ * skips it and says so instead).
+ */
+export function loadGrowthCases(): GrowthCase[] {
+  const path = fileURLToPath(new URL("../../assets/test_vectors.json", import.meta.url));
+  const doc = parseJsonWithBigInt(readFileSync(path, "utf8")) as unknown as {
+    sequence_growth?: GrowthCase[];
+  };
+  // The bigint-fidelity parser is right for a vector's *values* and wrong for its
+  // ids, lengths and offsets: those index things, and index arithmetic on a
+  // `bigint` throws the moment it meets a `number`. Narrow them here, once, and
+  // leave only `deliver[].value` — a real u64 domain — as the parser produced it.
+  return (doc.sequence_growth ?? []).map((c) => ({
+    ...c,
+    field_id: Number(c.field_id),
+    deliver: c.deliver.map((el) => ({
+      ...(el.id !== undefined ? { id: Number(el.id) } : {}),
+      ...(el.id_from_cap !== undefined ? { id_from_cap: Number(el.id_from_cap) } : {}),
+      value: el.value,
+    })),
+    expect: {
+      ...c.expect,
+      ...(c.expect.length !== undefined ? { length: Number(c.expect.length) } : {}),
+      ...(c.expect.length_from_cap !== undefined
+        ? { length_from_cap: Number(c.expect.length_from_cap) }
+        : {}),
+      ...(c.expect.max_length !== undefined ? { max_length: Number(c.expect.max_length) } : {}),
+      ...(c.expect.default_ids !== undefined
+        ? { default_ids: c.expect.default_ids.map(Number) }
+        : {}),
+    },
+  }));
+}
+
+/**
  * Replay a vector's fields onto `os`, exercising the public writer surface.
  *
  * A vector's `serialized` form is the primitive-layer ground truth and always

@@ -13,12 +13,11 @@ import {
   OStream,
   U64_MAX,
   decode,
-  type Visitor,
-} from "../src/index.js";
+  type Visitor, growingOStream } from "../src/index.js";
 import { RecordingVisitor } from "./helpers/recording-visitor.js";
 
 function roundtrip(write: (os: OStream) => void): RecordingVisitor {
-  const os = new OStream();
+  const os = growingOStream();
   write(os);
   const seen = new RecordingVisitor();
   decode(os.bytes(), seen);
@@ -143,35 +142,36 @@ describe("nested sequences", () => {
 
   it("routes nested fields to a child visitor returned from sequenceBegin", () => {
     // Outer collects id 1; the nested sequence's fields go to a fresh Inner.
-    class Inner implements Visitor {
-      value: number | bigint = 0;
-      unsigned(_id: number, v: number | bigint): void {
-        this.value = v;
-      }
-    }
+    // A flat visitor routes a nested scope by the depth sequenceBegin reports —
+    // the replacement for handing the decoder a child object (§5.3.1).
     class Outer implements Visitor {
       value: number | bigint = 0;
-      readonly inner = new Inner();
+      innerValue: number | bigint = 0;
+      private depth = 0;
       unsigned(_id: number, v: number | bigint): void {
-        this.value = v;
+        if (this.depth === 0) this.value = v;
+        else this.innerValue = v;
       }
-      sequenceBegin(): Visitor {
-        return this.inner;
+      sequenceBegin(_id: number, depth: number): void {
+        this.depth = depth;
+      }
+      sequenceEnd(_id: number, depth: number): void {
+        this.depth = depth - 1;
       }
     }
 
-    const os = new OStream();
+    const os = growingOStream();
     os.writeUnsigned(1, 11n);
     os.writeSequenceBeginLazy(2);
-    os.writeUnsigned(1, 99n); // must land on Inner, not Outer
+    os.writeUnsigned(1, 99n); // must land on the nested slot, not the root one
     os.writeSequenceEnd();
 
     const outer = new Outer();
-    const is = new IStream();
-    is.feed(os.bytes(), outer);
-    is.end();
+    const is = new IStream(outer);
+    is.feed(os.bytes());
+    is.status();
 
     expect(outer.value).toBe(11);
-    expect(outer.inner.value).toBe(99);
+    expect(outer.innerValue).toBe(99);
   });
 });

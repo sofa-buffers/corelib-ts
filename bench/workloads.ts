@@ -27,7 +27,6 @@
  */
 
 import {
-  Cursor,
   DecodeStatus,
   IStream,
   OStream,
@@ -214,10 +213,10 @@ export class DiscardSink {
   acc = 0;
   flushes = 0;
   bytes = 0;
-  readonly add: FlushSink = (chunk) => {
+  readonly add: FlushSink = (buf, start, end) => {
     this.flushes++;
-    this.bytes += chunk.length;
-    if (chunk.length > 0) this.acc ^= chunk[0]!;
+    this.bytes += end - start;
+    if (end > start) this.acc ^= buf[start]!;
   };
 }
 
@@ -247,11 +246,11 @@ export class Checksum implements Visitor {
   fp64(_id: number, v: number): void {
     this.acc += v;
   }
-  string(_id: number, _total: number, _offset: number, chunk: Uint8Array): void {
-    this.acc += chunk.length;
+  string(_id: number, _total: number, _offset: number, _src: Uint8Array, start: number, end: number): void {
+    this.acc += end - start;
   }
-  blob(_id: number, _total: number, _offset: number, chunk: Uint8Array): void {
-    this.acc += chunk.length;
+  blob(_id: number, _total: number, _offset: number, _src: Uint8Array, start: number, end: number): void {
+    this.acc += end - start;
   }
   arrayUnsigned(_id: number, _i: number, v: number | bigint): void {
     this.acc += typeof v === "number" ? v : Number(v);
@@ -315,36 +314,23 @@ export function encodeBlobStreaming(os: OStream, blob: Uint8Array): void {
 
 /** Feed a whole message to a fresh {@link IStream} in `chunk`-byte pieces. */
 export function decodeChunked(wire: Uint8Array, visitor: Visitor, chunk: number): DecodeStatus {
-  const is = new IStream();
+  const is = new IStream(visitor);
   let status: DecodeStatus = DecodeStatus.Complete;
   for (let off = 0; off < wire.length; off += chunk) {
-    status = is.feed(wire.subarray(off, Math.min(off + chunk, wire.length)), visitor);
+    status = is.feed(wire.subarray(off, Math.min(off + chunk, wire.length)));
   }
   return status;
 }
 
 /**
- * The `decode: composite skip-all` row: walk the message and materialize
- * nothing.
- *
- * This is the pull decoder's skip machinery, not a push visitor with no
- * callbacks — the two are different work. A {@link Visitor} that implements
- * nothing still has every value *parsed* for it (the decoder only elides the
- * call), while {@link Cursor.skip} jumps a fixlen payload by its length word and
- * discards a whole sub-sequence by walking headers, which is the path a router
- * or filter actually runs and the one MESSAGE_SPEC §7.2 item 7 requires be
- * exercised. Returns the number of top-level fields skipped, so the loop cannot
- * be optimised away.
- */
-/**
- * A message whose one subtree the consumer declines, and the two ways to say so.
+ * A message whose one subtree the consumer declines.
  *
  * `declineWire` is deliberately string-heavy: a declined subtree used to cost a
  * payload view and a callback lookup per field, and the row exists to keep that
  * saving honest rather than asserted.
  */
 export function declinedWire(): Uint8Array {
-  const os = new OStream();
+  const os = growingOStream();
   os.writeUnsigned(1, 7);
   os.writeSequenceBeginLazy(2);
   for (let i = 0; i < 200; i++) os.writeString(i % 64, "payload".repeat(8));
@@ -353,18 +339,29 @@ export function declinedWire(): Uint8Array {
   return os.bytes().slice();
 }
 
-/** Declines the subtree: sequenceBegin returns null (corelib-ts#154). */
+/** Declines the subtree: sequenceBegin returns false (corelib-ts#154). */
 export function decodeDeclining(wire: Uint8Array): void {
-  decode(wire, { sequenceBegin: () => null });
+  decode(wire, { sequenceBegin: () => false });
 }
 
+/**
+ * The `decode: composite skip-all` row: walk the message and materialize nothing.
+ *
+ * A visitor that counts top-level headers and declines every subtree, which puts
+ * all of the work on the decoder's own skip machinery — the path a router or
+ * filter runs, and the one §7.2 item 7 requires be exercised. `skip` is one of the
+ * two per-field intents (§6.7.2), and "not implementing the callback" is how a
+ * visitor says it. Returns the number of top-level fields seen, so the loop cannot
+ * be optimised away.
+ */
 export function skipAll(wire: Uint8Array): number {
-  const c = new Cursor(wire);
   let n = 0;
-  while (c.readHeader()) {
-    c.skip(c.wire);
-    n++;
-  }
+  decode(wire, {
+    // Every subtree is declined, so nothing inside one is ever reported and every
+    // header that arrives here is a top-level field: no depth counter needed.
+    fieldBegin: () => void n++,
+    sequenceBegin: () => false,
+  });
   return n;
 }
 
@@ -422,12 +419,10 @@ export function buildWorkloads(): Workload[] {
     write(scratch);
     sink(scratch.bytesUsed);
   };
-  // The whole-message rows go through `decode()` — the contiguous path a caller
-  // with the message already in hand uses, and the one the other ports' decode
-  // rows drive. `decode: blob 1MB` below is its chunk-fed counterpart and the
-  // only row here that runs the resumable state machine; `perf` reports that
-  // machine for both directions, so between the two tools both decode surfaces
-  // are covered.
+  // The whole-message rows go through `decode()` — one `feed` of the whole buffer,
+  // which is what a caller with the message already in hand uses and what the
+  // other ports' decode rows drive. `decode: blob 1MB` below is its chunk-fed
+  // counterpart: the same decoder, fed 4096 bytes at a time.
   const decodeWhole = (wire: Uint8Array) => () => {
     const c = new Checksum();
     decode(wire, c);
@@ -462,8 +457,8 @@ export function buildWorkloads(): Workload[] {
       run: decodeWhole(compWire) },
     { key: "decode_composite_skip", label: "decode: composite skip-all", bytes: compWire.length,
       run: () => sink(skipAll(compWire)) },
-    // The PUSH twin of the row above: skip-all there is the pull cursor jumping
-    // fields, this is a visitor declining a whole subtree (sequenceBegin -> null).
+    // The subtree twin of the row above: skip-all declines every scope it is
+    // offered, this one declines a single large subtree (sequenceBegin -> false).
     { key: "decode_declined", label: "decode: declined subtree", bytes: declWire.length,
       run: () => decodeDeclining(declWire) },
   ];

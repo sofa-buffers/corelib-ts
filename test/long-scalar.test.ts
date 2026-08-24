@@ -1,24 +1,26 @@
 /**
  * The 64-bit `Long` path reached arrays only; scalars had no twin (corelib-ts#143).
  *
- * `writeUnsignedArrayLong` / `readUnsignedArrayLong` (+ signed) let a 64-bit
- * *array* stay on 32-bit word pairs, but a `u64`/`i64` **scalar** could only be
- * written from and decoded to `number | bigint` — so a generated field under
- * `int64: long` materialised a `bigint` per scalar per decode, which is the one
- * thing the mode exists to avoid. The four scalar codecs added here close that,
- * and the opt-in `Visitor.longs` channel carries the same representation through
- * the two push decoders so a field does not change runtime type per decode API.
+ * `writeUnsignedArrayLong` (+ signed) let a 64-bit *array* stay on 32-bit word
+ * pairs, but a `u64`/`i64` **scalar** could only be written from `number |
+ * bigint` — so a generated field under `int64: long` materialised a `bigint` per
+ * scalar per encode, which is the one thing the mode exists to avoid.
  *
- * The bar this suite holds them to is that they are **representation-only**:
- * identical wire out of the encoder at every buffer size, identical values out
- * of every decoder, and — the streaming half of it — identical values *and*
- * identical `SofabError` codes through `decode()` and `IStream` at every chunk
- * size.
+ * The decode half is no longer an opt-in channel: every integer callback carries
+ * the exact 64-bit value as two unsigned 32-bit halves (`lo`/`hi`) *beside* the
+ * number-first value, so a `Long` consumer rebuilds one with `Long.fromBits` and
+ * a plain consumer ignores them. That removes the flag the old channel needed —
+ * and with it the per-value `Long` the decoder used to allocate, which §6.6 does
+ * not allow it to (a value is not storage; an object is).
+ *
+ * The bar this suite holds all of it to is that it is **representation-only**:
+ * identical wire out of the encoder at every buffer size, identical values out of
+ * the decoder however the halves are read, and identical `SofabError` codes
+ * through `decode()` and `IStream` at every chunk size.
  */
 
 import { describe, expect, it } from "vitest";
 import {
-  Cursor,
   DecodeStatus,
   IStream,
   Long,
@@ -26,10 +28,7 @@ import {
   SofabError,
   SofabErrorCode,
   decode,
-  type AnyVisitor,
-  type LongVisitor,
-  type Visitor,
-} from "../src/index.js";
+  type Visitor, growingOStream } from "../src/index.js";
 
 /** Unsigned corpus: every varint-width and number/bigint boundary that matters. */
 const UNSIGNED: bigint[] = [
@@ -69,7 +68,7 @@ const SIGNED: bigint[] = [
 
 /** Encode through the growable in-memory path. */
 function grown(write: (os: OStream) => void): number[] {
-  const os = new OStream();
+  const os = growingOStream();
   write(os);
   return Array.from(os.bytes());
 }
@@ -77,8 +76,8 @@ function grown(write: (os: OStream) => void): number[] {
 /** Encode through a fixed caller buffer of `size`, collecting everything flushed. */
 function streamed(size: number, write: (os: OStream) => void): number[] {
   const out: number[] = [];
-  const os = new OStream(new Uint8Array(size), 0, (b) => {
-    for (const byte of b) out.push(byte);
+  const os = new OStream(new Uint8Array(size), 0, (buf, start, end) => {
+    for (let i = start; i < end; i++) out.push(buf[i]!);
   });
   write(os);
   os.flush();
@@ -162,80 +161,82 @@ describe("writeUnsignedLong / writeSignedLong", () => {
   });
 });
 
-describe("Cursor.readUnsignedLong / readSignedLong", () => {
-  it("decode what the bigint readers decode", () => {
+describe("the decoder's lo/hi halves", () => {
+  /** Rebuild every scalar of `wire` as a Long, from the halves the visitor gets. */
+  function scalars(wire: Uint8Array): { u: bigint[]; s: bigint[] } {
+    const u: bigint[] = [];
+    const sv: bigint[] = [];
+    decode(wire, {
+      unsigned: (_id, _v, lo, hi) => void u.push(Long.fromBits(lo, hi).toBigInt()),
+      signed: (_id, _v, lo, hi) => void sv.push(Long.fromBits(lo, hi).toBigInt(true)),
+    });
+    return { u, s: sv };
+  }
+
+  it("carry what the number-first value carries, for every 64-bit boundary", () => {
     for (const v of UNSIGNED) {
-      const os = new OStream();
+      const os = growingOStream();
       os.writeUnsigned(13, v);
-      const bytes = os.bytes().slice();
-      const c = new Cursor(bytes);
-      expect(c.readHeader()).toBe(true);
-      expect(c.readUnsignedLong().toBigInt(), `u64 ${v}`).toBe(v);
-      // ...and the cursor is left exactly where the bigint reader leaves it.
-      expect(c.readHeader()).toBe(false);
+      expect(scalars(os.bytes().slice()).u, `u64 ${v}`).toEqual([v]);
     }
     for (const v of SIGNED) {
-      const os = new OStream();
+      const os = growingOStream();
       os.writeSigned(13, v);
-      const bytes = os.bytes().slice();
-      const c = new Cursor(bytes);
-      expect(c.readHeader()).toBe(true);
-      expect(c.readSignedLong().toBigInt(true), `i64 ${v}`).toBe(v);
-      expect(c.readHeader()).toBe(false);
+      expect(scalars(os.bytes().slice()).s, `i64 ${v}`).toEqual([v]);
     }
   });
 
   it("round-trip the Long writers", () => {
-    const os = new OStream();
+    const os = growingOStream();
     UNSIGNED.forEach((v, i) => os.writeUnsignedLong(i, Long.fromValue(v)));
     SIGNED.forEach((v, i) => os.writeSignedLong(100 + i, Long.fromValue(v)));
-
-    const c = new Cursor(os.bytes().slice());
-    const u: bigint[] = [];
-    const s: bigint[] = [];
-    while (c.readHeader()) {
-      if (c.id < 100) u.push(c.readUnsignedLong().toBigInt());
-      else s.push(c.readSignedLong().toBigInt(true));
-    }
-    expect(u).toEqual(UNSIGNED);
-    expect(s).toEqual(SIGNED);
+    const got = scalars(os.bytes().slice());
+    expect(got.u).toEqual(UNSIGNED);
+    expect(got.s).toEqual(SIGNED);
   });
 
-  it("agree with the array readers element for element", () => {
-    // Scalar and array are the same varint; the two Long readers must not drift.
-    const os = new OStream();
+  it("agree with the array halves element for element", () => {
+    // Scalar and array are the same varint; the two paths must not drift.
+    const os = growingOStream();
     os.writeUnsignedArray(1, UNSIGNED);
     os.writeSignedArray(2, SIGNED);
-    const c = new Cursor(os.bytes().slice());
+    const uArray: number[][] = [];
+    const sArray: number[][] = [];
+    decode(os.bytes().slice(), {
+      arrayUnsigned: (_id, _i, _v, lo, hi) => void uArray.push([lo, hi]),
+      arraySigned: (_id, _i, _v, lo, hi) => void sArray.push([lo, hi]),
+    });
 
-    c.readHeader();
-    const uArray = c.readUnsignedArrayLong();
-    c.readHeader();
-    const sArray = c.readSignedArrayLong();
-
-    const each = new OStream();
+    const each = growingOStream();
     UNSIGNED.forEach((v, i) => each.writeUnsigned(i, v));
-    const cu = new Cursor(each.bytes().slice());
-    const uScalar: Long[] = [];
-    while (cu.readHeader()) uScalar.push(cu.readUnsignedLong());
-
-    const eachS = new OStream();
+    const eachS = growingOStream();
     SIGNED.forEach((v, i) => eachS.writeSigned(i, v));
-    const cs = new Cursor(eachS.bytes().slice());
-    const sScalar: Long[] = [];
-    while (cs.readHeader()) sScalar.push(cs.readSignedLong());
+    const uScalar: number[][] = [];
+    const sScalar: number[][] = [];
+    decode(each.bytes().slice(), { unsigned: (_id, _v, lo, hi) => void uScalar.push([lo, hi]) });
+    decode(eachS.bytes().slice(), { signed: (_id, _v, lo, hi) => void sScalar.push([lo, hi]) });
 
-    expect(uScalar.map((l) => [l.low, l.high])).toEqual(uArray.map((l) => [l.low, l.high]));
-    expect(sScalar.map((l) => [l.low, l.high])).toEqual(sArray.map((l) => [l.low, l.high]));
+    expect(uScalar).toEqual(uArray);
+    expect(sScalar).toEqual(sArray);
+  });
+
+  it("are the two's-complement halves for a signed value, not the zig-zag ones", () => {
+    // The decoded value's bits, so Long.fromBits(...).toBigInt(true) is the value
+    // — not the raw zig-zag image the wire carries.
+    const os = growingOStream();
+    os.writeSigned(1, -2n);
+    let half: [number, number] = [0, 0];
+    decode(os.bytes(), { signed: (_id, _v, lo, hi) => void (half = [lo, hi]) });
+    expect(half).toEqual([0xffff_fffe, 0xffff_ffff]);
   });
 });
 
 // --- the streaming (Visitor) channel ---------------------------------------
 
-/** One decoded integer event, normalised so both channels compare directly. */
+/** One decoded integer event, normalised so both readings compare directly. */
 type IntEvent = { kind: "u" | "s" | "au" | "as"; id: number; value: bigint };
 
-/** Collects the integer events a plain (number-first) visitor sees. */
+/** Collects the integer events from the number-first `value`. */
 class PlainRecorder implements Visitor {
   readonly events: IntEvent[] = [];
   unsigned(id: number, v: number | bigint): void {
@@ -250,48 +251,29 @@ class PlainRecorder implements Visitor {
   arraySigned(id: number, _i: number, v: number | bigint): void {
     this.events.push({ kind: "as", id, value: BigInt(v) });
   }
-  sequenceBegin(): Visitor {
-    return this;
-  }
 }
 
-/** The same, on the opt-in `Long` channel. */
-class LongRecorder implements LongVisitor {
-  readonly longs = true;
+/** The same events, read from the `lo`/`hi` halves instead. */
+class LongRecorder implements Visitor {
   readonly events: IntEvent[] = [];
-  /**
-   * Every value really arrived as a `Long`. The hooks are *declared* `Long`, so
-   * only a runtime check can tell an honest channel from one that quietly kept
-   * handing back numbers — which is exactly the regression to guard against.
-   */
-  allLong = true;
 
-  unsigned(id: number, v: Long): void {
-    this.events.push({ kind: "u", id, value: this.check(v).toBigInt() });
+  unsigned(id: number, _v: number | bigint, lo: number, hi: number): void {
+    this.events.push({ kind: "u", id, value: Long.fromBits(lo, hi).toBigInt() });
   }
-  signed(id: number, v: Long): void {
-    this.events.push({ kind: "s", id, value: this.check(v).toBigInt(true) });
+  signed(id: number, _v: number | bigint, lo: number, hi: number): void {
+    this.events.push({ kind: "s", id, value: Long.fromBits(lo, hi).toBigInt(true) });
   }
-  arrayUnsigned(id: number, _i: number, v: Long): void {
-    this.events.push({ kind: "au", id, value: this.check(v).toBigInt() });
+  arrayUnsigned(id: number, _i: number, _v: number | bigint, lo: number, hi: number): void {
+    this.events.push({ kind: "au", id, value: Long.fromBits(lo, hi).toBigInt() });
   }
-  arraySigned(id: number, _i: number, v: Long): void {
-    this.events.push({ kind: "as", id, value: this.check(v).toBigInt(true) });
-  }
-  sequenceBegin(): LongVisitor {
-    return this;
-  }
-
-  private check(v: Long): Long {
-    if (v instanceof Long) return v;
-    this.allLong = false;
-    return Long.fromValue(v);
+  arraySigned(id: number, _i: number, _v: number | bigint, lo: number, hi: number): void {
+    this.events.push({ kind: "as", id, value: Long.fromBits(lo, hi).toBigInt(true) });
   }
 }
 
 /** A message exercising every integer surface the flag touches. */
 function corpusMessage(): Uint8Array {
-  const os = new OStream();
+  const os = growingOStream();
   UNSIGNED.forEach((v, i) => os.writeUnsigned(i + 1, v));
   SIGNED.forEach((v, i) => os.writeSigned(i + 40, v));
   os.writeUnsignedArray(80, UNSIGNED);
@@ -310,40 +292,35 @@ function feed<V extends PlainRecorder | LongRecorder>(
   chunkSize: number,
   visitor: V,
 ): V {
-  const is = new IStream();
-  // Both recorder shapes are assignable to `AnyVisitor`, which is the point of
-  // that alias: a helper generic over the two needs no cast and no narrowing.
-  const v: AnyVisitor = visitor;
+  const is = new IStream(visitor);
   let status: DecodeStatus = DecodeStatus.Complete;
   for (let i = 0; i < bytes.length; i += chunkSize) {
-    status = is.feed(bytes.subarray(i, i + chunkSize), v);
+    status = is.feed(bytes.subarray(i, i + chunkSize));
   }
   expect(status).toBe(DecodeStatus.Complete);
   return visitor;
 }
 
-describe("Visitor.longs", () => {
+describe("the lo/hi halves alongside every integer value", () => {
   const bytes = corpusMessage();
 
-  it("delivers the same values decode() delivers without it", () => {
+  it("carry the same values the number-first channel carries", () => {
     const plain = new PlainRecorder();
     decode(bytes, plain);
     const longs = new LongRecorder();
     decode(bytes, longs);
 
-    expect(longs.allLong).toBe(true);
     expect(longs.events).toEqual(plain.events);
     // Sanity: the corpus really did reach every hook.
     expect(new Set(plain.events.map((e) => e.kind))).toEqual(new Set(["u", "s", "au", "as"]));
   });
 
-  it("delivers those same values through IStream at every chunk size", () => {
+  it("carry those same values through IStream at every chunk size", () => {
     const reference = new PlainRecorder();
     decode(bytes, reference);
 
     for (let chunkSize = 1; chunkSize <= bytes.length; chunkSize++) {
       const longs = feed(bytes, chunkSize, new LongRecorder());
-      expect(longs.allLong, `chunk size ${chunkSize}`).toBe(true);
       expect(longs.events, `chunk size ${chunkSize}`).toEqual(reference.events);
       // The plain channel is fed alongside, so a chunk size that broke *both*
       // identically could not pass by comparing the two against each other.
@@ -353,14 +330,11 @@ describe("Visitor.longs", () => {
     }
   });
 
-  it("is decided by the ROOT visitor, and a child's own flag is ignored", () => {
-    // Both decoders read `longs` once, at the root, and drive the whole tree on
-    // that channel — refreshing it per scope is a megamorphic property load at
-    // every sequence transition, and it measured (see Visitor.longs). So a child
-    // inherits the root's channel in *both* directions, which is what this pins:
-    // a plain child under a Long root still gets Longs, and an opted-in child
-    // under a plain root still gets number-first values.
-    const os = new OStream();
+  it("reach a nested scope unchanged — there is no channel to lose", () => {
+    // What the old opt-in flag had to promise per scope, the halves get for free:
+    // they are arguments, so a nested scope cannot be on a different channel from
+    // its parent, and a flat visitor has only one channel to begin with.
+    const os = growingOStream();
     os.writeUnsigned(1, 2n ** 63n);
     os.writeSequenceBeginLazy(2);
     os.writeUnsigned(3, 2n ** 63n);
@@ -368,48 +342,28 @@ describe("Visitor.longs", () => {
     os.writeUnsigned(4, 2n ** 63n);
     const wire = os.bytes().slice();
 
-    const seen: string[] = [];
-    const note = (v: unknown): void => {
-      seen.push(v instanceof Long ? "Long" : typeof v);
+    const want = [2n ** 63n, 2n ** 63n, 2n ** 63n];
+    const halves = (b: Uint8Array): bigint[] => {
+      const seen: bigint[] = [];
+      decode(b, { unsigned: (_id, _v, lo, hi) => void seen.push(Long.fromBits(lo, hi).toBigInt()) });
+      return seen;
     };
-    // The casts are the point: the types model the root-decides contract, so a
-    // mixed tree is not expressible — only a cast can build one, and the runtime
-    // must still resolve it the same way. `sequenceBegin` returning a child on
-    // the other channel is exactly what TypeScript refuses here.
-    const longRoot = {
-      longs: true as const,
-      unsigned: (_id: number, v: Long) => note(v),
-      sequenceBegin: () => ({ unsigned: (_id: number, v: unknown) => note(v) }) as never,
-    };
-    const plainRoot = {
-      unsigned: (_id: number, v: number | bigint) => note(v),
-      sequenceBegin: () => ({ longs: true, unsigned: (_id: number, v: unknown) => note(v) }) as never,
-    };
+    expect(halves(wire)).toEqual(want);
 
-    for (const [what, root, want] of [
-      ["a Long root", longRoot, ["Long", "Long", "Long"]],
-      ["a plain root", plainRoot, ["bigint", "bigint", "bigint"]],
-    ] as const) {
-      seen.length = 0;
-      decode(wire, root as Visitor);
-      expect(seen, `${what}, decode()`).toEqual(want);
-
-      // The resumable decoder must agree, at every chunk size.
-      for (let chunkSize = 1; chunkSize <= wire.length; chunkSize++) {
-        seen.length = 0;
-        const is = new IStream();
-        for (let i = 0; i < wire.length; i += chunkSize) {
-          is.feed(wire.subarray(i, i + chunkSize), root as Visitor);
-        }
-        expect(seen, `${what}, chunk size ${chunkSize}`).toEqual(want);
-      }
+    for (let chunkSize = 1; chunkSize <= wire.length; chunkSize++) {
+      const seen: bigint[] = [];
+      const is = new IStream({
+        unsigned: (_id, _v, lo, hi) => void seen.push(Long.fromBits(lo, hi).toBigInt()),
+      });
+      for (let i = 0; i < wire.length; i += chunkSize) is.feed(wire.subarray(i, i + chunkSize));
+      expect(seen, `chunk size ${chunkSize}`).toEqual(want);
     }
   });
 
   it("changes no SofabError code, on any path, at any chunk size", () => {
-    // The channel decides how a *valid* value is materialised and nothing else,
-    // so every malformed / truncated input must produce the identical verdict
-    // with the flag set and unset — and the streaming verdict must match the
+    // How a *valid* value is read decides nothing about validity, so every
+    // malformed / truncated input must produce the identical verdict whichever
+    // callbacks a visitor implements — and the streaming verdict must match the
     // whole-buffer one, which is the parity bar #143 sets.
     const malformed: Record<string, Uint8Array> = {
       // A scalar varint of ten continuation bytes needs an 11th: >64 bits.
@@ -430,7 +384,7 @@ describe("Visitor.longs", () => {
     };
 
     /** The verdict `decode()` reaches, as a code or "ok". */
-    const whole = (b: Uint8Array, v: AnyVisitor): string => {
+    const whole = (b: Uint8Array, v: Visitor): string => {
       try {
         decode(b, v);
         return "ok";
@@ -438,13 +392,13 @@ describe("Visitor.longs", () => {
         return e instanceof SofabError ? e.code : String(e);
       }
     };
-    /** The verdict `IStream` reaches at `chunkSize`, incl. its `end()` status. */
-    const chunked = (b: Uint8Array, v: AnyVisitor, chunkSize: number): string => {
-      const is = new IStream();
+    /** The verdict `IStream` reaches at `chunkSize`, incl. its `status()`. */
+    const chunked = (b: Uint8Array, v: Visitor, chunkSize: number): string => {
+      const is = new IStream(v);
       let status: DecodeStatus = DecodeStatus.Complete;
       try {
         for (let i = 0; i < b.length; i += chunkSize) {
-          status = is.feed(b.subarray(i, i + chunkSize), v);
+          status = is.feed(b.subarray(i, i + chunkSize));
         }
       } catch (e) {
         return e instanceof SofabError ? e.code : String(e);
@@ -453,7 +407,8 @@ describe("Visitor.longs", () => {
     };
 
     const plain: Visitor = {};
-    const longs: LongVisitor = { longs: true };
+    // A visitor that reads the halves — the same decode, a different reading.
+    const longs: Visitor = { unsigned: () => {}, signed: () => {} };
 
     for (const [what, b] of Object.entries(malformed)) {
       expect(whole(b, plain), what).toBe(SofabErrorCode.InvalidMsg);
@@ -465,9 +420,9 @@ describe("Visitor.longs", () => {
     }
 
     for (const [what, b] of Object.entries(truncated)) {
-      // Whole-buffer decode throws INCOMPLETE where the resumable one merely
-      // suspends and reports it from end() — the documented difference between
-      // the two surfaces (§7). Both must be unaffected by the flag.
+      // The one-shot entry point throws INCOMPLETE where the resumable one merely
+      // suspends and reports it from status() — the documented difference between
+      // the two *entry points* (§7), not between two decoders.
       expect(whole(b, longs), `${what} (longs)`).toBe(whole(b, plain));
       expect(whole(b, plain), what).toBe(SofabErrorCode.Incomplete);
       for (let k = 1; k <= b.length; k++) {
@@ -477,10 +432,10 @@ describe("Visitor.longs", () => {
     }
   });
 
-  it("costs a non-opting visitor nothing — values are unchanged", () => {
-    // The regression guard for the opt-in itself: a visitor that says nothing
-    // must still get number-first values, `number` below 2^53 and `bigint` above.
-    const os = new OStream();
+  it("leave the number-first value exactly as it was", () => {
+    // The regression guard: `value` is still `number` below 2^53 and `bigint`
+    // above, whatever a visitor does with the halves beside it.
+    const os = growingOStream();
     os.writeUnsigned(1, 42n);
     os.writeUnsigned(2, 2n ** 63n);
     os.writeSigned(3, -42n);

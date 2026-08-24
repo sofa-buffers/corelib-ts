@@ -58,19 +58,29 @@ export function runChecks(api, label) {
   let stringBytes = null;
   const visitor = {
     unsigned(id, v) {
+      if (inNested) {
+        if (id === 1) got.nested = v;
+        return;
+      }
       if (id === 1) got.u1 = v;
       if (id === 2) got.u2 = v;
     },
     signed(id, v) {
       if (id === 3) got.s3 = v;
     },
-    string(id, total, offset, chunk) {
-      if (id === 7) stringBytes = chunk.slice();
+    string(id, total, offset, src, start, end) {
+      if (id === 7) stringBytes = src.slice(start, end);
     },
-    sequenceBegin() {
-      return { unsigned(id, v) { if (id === 1) got.nested = v; } };
+    // One flat visitor for the whole message: a nested scope is an event, and the
+    // (id, depth) pair says which one it is.
+    sequenceBegin(id, depth) {
+      inNested = id === 12 && depth === 1;
+    },
+    sequenceEnd() {
+      inNested = false;
     },
   };
+  let inNested = false;
   decode(bytes, visitor);
   if (stringBytes) got.str7 = new TextDecoder().decode(stringBytes);
 
@@ -81,18 +91,22 @@ export function runChecks(api, label) {
       signed: (id, v) => out.writeSigned(id, v),
       fp32: (id, v) => out.writeFp32(id, v),
       fp64: (id, v) => out.writeFp64(id, v),
+      // A payload arrives as a range of the fed buffer (`src[start..end)`), so a
+      // consumer that wants the value copies it out during the call (§6.6.3/§6.7).
       string: (() => {
         const buf = {};
-        return (id, total, offset, chunk) => {
-          (buf[id] ??= new Uint8Array(total)).set(chunk, offset);
-          if (offset + chunk.length >= total) out.writeString(id, new TextDecoder().decode(buf[id]));
+        return (id, total, offset, src, start, end) => {
+          if (offset === 0) buf[id] = new Uint8Array(total);
+          buf[id].set(src.subarray(start, end), offset);
+          if (offset + (end - start) >= total) out.writeString(id, new TextDecoder().decode(buf[id]));
         };
       })(),
       blob: (() => {
         const buf = {};
-        return (id, total, offset, chunk) => {
-          (buf[id] ??= new Uint8Array(total)).set(chunk, offset);
-          if (offset + chunk.length >= total) out.writeBlob(id, buf[id]);
+        return (id, total, offset, src, start, end) => {
+          if (offset === 0) buf[id] = new Uint8Array(total);
+          buf[id].set(src.subarray(start, end), offset);
+          if (offset + (end - start) >= total) out.writeBlob(id, buf[id]);
         };
       })(),
       arrayBegin(id, kind) { this._a = { id, kind, vals: [] }; },
@@ -109,7 +123,7 @@ export function runChecks(api, label) {
       },
       // endKeep, not end: a transcode must reproduce its input byte for byte,
       // including an empty frame the input may legitimately carry (§2/§5.1).
-      sequenceBegin(id) { out.writeSequenceBeginLazy(id); return this; },
+      sequenceBegin(id) { out.writeSequenceBeginLazy(id); },
       sequenceEnd() { out.writeSequenceEndKeep(); },
     };
     decode(bytes, transcode);
@@ -121,16 +135,16 @@ export function runChecks(api, label) {
   check("large unsigned decodes as bigint", typeof got.u2 === "bigint" && got.u2 === 2n ** 60n);
   check("signed decodes as number", got.s3 === -7);
   check("UTF-8 string round-trips", got.str7 === "sofa🛋");
-  check("nested-sequence field routed to child visitor", got.nested === 99);
+  check("nested-sequence field routed by (id, depth)", got.nested === 99);
 
   // --- chunked (streaming) decode, one byte at a time ---
   check("streaming feed() returns COMPLETE on the last byte", (() => {
-    const is = new IStream();
+    const is = new IStream({});
     let last;
-    for (let i = 0; i < bytes.length; i++) last = is.feed(bytes.subarray(i, i + 1), {});
+    for (let i = 0; i < bytes.length; i++) last = is.feed(bytes.subarray(i, i + 1));
     // No end step: the status feed() returns *is* the answer (CORELIB_PLAN
-    // §5.2); status() — and its deprecated end() alias — re-read the same value.
-    return last === "COMPLETE" && is.status() === "COMPLETE" && is.end() === "COMPLETE";
+    // §5.2.4); status() re-reads the same value.
+    return last === "COMPLETE" && is.status() === "COMPLETE";
   })());
 
   return failures;

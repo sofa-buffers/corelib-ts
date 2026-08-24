@@ -97,7 +97,7 @@ describe("the documented example does what the section claims", () => {
     expect([...wire]).toStrictEqual([0x09, 0x06, 0x11, 0x08]);
   });
 
-  it("decodes it whole-buffer through the pull cursor", () => {
+  it("decodes it whole-buffer through the one-shot entry point", () => {
     expect([got.x, got.y]).toStrictEqual([3, 4]);
   });
 

@@ -36,9 +36,9 @@ describe("a flush consumes the installation offset (§5.1)", () => {
     // every later one gets the whole buffer because the offset was consumed.
     const sizes: number[] = [];
     const out: number[] = [];
-    const os = new OStream(new Uint8Array(8), 4, (chunk) => {
-      sizes.push(chunk.length);
-      out.push(...chunk);
+    const os = new OStream(new Uint8Array(8), 4, (buf, start, end) => {
+      sizes.push(end - start);
+      for (let i = start; i < end; i++) out.push(buf[i]!);
     });
     write(os);
     os.flush();
@@ -53,10 +53,10 @@ describe("a flush consumes the installation offset (§5.1)", () => {
     const buf = new Uint8Array(8);
     const sizes: number[] = [];
     const out: number[] = [];
-    const os = new OStream(buf, 4, (chunk) => {
-      sizes.push(chunk.length);
-      out.push(...chunk);
-      os.setBuffer(buf, 4); // copy first: the swap invalidates `chunk`
+    const os = new OStream(buf, 4, (b, start, end) => {
+      sizes.push(end - start);
+      for (let i = start; i < end; i++) out.push(b[i]!);
+      os.setBuffer(buf, 4); // copy first: the swap invalidates the region
     });
     write(os);
     os.flush();
@@ -72,9 +72,9 @@ describe("a flush consumes the installation offset (§5.1)", () => {
     // the cursor over it.
     const taken: Uint8Array[] = [];
     const sizes: number[] = [];
-    const os = new OStream(new Uint8Array(8), 4, (chunk) => {
-      taken.push(chunk); // taken, not copied: the buffer is handed on as-is
-      sizes.push(chunk.length);
+    const os = new OStream(new Uint8Array(8), 4, (buf, start, end) => {
+      taken.push(buf.subarray(start, end)); // taken, not copied: handed on as-is
+      sizes.push(end - start);
       os.setBuffer(new Uint8Array(8), 4);
     });
     write(os);
@@ -118,7 +118,9 @@ describe("a flush consumes the installation offset (§5.1)", () => {
     // The same rule under a value that is itself split across flushes: a
     // 10-byte varint through an 8-byte buffer with 4 reserved.
     const out: number[] = [];
-    const os = new OStream(new Uint8Array(8), 4, (chunk) => out.push(...chunk));
+    const os = new OStream(new Uint8Array(8), 4, (buf, start, end) => {
+      for (let i = start; i < end; i++) out.push(buf[i]!);
+    });
     os.writeUnsigned(1, 2n ** 64n - 1n);
     os.writeString(2, "hello, world");
     os.flush();

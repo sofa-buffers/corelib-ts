@@ -3,8 +3,9 @@
  * rather than through `OStream.writeString`.
  *
  * §6.4 / MESSAGE_SPEC §8 forbid silent `U+FFFD` substitution in either
- * direction, and this module has **two** paths that could commit it: the sizing
- * pass (`utf8Length`) and the writing pass (`utf8Write`). `writeString` runs the
+ * direction, and this module has **three** paths that could commit it: the sizing
+ * pass (`utf8Length`), the contiguous writing pass (`utf8Write`) and the
+ * byte-at-a-time one (`utf8WriteSink`, the narrow-buffer path). `writeString` runs the
  * sizing pass first — it needs the byte length for the fixlen word — so through
  * the public API the writer only ever sees strings the sizer already accepted,
  * and its own surrogate rejections are never taken. That is precisely why they
@@ -15,7 +16,14 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { encodeUtf8, utf8Length, utf8Write } from "../src/encode/fixlen.js";
+import { utf8Length, utf8Write, utf8WriteSink } from "../src/encode/fixlen.js";
+
+/** Collect what {@link utf8WriteSink} emits, byte by byte. */
+function encodeUtf8(text: string): Uint8Array {
+  const out: number[] = [];
+  utf8WriteSink(text, { putByte: (b) => void out.push(b) });
+  return Uint8Array.from(out);
+}
 import { SofabError, SofabErrorCode } from "../src/index.js";
 
 const REPLACEMENT = [0xef, 0xbf, 0xbd]; // U+FFFD, the byte triple §8 forbids

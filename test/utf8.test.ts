@@ -16,7 +16,34 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { Cursor, OStream, SofabError, SofabErrorCode } from "../src/index.js";
+import {
+  OStream,
+  SofabError,
+  SofabErrorCode,
+  decode,
+  decodeUtf8,
+  growingOStream,
+  type Visitor,
+} from "../src/index.js";
+
+/**
+ * Materialize the single `string` field of `wire`, the way generated code does:
+ * the decoder reports raw payload pieces (§6.4.5 leaves validation to whoever
+ * materializes), and {@link decodeUtf8} is the strict decoder that turns a range
+ * into a value — rejecting invalid UTF-8 as INVALID_MSG.
+ */
+function readString(wire: Uint8Array): { id: number; text: string } {
+  let id = -1;
+  let text = "";
+  const v: Visitor = {
+    string(fieldId, total, offset, src, start, end) {
+      id = fieldId;
+      if (offset === 0 && end - start === total) text = decodeUtf8(src, start, end);
+    },
+  };
+  decode(wire, v);
+  return { id, text };
+}
 import { hexToBytes } from "./helpers/hex.js";
 import { loadInvalidUtf8 } from "./helpers/vectors.js";
 
@@ -62,12 +89,9 @@ describe("strict UTF-8 (invalid_utf8 vectors)", () => {
 
   describe.each(invalid.map((v) => [v.name, v] as const))("%s", (_name, v) => {
     it("decodes the wire message to the INVALID outcome", () => {
-      // Drive the pull decoder, which materializes the string in the corelib
-      // (fatal TextDecoder). Reading the field must throw INVALID_MSG.
-      const c = new Cursor(hexToBytes(v.serialized_hex));
-      expect(c.readHeader()).toBe(true);
-      expect(c.id).toBe(Number(v.id));
-      const err = caught(() => c.readString());
+      // Materializing the string is what runs the check (§6.4.5), and it must
+      // report the same INVALID verdict as any other malformation.
+      const err = caught(() => readString(hexToBytes(v.serialized_hex)));
       expect(err).toBeInstanceOf(SofabError);
       expect((err as SofabError).code).toBe(SofabErrorCode.InvalidMsg);
     });
@@ -75,7 +99,7 @@ describe("strict UTF-8 (invalid_utf8 vectors)", () => {
     it("rejects encoding an unpaired-surrogate input (where applicable)", () => {
       const s = surrogateStringOf(v.string_hex);
       if (s === null) return; // not representable as a JS string; encode N/A
-      const err = caught(() => new OStream().writeString(v.id, s));
+      const err = caught(() => growingOStream().writeString(v.id, s));
       expect(err).toBeInstanceOf(SofabError);
       expect((err as SofabError).code).toBe(SofabErrorCode.Argument);
     });
@@ -94,7 +118,7 @@ describe("strict UTF-8 encode: unpaired surrogate → InvalidArgument", () => {
 
   describe.each(bad)("%s", (_name, text) => {
     it("rejects on the in-memory (fast) path", () => {
-      const err = caught(() => new OStream().writeString(1, text));
+      const err = caught(() => growingOStream().writeString(1, text));
       expect(err).toBeInstanceOf(SofabError);
       expect((err as SofabError).code).toBe(SofabErrorCode.Argument);
     });
@@ -126,7 +150,7 @@ describe("strict UTF-8 encode: valid strings are byte-identical", () => {
     it("fast path == streaming path (TextEncoder) byte-for-byte", () => {
       // The streaming path encodes valid input via TextEncoder — the pre-change
       // behavior. Equal output proves the fast path is unchanged for valid data.
-      const inMemory = new OStream();
+      const inMemory = growingOStream();
       inMemory.writeString(1, text);
       const streaming = new OStream(new Uint8Array(512));
       streaming.writeString(1, text);
@@ -134,29 +158,23 @@ describe("strict UTF-8 encode: valid strings are byte-identical", () => {
     });
 
     it("round-trips through the fatal decoder", () => {
-      const os = new OStream();
+      const os = growingOStream();
       os.writeString(0, text);
-      const c = new Cursor(os.bytes());
-      expect(c.readHeader()).toBe(true);
-      expect(c.readString()).toBe(text);
+      expect(readString(os.bytes()).text).toBe(text);
     });
   });
 });
 
 describe("strict UTF-8 decode: valid payloads accepted", () => {
   it("accepts embedded U+0000 (not the overlong C0 80 form)", () => {
-    const os = new OStream();
+    const os = growingOStream();
     os.writeString(0, "a\u0000b");
-    const c = new Cursor(os.bytes());
-    c.readHeader();
-    expect(c.readString()).toBe("a\u0000b");
+    expect(readString(os.bytes()).text).toBe("a\u0000b");
   });
 
   it("accepts a correctly paired astral code point", () => {
-    const os = new OStream();
+    const os = growingOStream();
     os.writeString(0, "😀");
-    const c = new Cursor(os.bytes());
-    c.readHeader();
-    expect(c.readString()).toBe("😀");
+    expect(readString(os.bytes()).text).toBe("😀");
   });
 });

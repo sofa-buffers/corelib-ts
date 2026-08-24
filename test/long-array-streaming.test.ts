@@ -17,12 +17,14 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { Long, OStream } from "../src/index.js";
+import { Long, OStream, growingOStream } from "../src/index.js";
 
 /** Encode through a fixed caller buffer of `size`, collecting everything flushed. */
 function streamed(size: number, write: (os: OStream) => void): number[] {
   const out: number[] = [];
-  const os = new OStream(new Uint8Array(size), 0, (b) => out.push(...b));
+  const os = new OStream(new Uint8Array(size), 0, (buf, start, end) => {
+    for (let i = start; i < end; i++) out.push(buf[i]!);
+  });
   write(os);
   os.flush();
   return out;
@@ -30,7 +32,7 @@ function streamed(size: number, write: (os: OStream) => void): number[] {
 
 /** Encode through the growable path. */
 function grown(write: (os: OStream) => void): number[] {
-  const os = new OStream();
+  const os = growingOStream();
   write(os);
   return Array.from(os.bytes());
 }

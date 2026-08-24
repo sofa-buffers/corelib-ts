@@ -1,34 +1,33 @@
 /**
- * `Visitor.fieldBegin` — the push twin of `Cursor.readHeader()`, and where a
- * schema bound must *not* be taken.
+ * `Visitor.fieldBegin` — the field-header event, and where a schema bound must
+ * *not* be taken.
  *
  * The hook was added for the divergence Crucible F-0061 found
  * (`r3_wrapper_reopen_overindex_trunc.bin` against the `probe` schema —
  * `string_array` at id 200, `count: 5`, corelib-ts#97): an element id past the
  * declared `count` in a message that ends inside the element's fixlen word. The
  * push path saw no event at all, because `fixlenBegin` needs the *complete*
- * word, and answered `INCOMPLETE`; the pull path peeked the subtype one byte
+ * word, and answered `INCOMPLETE`; the removed pull path peeked the subtype one byte
  * into that word and answered `INVALID`. The same bytes, two verdicts.
  *
- * It was closed from the other end. CORELIB_PLAN §4.1 makes the pull path's
- * peek the defect: a varint has no value before its final byte, and a decoder
- * MUST NOT let a settled low bit influence an outcome "even when the field's id
- * would violate a schema bound (MESSAGE_SPEC §7.1) once the subtype confirmed
- * the field is the declared one" — because §7.3 skips a field whose subtype
- * contradicts the declared type instead of rejecting it, so the id alone never
- * settles anything. `Cursor` now waits for the whole word, both surfaces answer
- * `INCOMPLETE`, and generated code takes the bound at `fixlenBegin`.
+ * It was closed from both ends. CORELIB_PLAN §4.1.1 makes the peek the defect: a
+ * varint has no value before its final byte, and a decoder MUST NOT let a settled
+ * low bit influence an outcome "even when the field's id would violate a schema
+ * bound (MESSAGE_SPEC §7.1) once the subtype confirmed the field is the declared
+ * one" — because §7.3 skips a field whose subtype contradicts the declared type
+ * instead of rejecting it, so the id alone never settles anything. And §5.3.1 has
+ * since removed the second surface outright, so there is one implementation of the
+ * rule left to keep honest.
  *
- * So this file pins two things: the timing (both surfaces, every chunking) and
- * what the hook is actually for — announcing every field header, in wire order,
- * to a reader that would otherwise implement eight value callbacks to see the
- * same thing.
+ * So this file pins two things: the timing (every chunking, both entry points) and
+ * what the hook is actually for — announcing every field header, in wire order, to
+ * a reader that would otherwise implement eight value callbacks to see the same
+ * thing.
  */
 
 import { describe, expect, it } from "vitest";
 import {
   ArrayKind,
-  Cursor,
   DecodeStatus,
   FixlenSubtype,
   IStream,
@@ -37,8 +36,7 @@ import {
   SofabErrorCode,
   WireType,
   decode,
-  type Visitor,
-} from "../src/index.js";
+  type Visitor, growingOStream } from "../src/index.js";
 
 /** The schema `count` of `probe.string_array`: element ids 0..4 are in range. */
 const COUNT = 5;
@@ -74,18 +72,18 @@ function statusOf(e: unknown): DecodeStatus {
 
 /** Feed `bytes` in `size`-byte chunks (0 = one feed), returning the outcome. */
 function feed(bytes: Uint8Array, size: number, visitor: Visitor): DecodeStatus {
-  const is = new IStream();
+  const is = new IStream(visitor);
   try {
-    if (size <= 0) is.feed(bytes, visitor);
+    if (size <= 0) is.feed(bytes);
     else {
       for (let i = 0; i < bytes.length; i += size) {
-        is.feed(bytes.subarray(i, i + size), visitor);
+        is.feed(bytes.subarray(i, i + size));
       }
     }
   } catch (e) {
     return statusOf(e);
   }
-  return is.end();
+  return is.status();
 }
 
 /** One-shot push decode, reported as the three-valued outcome. */
@@ -98,34 +96,7 @@ function whole(bytes: Uint8Array, visitor: Visitor): DecodeStatus {
   return DecodeStatus.Complete;
 }
 
-// --- the two readers a generator would emit for `probe` --------------------
-
-/** Pull reader: the element bound is taken from `readHeader()`'s `id`. */
-function cursorVerdict(bytes: Uint8Array): DecodeStatus {
-  try {
-    const c = new Cursor(bytes);
-    while (c.readHeader()) {
-      if (c.id === WRAPPER && c.wire === WireType.SequenceStart) {
-        while (c.readHeader()) {
-          // Re-read into a local: `c.wire` is a mutable field, so the outer
-          // `=== SequenceStart` test must not narrow the element's wire type.
-          const wire: number = c.wire;
-          if (wire !== WireType.Fixlen || c.fixSub !== FixlenSubtype.String) {
-            c.skip(wire);
-            continue;
-          }
-          if (c.id >= COUNT) {
-            throw new SofabError(SofabErrorCode.InvalidMsg, `element ${c.id} >= count ${COUNT}`);
-          }
-          c.readString();
-        }
-      } else c.skip(c.wire);
-    }
-    return DecodeStatus.Complete;
-  } catch (e) {
-    return statusOf(e);
-  }
-}
+// --- the reader a generator would emit for `probe` -------------------------
 
 /**
  * Push reader applying the same bound — from `fixlenBegin`, not `fieldBegin`.
@@ -138,22 +109,22 @@ function cursorVerdict(bytes: Uint8Array): DecodeStatus {
  * reaches a verdict the format does not license yet — which is what generated
  * code avoids by binding this to `fixlenBegin`.
  */
-class Elements implements Visitor {
+class Probe implements Visitor {
   readonly seen: string[] = [];
+  private inWrapper = false;
+  sequenceBegin(id: number): void {
+    if (id === WRAPPER) this.inWrapper = true;
+  }
+  sequenceEnd(id: number): void {
+    if (id === WRAPPER) this.inWrapper = false;
+  }
   fixlenBegin(id: number, sub: FixlenSubtype, _total: number): void {
-    if (sub === FixlenSubtype.String && id >= COUNT) {
+    if (this.inWrapper && sub === FixlenSubtype.String && id >= COUNT) {
       throw new SofabError(SofabErrorCode.InvalidMsg, `element ${id} >= count ${COUNT}`);
     }
   }
-  string(id: number, _total: number, _offset: number, chunk: Uint8Array): void {
-    this.seen.push(`${id}:${chunk.length}`);
-  }
-}
-
-class Probe implements Visitor {
-  readonly elements = new Elements();
-  sequenceBegin(id: number): Visitor | void {
-    if (id === WRAPPER) return this.elements;
+  string(id: number, _total: number, _offset: number, _src: Uint8Array, start: number, end: number): void {
+    if (this.inWrapper) this.seen.push(`${id}:${end - start}`);
   }
 }
 
@@ -193,9 +164,8 @@ class Rec implements Visitor {
   arrayEnd(id: number): void {
     this.ev.push(`arrayEnd ${id}`);
   }
-  sequenceBegin(id: number): Visitor | void {
+  sequenceBegin(id: number): void {
     this.ev.push(`sequenceBegin ${id}`);
-    return new Rec(this.ev); // same log, child scope
   }
   sequenceEnd(): void {
     this.ev.push("sequenceEnd");
@@ -224,8 +194,7 @@ describe("Visitor.fieldBegin", () => {
     // Both surfaces therefore answer INCOMPLETE. One byte more (CTRL_OVER below)
     // completes the word and both answer INVALID, which is what shows the bound
     // itself is right and only its TIMING was wrong.
-    it("is INCOMPLETE on both surfaces: the word carrying the subtype never ended", () => {
-      expect(cursorVerdict(REPRO)).toBe(DecodeStatus.Incomplete);
+    it("is INCOMPLETE: the word carrying the subtype never ended", () => {
       expect(whole(REPRO, new Probe())).toBe(DecodeStatus.Incomplete);
     });
 
@@ -237,7 +206,6 @@ describe("Visitor.fieldBegin", () => {
 
     it("rejects the moment one more byte completes that word", () => {
       const done = new Uint8Array([...REPRO, 0x00]);
-      expect(cursorVerdict(done)).toBe(DecodeStatus.Invalid);
       expect(whole(done, new Probe())).toBe(DecodeStatus.Invalid);
       for (const size of CHUNKINGS) {
         expect(feed(done, size, new Probe())).toBe(DecodeStatus.Invalid);
@@ -245,14 +213,13 @@ describe("Visitor.fieldBegin", () => {
     });
 
     it("does not reject the in-range control", () => {
-      expect(cursorVerdict(CTRL)).toBe(DecodeStatus.Complete);
       const p = new Probe();
       expect(whole(CTRL, p)).toBe(DecodeStatus.Complete);
-      expect(p.elements.seen).toEqual(["0:1", "0:1"]);
+      expect(p.seen).toEqual(["0:1", "0:1"]);
       for (const size of CHUNKINGS) {
         const q = new Probe();
         expect(feed(CTRL, size, q)).toBe(DecodeStatus.Complete);
-        expect(q.elements.seen).toEqual(["0:1", "0:1"]);
+        expect(q.seen).toEqual(["0:1", "0:1"]);
       }
     });
   });
@@ -276,35 +243,36 @@ describe("Visitor.fieldBegin", () => {
       0xc6, 0x0c, 0x02, 0x0a, 0x41, 0x07, 0xc6, 0x0c, 0x8a, 0x0a, 0x0b, 0x41, 0x07,
     ]);
 
-    it("is skipped, not rejected, on both surfaces", () => {
-      expect(cursorVerdict(SKIPPED)).toBe(DecodeStatus.Complete);
+    it("is skipped, not rejected", () => {
       const p = new Probe();
       expect(whole(SKIPPED, p)).toBe(DecodeStatus.Complete);
-      expect(p.elements.seen).toEqual(["0:1"]); // only the in-range string element
+      expect(p.seen).toEqual(["0:1"]); // only the in-range string element
       for (const size of CHUNKINGS) {
         expect(feed(SKIPPED, size, new Probe())).toBe(DecodeStatus.Complete);
       }
     });
 
     it("would be rejected by a bound taken from fieldBegin — which is why it is not", () => {
+      let inWrapper = false;
       const wrong: Visitor = {
-        sequenceBegin: (id) =>
-          id === WRAPPER
-            ? {
-                fieldBegin(elem: number): void {
-                  if (elem >= COUNT) {
-                    throw new SofabError(SofabErrorCode.InvalidMsg, `element ${elem} >= count ${COUNT}`);
-                  }
-                },
-              }
-            : undefined,
+        sequenceBegin: (id) => {
+          if (id === WRAPPER) inWrapper = true;
+        },
+        sequenceEnd: (id) => {
+          if (id === WRAPPER) inWrapper = false;
+        },
+        fieldBegin(elem: number): void {
+          if (inWrapper && elem >= COUNT) {
+            throw new SofabError(SofabErrorCode.InvalidMsg, `element ${elem} >= count ${COUNT}`);
+          }
+        },
       };
       expect(whole(SKIPPED, wrong)).toBe(DecodeStatus.Invalid);
     });
   });
 
   describe("the general guarantee", () => {
-    const os = new OStream();
+    const os = growingOStream();
     os.writeUnsigned(1, 7);
     os.writeSigned(2, -7);
     os.writeString(3, "hi");
@@ -345,8 +313,7 @@ describe("Visitor.fieldBegin", () => {
       const rec = new Rec();
       expect(whole(msg, rec)).toBe(DecodeStatus.Complete);
       // No `fieldBegin` for the sequence end: it closes a scope rather than
-      // opening a field, and its id is discarded — the pull twin says the same
-      // by returning false from readHeader() instead of publishing a header.
+      // opening a field, and its id is discarded (§4.9).
       expect(rec.ev).toEqual(expected);
     });
 

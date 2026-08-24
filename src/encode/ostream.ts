@@ -69,7 +69,7 @@ import {
   toBigInt,
 } from "../varint/num64.js";
 import { encodeZigzagVarintLoHi } from "../varint/zigzag.js";
-import { encodeUtf8, utf8Length, utf8Write } from "./fixlen.js";
+import { type ByteSink, utf8Length, utf8Write, utf8WriteSink } from "./fixlen.js";
 import type { BufferOwner, FlushSink } from "./sink.js";
 
 /**
@@ -118,14 +118,10 @@ function checkHandover(buffer: Uint8Array, offset: number, streaming: boolean): 
  * {@link SofabError}. To let the buffer follow the message instead, encode into
  * the accumulator {@link growingOStream} builds.
  */
-export class OStream {
-  // The `!` on the state fields below is the deprecated no-argument
-  // constructor: it returns the accumulator `growingOStream()` builds instead of
-  // `this`, so it is the one path through the constructor that leaves them
-  // unassigned — and the object it leaves behind is discarded unused.
-  private buf!: Uint8Array;
-  private pos!: number;
-  private start!: number;
+export class OStream implements ByteSink {
+  private buf: Uint8Array;
+  private pos: number;
+  private start: number;
   private readonly flushSink: FlushSink | undefined;
   /**
    * Who to ask for the next buffer once this one is full — the caller that owns
@@ -139,7 +135,7 @@ export class OStream {
    * implementations of the same bytes — a bulk one that reserves the worst case
    * up front and a streaming one that emits element by element.
    */
-  private readonly canGrow!: boolean;
+  private readonly canGrow: boolean;
   private depth = 0;
   /**
    * Ids of the innermost open sequences whose header has not been written yet
@@ -150,18 +146,22 @@ export class OStream {
    * never buffer content, so a flush can never split a run.
    *
    * Storage plus an explicit count rather than `push`/`pop`, so the slots are
-   * reused across messages (no allocation on a pooled encoder) and so
-   * {@link OStream.commitPending} can zero the count *before* it writes.
+   * reused across messages and so {@link OStream.commitPending} can zero the
+   * count *before* it writes.
    *
-   * The array grows on demand and is bounded only by `MAX_DEPTH` — there is no
-   * fixed hold-back window and hence no eager-framing fallback, which is what
-   * CORELIB_PLAN §6 ("How deep the hold-back reaches") demands of an
-   * implementation that can allocate: canonical output at *every* depth.
+   * **Fixed size, sized at construction** from `MAX_DEPTH` — the "fixed-size
+   * state whose size this document fixes" of CORELIB_PLAN §6.6.2, and the shape
+   * §6.0.1 asks for: the run covers the full depth, so it is always a contiguous
+   * suffix of the open sequences, every sequence stays canonical however deep it
+   * nests, and there is no eager-framing fallback. Nothing is allocated per
+   * message, per field or per sequence.
    *
-   * Created on the first {@link OStream.writeSequenceBeginLazy}, so a message
-   * with no sequence field never allocates it.
+   * A plain array rather than an `Int32Array`: a 255-slot typed array is an
+   * external backing store on V8 (~3.1 µs to allocate on Node 24, against ~5 ns
+   * for this), and an encoder is constructed per message on the accumulator path.
+   * Slots are written before they are read, so it is never read holey.
    */
-  private pending: number[] | null = null;
+  private readonly pending: number[];
   /** Valid entries in {@link OStream.pending}. */
   private nPending = 0;
   /**
@@ -173,29 +173,20 @@ export class OStream {
    * offset was consumed or re-armed.
    */
   private installs = 0;
-  private kernel!: Kernel;
+  private readonly kernel: Kernel;
 
   /**
-   * @deprecated The corelib allocates no output buffer (CORELIB_PLAN §5.1):
-   * this form is a one-release alias for {@link growingOStream} and will be
-   * removed. Supply a buffer — `new OStream(buf, offset?, flush?)` — or, where
-   * the message has no schema-derived bound, call `growingOStream()`, the
-   * caller that owns a buffer on your behalf.
+   * Encoder over a caller buffer, optionally draining to `flush` as it fills and,
+   * where the caller owns storage it can enlarge, asking `owner` for the next
+   * buffer instead of reporting `BUFFER_FULL`.
+   *
+   * Constructing one is the only allocating step (§6.6): it sizes the hold-back
+   * run from `MAX_DEPTH` and reads the active kernel once. No `write*` call after
+   * that allocates anything.
    */
-  constructor();
-  /**
-   * Encoder over a caller buffer, optionally draining to `flush` as it fills
-   * and, where the caller owns storage it can enlarge, asking `owner` for the
-   * next buffer instead of reporting `BUFFER_FULL`.
-   */
-  constructor(buffer: Uint8Array, offset?: number, flush?: FlushSink, owner?: BufferOwner);
-  constructor(buffer?: Uint8Array, offset = 0, flush?: FlushSink, owner?: BufferOwner) {
-    if (buffer === undefined) {
-      // The allocating half is the caller's, and `growingOStream()` builds that
-      // caller: nothing below this line ever allocates or grows a buffer.
-      return growingOStream();
-    }
+  constructor(buffer: Uint8Array, offset = 0, flush?: FlushSink, owner?: BufferOwner) {
     this.kernel = getKernel();
+    this.pending = new Array<number>(MAX_DEPTH);
     checkHandover(buffer, offset, flush !== undefined);
     this.buf = buffer;
     this.start = offset;
@@ -237,7 +228,10 @@ export class OStream {
   flush(): void {
     if (this.flushSink && this.pos > this.start) {
       const installed = this.installs;
-      this.flushSink(this.buf.subarray(this.start, this.pos));
+      // The installed buffer itself, with the region's coordinates — never a view
+      // this encoder built (§6.6: no allocation after construction) and never
+      // memory from anywhere else (§5.1.6: pass-through is forbidden).
+      this.flushSink(this.buf, this.start, this.pos);
       // A `setBuffer` from inside the callback *is* the new installation and has
       // already placed the cursor at its own offset; only a bare return leaves
       // the old installation in place, and that one is the consumed case.
@@ -392,6 +386,23 @@ export class OStream {
     this.putFp32(value);
   }
 
+  /**
+   * Write an fp32 field from its raw wire bits — the 4 little-endian payload
+   * bytes as one 32-bit word, which is exactly what {@link Visitor.fp32} delivers
+   * as `bits`.
+   *
+   * This is the re-encode half of the bit-exactness rule (CORELIB_PLAN §6.5). A JS
+   * `number` is a 64-bit double, and widening an fp32 **signaling** NaN into one
+   * quiets it, so re-encoding through {@link writeFp32} cannot reproduce such a
+   * payload; the bits go out verbatim here, so decode → re-encode is byte-for-byte
+   * for every fp32 value, sNaN included. §6.5 requires this path of every
+   * double-only target, and names it: "a 32-bit bits accessor".
+   */
+  writeFp32Bits(id: number, bits: number): void {
+    this.fixlenHead(id, 4, FixlenSubtype.Fp32);
+    this.putFp32Bits(bits >>> 0);
+  }
+
   /** Write an IEEE-754 64-bit double field. */
   writeFp64(id: number, value: number): void {
     this.fixlenHead(id, 8, FixlenSubtype.Fp64);
@@ -430,7 +441,7 @@ export class OStream {
         this.pos = p + n;
         return;
       }
-      this.writeRaw(encodeUtf8(text));
+      utf8WriteSink(text, this);
       return;
     }
 
@@ -445,7 +456,11 @@ export class OStream {
       this.pos = utf8Write(text, this.buf, this.pos);
       return;
     }
-    this.writeRaw(encodeUtf8(text));
+    // Buffer too narrow to take the payload in one piece: emit it byte by byte,
+    // draining the sink in between (§5.1.3 — a payload run is divisible at any
+    // byte). Encoding *through* the byte writer rather than into a throwaway
+    // array is what keeps this path allocation-free (§6.6).
+    utf8WriteSink(text, this);
   }
 
   /** Write a blob (arbitrary bytes) field. */
@@ -669,13 +684,11 @@ export class OStream {
     if (id >>> 0 !== id || id > ID_MAX) {
       throw argumentError(`field id ${id} out of range 0..${ID_MAX}`);
     }
-    // No hold-back window and so no eager fallback: the run is an ordinary
-    // growable array already bounded by MAX_DEPTH, so it is *always* a
-    // contiguous suffix of the open sequences and every sequence stays
-    // canonical however deep it nests. That is what CORELIB_PLAN §6 ("How deep
-    // the hold-back reaches") requires of an implementation that can allocate;
-    // only a heap-free profile may bound the run and frame eagerly past it.
-    (this.pending ??= [])[this.nPending++] = id;
+    // The run covers the full MAX_DEPTH (see `pending`), so it is *always* a
+    // contiguous suffix of the open sequences and every sequence stays canonical
+    // however deep it nests — what CORELIB_PLAN §6.0.1 ("How deep the hold-back
+    // reaches") requires. No eager-framing fallback, and no allocation.
+    this.pending[this.nPending++] = id;
     this.depth++;
   }
 
@@ -866,7 +879,27 @@ export class OStream {
     }
     // The bytes live in a local word rather than a scratch array, so a flush
     // sink that re-enters the encoder between them cannot overwrite the tail.
-    const bits = fp32Bits(value);
+    this.putFp32Bits(fp32Bits(value));
+  }
+
+  /**
+   * Write the 4 little-endian bytes of an fp32 held as a 32-bit word (§4.6) — the
+   * path {@link OStream.writeFp32Bits} takes, and the tail of
+   * {@link OStream.putFp32Slow}.
+   */
+  private putFp32Bits(bits: number): void {
+    if (this.buf.length - this.pos >= 4) {
+      const buf = this.buf;
+      let p = this.pos;
+      buf[p++] = bits & 0xff;
+      buf[p++] = (bits >>> 8) & 0xff;
+      buf[p++] = (bits >>> 16) & 0xff;
+      buf[p++] = bits >>> 24;
+      this.pos = p;
+      return;
+    }
+    // Too narrow for four contiguous bytes: split across flushes, byte by byte
+    // (this port declares MIN_OUTPUT_BUFFER = 1, so it splits atomic units too).
     this.putByte(bits & 0xff);
     this.putByte((bits >>> 8) & 0xff);
     this.putByte((bits >>> 16) & 0xff);
@@ -901,8 +934,13 @@ export class OStream {
     this.putByte(hi >>> 24);
   }
 
-  /** Append one byte, draining to the sink first when the buffer is full. */
-  private putByte(b: number): void {
+  /**
+   * Append one byte, draining to the sink first when the buffer is full.
+   *
+   * @internal Public only because {@link utf8WriteSink} writes through it — the
+   * narrow-buffer string path (§5.1.3). Not part of the field-writing API.
+   */
+  putByte(b: number): void {
     if (this.pos === this.buf.length) this.ensureSome(1);
     this.buf[this.pos++] = b;
   }
@@ -955,7 +993,7 @@ export class OStream {
     // emit these same ids a second time. The loop counts with the local `n`, so
     // clearing the field does not cut short the run it is already emitting.
     this.nPending = 0;
-    const pending = this.pending!;
+    const pending = this.pending;
     for (let i = 0; i < n; i++) {
       this.putVarintNum(pending[i]! * 8 + WireType.SequenceStart);
     }
@@ -976,12 +1014,37 @@ export class OStream {
     this.putVarintNum(count);
   }
 
-  /** Copy `data` out, flushing/growing as needed (large payloads stay chunked). */
+  /**
+   * Copy `data` out, flushing/growing as needed (large payloads stay chunked).
+   *
+   * The whole-payload case — the common one, and the only one on a buffer sized
+   * from `MAX_SIZE` or on the accumulator — is a single `set` of the caller's
+   * array: a `memcpy`, and no view at all.
+   *
+   * **A payload split across flushes takes a per-piece view, and that is a
+   * recorded deviation from §6.6.** `TypedArray.set` is the only `memcpy` this
+   * language exposes and it takes a *typed array* as its source, so copying a
+   * *range* of one needs a `subarray` — an object, hence an allocator call, hence
+   * something §6.6 forbids the codec "for anything at all". The allocation-free
+   * alternative is a byte loop, which measures 358 MB/s against 10,963 MB/s for
+   * `set`: a 30x tax on the one path that exists precisely because the payload is
+   * large. This port takes the view instead. The deviation is **bounded and
+   * shaped**: one view per copied piece (never per byte), never handed to anyone —
+   * it is consumed by `set` inside this method and unreachable from any caller, so
+   * §6.7's ban on exposing a borrowed slice is untouched, and so is §5.1.6, which
+   * is why the copy happens at all. `heap-free-codec.test.ts` pins that shape
+   * rather than waiving the rule, and the README records it (§9.0.2).
+   */
   private writeRaw(data: Uint8Array): void {
+    const total = data.length;
     let off = 0;
-    while (off < data.length) {
-      const room = this.ensureSome(data.length - off);
-      this.buf.set(data.subarray(off, off + room), this.pos);
+    while (off < total) {
+      const room = this.ensureSome(total - off);
+      if (off === 0 && room === total) {
+        this.buf.set(data, this.pos);
+      } else {
+        this.buf.set(data.subarray(off, off + room), this.pos);
+      }
       this.pos += room;
       off += room;
     }

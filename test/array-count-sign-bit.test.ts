@@ -15,7 +15,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { Cursor, DecodeStatus, IStream, SofabErrorCode, decode, type Visitor } from "../src/index.js";
+import { DecodeStatus, IStream, SofabErrorCode, decode, type Visitor } from "../src/index.js";
 
 // `0x3b` is an unsigned-array header at id 7: wire type 3 (ArrayUnsigned), id 7.
 // Its value is skipped, which is all the decoder has to do to trip the bug.
@@ -25,20 +25,7 @@ const BIT63 = new Uint8Array([HEADER, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 
 const BIT63_ALT = new Uint8Array([HEADER, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe5, 0x01]);
 const BIT62 = new Uint8Array([HEADER, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x40]);
 
-/** Pull path — a generated decoder skipping a field its schema declares scalar. */
-function viaCursor(bytes: Uint8Array): string {
-  try {
-    const c = new Cursor(bytes);
-    while (c.readHeader()) c.skip(c.wire);
-    return DecodeStatus.Complete;
-  } catch (e) {
-    return (e as { code: string }).code === SofabErrorCode.InvalidMsg
-      ? DecodeStatus.Invalid
-      : DecodeStatus.Incomplete;
-  }
-}
-
-/** Contiguous push path. */
+/** One-shot path — the whole message in one buffer. */
 function viaFast(bytes: Uint8Array): string {
   try {
     decode(bytes, {} as Visitor);
@@ -53,9 +40,9 @@ function viaFast(bytes: Uint8Array): string {
 /** Chunked push path, one byte per feed — the worst case for a resumable varint. */
 function viaIStream(bytes: Uint8Array): string {
   try {
-    const is = new IStream();
-    for (let i = 0; i < bytes.length; i++) is.feed(bytes.subarray(i, i + 1), {} as Visitor);
-    return is.end();
+    const is = new IStream({} as Visitor);
+    for (let i = 0; i < bytes.length; i++) is.feed(bytes.subarray(i, i + 1));
+    return is.status();
   } catch (e) {
     return (e as { code: string }).code === SofabErrorCode.InvalidMsg
       ? DecodeStatus.Invalid
@@ -64,7 +51,6 @@ function viaIStream(bytes: Uint8Array): string {
 }
 
 const paths: Array<[string, (b: Uint8Array) => string]> = [
-  ["Cursor", viaCursor],
   ["decode", viaFast],
   ["IStream", viaIStream],
 ];
@@ -84,19 +70,16 @@ describe("array count with bit 63 set", () => {
     });
   }
 
-  it("all three decode paths agree on every vector", () => {
+  it("both entry points agree on every vector", () => {
     for (const bytes of [BIT63, BIT63_ALT, BIT62]) {
       const verdicts = paths.map(([, run]) => run(bytes));
       expect(new Set(verdicts).size).toBe(1);
     }
   });
 
-  it("a limit cap cannot be slipped either", () => {
+  it("a receiver cap cannot be slipped either", () => {
     // maxArrayCount is compared with the same `>` — a negative count would pass
     // this guard just as it passed the ARRAY_MAX one.
-    const c = new Cursor(BIT63, { maxArrayCount: 4 });
-    expect(() => {
-      while (c.readHeader()) c.skip(c.wire);
-    }).toThrow();
+    expect(() => decode(BIT63, {}, { maxArrayCount: 4 })).toThrow();
   });
 });

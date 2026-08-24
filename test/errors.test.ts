@@ -13,8 +13,7 @@ import {
   OStream,
   SofabError,
   SofabErrorCode,
-  decode,
-} from "../src/index.js";
+  decode, growingOStream } from "../src/index.js";
 import { ID_MAX } from "../src/constants.js";
 
 /** Run `fn` and return the SofabError code it throws (or fail). */
@@ -98,23 +97,23 @@ describe("decoder distinguishes INCOMPLETE from INVALID", () => {
   });
 
   it("streaming end() reports INCOMPLETE for a lone dangling 0x80 (no throw)", () => {
-    const is = new IStream();
-    is.feed(bytes(0x80), {}); // continuation bit set, no terminator
-    expect(is.end()).toBe(DecodeStatus.Incomplete);
+    const is = new IStream({});
+    is.feed(bytes(0x80)); // continuation bit set, no terminator
+    expect(is.status()).toBe(DecodeStatus.Incomplete);
   });
 
   it("streaming end() reports INCOMPLETE for an unbalanced open sequence", () => {
-    const is = new IStream();
-    is.feed(bytes(0x0e), {}); // id 1 sequence start, never closed
-    expect(is.end()).toBe(DecodeStatus.Incomplete);
+    const is = new IStream({});
+    is.feed(bytes(0x0e)); // id 1 sequence start, never closed
+    expect(is.status()).toBe(DecodeStatus.Incomplete);
   });
 
   it("streaming end() reports COMPLETE for a message that ends on a boundary", () => {
-    const os = new OStream();
+    const os = growingOStream();
     os.writeUnsigned(1, 7);
-    const is = new IStream();
-    is.feed(os.bytes(), {});
-    expect(is.end()).toBe(DecodeStatus.Complete);
+    const is = new IStream({});
+    is.feed(os.bytes());
+    expect(is.status()).toBe(DecodeStatus.Complete);
   });
 
   it("a >64-bit varint is INVALID even though it too runs off the end", () => {
@@ -127,34 +126,34 @@ describe("decoder distinguishes INCOMPLETE from INVALID", () => {
 
 describe("encoder rejects bad arguments", () => {
   it("field id below zero", () => {
-    expect(codeOf(() => new OStream().writeUnsigned(-1, 0))).toBe(SofabErrorCode.Argument);
+    expect(codeOf(() => growingOStream().writeUnsigned(-1, 0))).toBe(SofabErrorCode.Argument);
   });
 
   it("field id above ID_MAX", () => {
-    expect(codeOf(() => new OStream().writeUnsigned(ID_MAX + 1, 0))).toBe(SofabErrorCode.Argument);
+    expect(codeOf(() => growingOStream().writeUnsigned(ID_MAX + 1, 0))).toBe(SofabErrorCode.Argument);
   });
 
   it("sequence-begin field id out of range", () => {
     // A lazily-opened sequence may never write its header, so the id is checked
     // at the call that supplied it rather than at commit time.
-    expect(codeOf(() => new OStream().writeSequenceBeginLazy(-1))).toBe(SofabErrorCode.Argument);
-    expect(codeOf(() => new OStream().writeSequenceBeginLazy(ID_MAX + 1))).toBe(SofabErrorCode.Argument);
+    expect(codeOf(() => growingOStream().writeSequenceBeginLazy(-1))).toBe(SofabErrorCode.Argument);
+    expect(codeOf(() => growingOStream().writeSequenceBeginLazy(ID_MAX + 1))).toBe(SofabErrorCode.Argument);
   });
 
   it("unsigned value out of 64-bit range", () => {
-    expect(codeOf(() => new OStream().writeUnsigned(1, -1n))).toBe(SofabErrorCode.Argument);
-    expect(codeOf(() => new OStream().writeUnsigned(1, 1n << 64n))).toBe(SofabErrorCode.Argument);
+    expect(codeOf(() => growingOStream().writeUnsigned(1, -1n))).toBe(SofabErrorCode.Argument);
+    expect(codeOf(() => growingOStream().writeUnsigned(1, 1n << 64n))).toBe(SofabErrorCode.Argument);
   });
 
   it("signed value out of 64-bit range", () => {
-    expect(codeOf(() => new OStream().writeSigned(1, 1n << 63n))).toBe(SofabErrorCode.Argument);
+    expect(codeOf(() => growingOStream().writeSigned(1, 1n << 63n))).toBe(SofabErrorCode.Argument);
   });
 
   it("sequence end without a matching begin is written, not rejected", () => {
     // The encoder writes what it is told; an end with no matching begin makes
     // the *bytes* malformed, which is the decoder's verdict, not the encoder's.
     // No other port refuses it.
-    const os = new OStream();
+    const os = growingOStream();
     os.writeSequenceEnd();
     expect(os.bytes()).toEqual(Uint8Array.from([0x07]));
   });
@@ -181,7 +180,7 @@ describe("encoder rejects bad arguments", () => {
  */
 describe("a non-integer number is an ARGUMENT error, not a bare RangeError", () => {
   /** A growable encoder (bulk kernel path for arrays). */
-  const grown = (): OStream => new OStream();
+  const grown = (): OStream => growingOStream();
   /** A fixed 1-byte caller buffer with a sink (element-at-a-time array path). */
   const streamed = (): OStream => new OStream(new Uint8Array(1), 0, () => {});
 
@@ -212,7 +211,7 @@ describe("a non-integer number is an ARGUMENT error, not a bare RangeError", () 
 
   it("the thrown error is a SofabError, so `instanceof SofabError` catches it", () => {
     try {
-      new OStream().writeUnsigned(1, 1.5);
+      growingOStream().writeUnsigned(1, 1.5);
       throw new Error("expected a throw");
     } catch (e) {
       expect(e).toBeInstanceOf(SofabError);

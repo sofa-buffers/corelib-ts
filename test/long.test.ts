@@ -1,11 +1,26 @@
 /**
- * The bigint-free 64-bit array path: `Long` + the `*ArrayLong` codec methods
- * must produce byte-identical wire to the bigint `write*Array` methods and
- * round-trip exactly through the cursor.
+ * The bigint-free 64-bit path: `Long` + the `*Long` encoder methods must produce
+ * byte-identical wire to their `bigint` twins, and the value must come back
+ * exactly — rebuilt from the `lo`/`hi` halves every integer callback carries, the
+ * decode-side half of the same `bigint`-free route (§6.6.3: a value, not storage).
  */
 
 import { describe, expect, it } from "vitest";
-import { Cursor, Long, OStream } from "../src/index.js";
+import { Long, OStream, decode, growingOStream } from "../src/index.js";
+
+/** Every unsigned array element of `wire`, rebuilt from the visitor's lo/hi halves. */
+function unsignedLongs(wire: Uint8Array): Long[] {
+  const out: Long[] = [];
+  decode(wire, { arrayUnsigned: (_id, _i, _v, lo, hi) => void out.push(Long.fromBits(lo, hi)) });
+  return out;
+}
+
+/** Every signed array element of `wire`, rebuilt from the visitor's lo/hi halves. */
+function signedLongs(wire: Uint8Array): Long[] {
+  const out: Long[] = [];
+  decode(wire, { arraySigned: (_id, _i, _v, lo, hi) => void out.push(Long.fromBits(lo, hi)) });
+  return out;
+}
 
 const U64 = [0n, 1n, 4611686018427387904n, 9223372036854775808n, 18446744073709551615n];
 const I64 = [-9223372036854775807n, -4611686018427387904n, 0n, 4611686018427387903n, 9223372036854775807n];
@@ -48,28 +63,24 @@ describe("Long", () => {
 
 describe("*ArrayLong wire compatibility", () => {
   it("writeUnsignedArrayLong is byte-identical to writeUnsignedArray", () => {
-    const a = new OStream(); a.writeUnsignedArray(6, U64);
-    const b = new OStream(); b.writeUnsignedArrayLong(6, U64.map(Long.fromBigInt));
+    const a = growingOStream(); a.writeUnsignedArray(6, U64);
+    const b = growingOStream(); b.writeUnsignedArrayLong(6, U64.map(Long.fromBigInt));
     expect([...b.bytes()]).toEqual([...a.bytes()]);
   });
 
   it("writeSignedArrayLong is byte-identical to writeSignedArray", () => {
-    const a = new OStream(); a.writeSignedArray(7, I64);
-    const b = new OStream(); b.writeSignedArrayLong(7, I64.map(Long.fromBigInt));
+    const a = growingOStream(); a.writeSignedArray(7, I64);
+    const b = growingOStream(); b.writeSignedArrayLong(7, I64.map(Long.fromBigInt));
     expect([...b.bytes()]).toEqual([...a.bytes()]);
   });
 
-  it("readUnsignedArrayLong round-trips", () => {
-    const os = new OStream(); os.writeUnsignedArrayLong(6, U64.map(Long.fromBigInt));
-    const c = new Cursor(os.bytes());
-    expect(c.readHeader()).toBe(true);
-    expect(c.readUnsignedArrayLong().map((l) => l.toBigInt(false))).toEqual(U64);
+  it("an unsigned Long array round-trips through the visitor's halves", () => {
+    const os = growingOStream(); os.writeUnsignedArrayLong(6, U64.map(Long.fromBigInt));
+    expect(unsignedLongs(os.bytes()).map((l) => l.toBigInt(false))).toEqual(U64);
   });
 
-  it("readSignedArrayLong round-trips", () => {
-    const os = new OStream(); os.writeSignedArrayLong(7, I64.map(Long.fromBigInt));
-    const c = new Cursor(os.bytes());
-    expect(c.readHeader()).toBe(true);
-    expect(c.readSignedArrayLong().map((l) => l.toBigInt(true))).toEqual(I64);
+  it("a signed Long array round-trips through the visitor's halves", () => {
+    const os = growingOStream(); os.writeSignedArrayLong(7, I64.map(Long.fromBigInt));
+    expect(signedLongs(os.bytes()).map((l) => l.toBigInt(true))).toEqual(I64);
   });
 });

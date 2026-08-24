@@ -11,8 +11,7 @@ import {
   IStream,
   OStream,
   SofabError,
-  SofabErrorCode,
-} from "../src/index.js";
+  SofabErrorCode, growingOStream } from "../src/index.js";
 import { bytesToHex, hexToBytes } from "./helpers/hex.js";
 import { TranscodeVisitor } from "./helpers/recording-visitor.js";
 import { loadVectors } from "./helpers/vectors.js";
@@ -20,15 +19,14 @@ import { loadVectors } from "./helpers/vectors.js";
 const vectors = loadVectors();
 
 function feedInChunks(bytes: Uint8Array, chunkSize: number): string {
-  const out = new OStream();
-  const visitor = new TranscodeVisitor(out);
-  const is = new IStream();
+  const out = growingOStream();
+  const is = new IStream(new TranscodeVisitor(out));
   // Every `feed` returns the outcome for the bytes consumed so far and needs no
   // end step (CORELIB_PLAN §6): on a whole vector the last one must say
   // COMPLETE, at every chunk size, and the accessor must agree with it.
   let status: DecodeStatus = DecodeStatus.Complete;
   for (let i = 0; i < bytes.length; i += chunkSize) {
-    status = is.feed(bytes.subarray(i, i + chunkSize), visitor);
+    status = is.feed(bytes.subarray(i, i + chunkSize));
     expect(status).toBe(is.status());
   }
   expect(status).toBe(DecodeStatus.Complete);
@@ -81,15 +79,14 @@ describe("chunked feeding", () => {
         return (seed >>> 0) % 13; // 0..12, straddling VARINT_MAX_BYTES
       };
       for (let trial = 0; trial < 8; trial++) {
-        const out = new OStream();
-        const visitor = new TranscodeVisitor(out);
-        const is = new IStream();
+        const out = growingOStream();
+        const is = new IStream(new TranscodeVisitor(out));
         for (let i = 0; i < bytes.length; ) {
           const take = next() + 1;
-          is.feed(bytes.subarray(i, i + take), visitor);
+          is.feed(bytes.subarray(i, i + take));
           i += take;
         }
-        is.end();
+        is.status();
         expect(bytesToHex(out.bytes())).toBe(vector.serialized.hex);
       }
     });
@@ -113,11 +110,11 @@ describe("chunked feeding", () => {
         for (let chunkSize = 1; chunkSize <= bytes.length; chunkSize++) {
           let code: SofabErrorCode | "none" = "none";
           try {
-            const is = new IStream();
+            const is = new IStream({});
             for (let i = 0; i < bytes.length; i += chunkSize) {
-              is.feed(bytes.subarray(i, i + chunkSize), {});
+              is.feed(bytes.subarray(i, i + chunkSize));
             }
-            is.end();
+            is.status();
           } catch (e) {
             if (!(e instanceof SofabError)) throw e;
             code = e.code;
@@ -132,23 +129,23 @@ describe("chunked feeding", () => {
     it("still suspends on nine continuation bytes", () => {
       const bytes = Uint8Array.from([0x01, ...Array(9).fill(0x80)]);
       for (let chunkSize = 1; chunkSize <= bytes.length; chunkSize++) {
-        const is = new IStream();
+        const is = new IStream({});
         for (let i = 0; i < bytes.length; i += chunkSize) {
-          is.feed(bytes.subarray(i, i + chunkSize), {});
+          is.feed(bytes.subarray(i, i + chunkSize));
         }
-        expect(is.end(), `chunk size ${chunkSize}`).toBe(DecodeStatus.Incomplete);
+        expect(is.status(), `chunk size ${chunkSize}`).toBe(DecodeStatus.Incomplete);
       }
     });
   });
 
   it("handles an empty chunk without advancing", () => {
-    const os = new OStream();
+    const os = growingOStream();
     os.writeUnsigned(1, 42n);
-    const out = new OStream();
-    const is = new IStream();
-    is.feed(new Uint8Array(0), new TranscodeVisitor(out));
-    is.feed(os.bytes(), new TranscodeVisitor(out));
-    is.end();
+    const out = growingOStream();
+    const is = new IStream(new TranscodeVisitor(out));
+    is.feed(new Uint8Array(0));
+    is.feed(os.bytes());
+    is.status();
     expect(bytesToHex(out.bytes())).toBe(bytesToHex(os.bytes()));
   });
 });

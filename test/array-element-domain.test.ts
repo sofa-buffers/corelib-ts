@@ -12,7 +12,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { OStream, SofabError, SofabErrorCode } from "../src/index.js";
+import { OStream, SofabError, SofabErrorCode, growingOStream } from "../src/index.js";
 
 /** A streaming encoder: fixed caller buffer plus a sink that drops the bytes. */
 function streaming(): OStream {
@@ -55,51 +55,51 @@ describe("array elements outside the 64-bit domain are rejected (§6.2)", () => 
   it.each(badUnsigned.map((v) => [String(v), v] as const))(
     "unsigned %s is ARGUMENT in the in-memory mode",
     (label, v) => {
-      expectArgument(() => new OStream().writeUnsignedArray(1, [v]), `unsigned ${label}`);
+      expectArgument(() => growingOStream().writeUnsignedArray(1, [v]), `unsigned ${label}`);
     },
   );
 
   it.each(badSigned.map((v) => [String(v), v] as const))(
     "signed %s is ARGUMENT in the in-memory mode",
     (label, v) => {
-      expectArgument(() => new OStream().writeSignedArray(1, [v]), `signed ${label}`);
+      expectArgument(() => growingOStream().writeSignedArray(1, [v]), `signed ${label}`);
     },
   );
 
   it("both modes agree on every out-of-domain unsigned element", () => {
     for (const v of badUnsigned) {
       expectArgument(() => streaming().writeUnsignedArray(1, [v]), `streaming unsigned ${v}`);
-      expectArgument(() => new OStream().writeUnsignedArray(1, [v]), `in-memory unsigned ${v}`);
+      expectArgument(() => growingOStream().writeUnsignedArray(1, [v]), `in-memory unsigned ${v}`);
     }
   });
 
   it("both modes agree on every out-of-domain signed element", () => {
     for (const v of badSigned) {
       expectArgument(() => streaming().writeSignedArray(1, [v]), `streaming signed ${v}`);
-      expectArgument(() => new OStream().writeSignedArray(1, [v]), `in-memory signed ${v}`);
+      expectArgument(() => growingOStream().writeSignedArray(1, [v]), `in-memory signed ${v}`);
     }
   });
 
   it("rejects a bad element in the middle of an otherwise valid array", () => {
     expectArgument(
-      () => new OStream().writeUnsignedArray(1, [1n, 2n, -1n, 4n]),
+      () => growingOStream().writeUnsignedArray(1, [1n, 2n, -1n, 4n]),
       "interior unsigned -1n",
     );
     expectArgument(
-      () => new OStream().writeSignedArray(1, [1n, 2n, 1n << 63n, 4n]),
+      () => growingOStream().writeSignedArray(1, [1n, 2n, 1n << 63n, 4n]),
       "interior signed 2^63",
     );
   });
 
   it("the domain edges themselves still encode", () => {
-    const os = new OStream();
+    const os = growingOStream();
     os.writeUnsignedArray(1, [0n, (1n << 64n) - 1n, 0, Number.MAX_SAFE_INTEGER]);
     os.writeSignedArray(2, [-(2n ** 63n), 2n ** 63n - 1n, -1, 0, 1]);
     expect(os.bytesUsed).toBeGreaterThan(0);
   });
 
   it("a rejected element never reaches the wire as a wrapped value", () => {
-    const os = new OStream();
+    const os = growingOStream();
     expect(() => os.writeUnsignedArray(1, [2n ** 64n])).toThrow(SofabError);
     // Whatever the encoder kept, it must not contain the reduced value 0 as a
     // payload: only the header and count were written before the throw.

@@ -71,9 +71,9 @@ describe("skip-ids scenario", () => {
 
     it("auto-skips correctly when fed one byte at a time", () => {
       const sv = new SkipVisitor(skip);
-      const is = new IStream();
-      for (let i = 0; i < bytes.length; i++) is.feed(bytes.subarray(i, i + 1), sv);
-      expect(() => is.end()).not.toThrow();
+      const is = new IStream(sv);
+      for (let i = 0; i < bytes.length; i++) is.feed(bytes.subarray(i, i + 1));
+      expect(() => is.status()).not.toThrow();
       expect(sv.events.map(key)).toEqual(expected);
     });
   });

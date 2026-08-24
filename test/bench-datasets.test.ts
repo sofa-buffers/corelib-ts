@@ -95,10 +95,10 @@ describe("bench datasets (BENCH_SPEC)", () => {
       const parts: number[] = [];
       const streamed = new Uint8Array(BLOB_ENCODED_SIZE);
       let at = 0;
-      const os = blobStreamingStream((chunk) => {
-        parts.push(chunk.length);
-        streamed.set(chunk, at);
-        at += chunk.length;
+      const os = blobStreamingStream((buf, start, end) => {
+        parts.push(end - start);
+        streamed.set(buf.subarray(start, end), at);
+        at += end - start;
       });
       encodeBlobStreaming(os, blob);
       expect(at).toBe(BLOB_ENCODED_SIZE);
@@ -112,8 +112,8 @@ describe("bench datasets (BENCH_SPEC)", () => {
       const wire = encodeBlobOneShot(blobOneShotStream(), blob);
       let delivered = 0;
       const v: Visitor = {
-        blob: (_id, _total, _off, chunk) => {
-          delivered += chunk.length;
+        blob: (_id, _total, _off, _src, start, end) => {
+          delivered += end - start;
         },
       };
       expect(decodeChunked(wire, v, BLOB_CHUNK)).toBe(DecodeStatus.Complete);
@@ -137,27 +137,26 @@ describe("bench datasets (BENCH_SPEC)", () => {
       let depth = 0;
       let maxDepth = 0;
 
-      const wrapper: Visitor = {
-        string: (id, _t, _o, chunk) => void (items[id] = utf8.decode(chunk)),
-        sequenceEnd: () => void depth--,
-      };
-      const inner: Visitor = {
-        sequenceBegin: () => {
-          maxDepth = Math.max(maxDepth, ++depth);
-          return inner;
-        },
-        sequenceEnd: () => void depth--,
-      };
+      // One flat visitor for the whole message: the wrapper array at id 1 is
+      // recognised by the (id, depth) pair sequenceBegin reports, which is how a
+      // flat reader routes a nested scope (§5.3.1).
+      let inWrapper = false;
       const root: Visitor = {
         fieldBegin: (id) => {
           if (depth === 0) top.push(id);
         },
-        string: (_id, total) => void (stringBytes = total),
-        sequenceBegin: (id) => {
-          maxDepth = Math.max(maxDepth, ++depth);
-          return id === 1 ? wrapper : inner;
+        string: (id, total, _offset, src, start, end) => {
+          if (inWrapper) items[id] = utf8.decode(src.subarray(start, end));
+          else stringBytes = total;
         },
-        sequenceEnd: () => void depth--,
+        sequenceBegin: (id, d) => {
+          maxDepth = Math.max(maxDepth, ++depth);
+          if (id === 1 && d === 1) inWrapper = true;
+        },
+        sequenceEnd: (id, d) => {
+          depth--;
+          if (id === 1 && d === 1) inWrapper = false;
+        },
       };
       decode(wire, root);
 
@@ -174,8 +173,8 @@ describe("bench datasets (BENCH_SPEC)", () => {
     });
 
     it("skip-all walks the whole message without materializing a field", () => {
-      // The `decode: composite skip-all` row: every top-level field and every
-      // sub-sequence discarded by the pull decoder's skip machinery.
+      // The `decode: composite skip-all` row: every top-level field seen and
+      // every sub-sequence declined, so the decoder's own skip machinery walks it.
       expect(skipAll(wire)).toBe(4);
     });
 
@@ -188,8 +187,8 @@ describe("bench datasets (BENCH_SPEC)", () => {
 
   it("the discard sink folds bytes without accumulating them", () => {
     const s = new DiscardSink();
-    s.add(Uint8Array.of(1, 2, 3));
-    s.add(Uint8Array.of(4));
+    s.add(Uint8Array.of(1, 2, 3), 0, 3);
+    s.add(Uint8Array.of(4), 0, 1);
     expect(s.flushes).toBe(2);
     expect(s.bytes).toBe(4);
     expect(s.acc).toBe(1 ^ 4);

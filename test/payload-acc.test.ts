@@ -12,7 +12,8 @@
  * every two-cut split.
  *
  * The other properties pinned here are the ones a caller depends on and cannot
- * see: that a whole-in-one-chunk payload is handed back without a copy, that a
+ * see: that even a whole-in-one-piece payload is copied rather than aliased
+ * (§6.7), that a
  * completed payload is not clobbered by the next one, that `offset === 0` clears
  * whatever an abandoned field left behind, and that a fragment with no payload in
  * progress allocates nothing at all — including when it claims two billion bytes.
@@ -41,7 +42,7 @@ function feedSplit(p: Uint8Array, cuts: number[]): Uint8Array {
   const done: Uint8Array[] = [];
   for (let i = 0; i < bounds.length - 1; i++) {
     const from = bounds[i]!;
-    const got = acc.take(p.length, from, p.subarray(from, bounds[i + 1]!));
+    const got = acc.take(p.length, from, p, from, bounds[i + 1]!);
     if (got !== null) done.push(got);
   }
   expect(done, `cuts at ${cuts.join(",")}`).toHaveLength(1);
@@ -51,12 +52,18 @@ function feedSplit(p: Uint8Array, cuts: number[]): Uint8Array {
 describe("PayloadAcc joins a split payload", () => {
   const p = payload(11);
 
-  it("hands back the chunk itself when the payload arrives whole", () => {
+  it("copies even when the payload arrives whole — it never aliases the input", () => {
     const acc = new PayloadAcc();
-    const got = acc.take(p.length, 0, p);
-    // Identity, not just equality: the no-copy path is the reason this class is
-    // affordable on the contiguous decode path, where it is always taken.
-    expect(got).toBe(p);
+    const got = acc.take(p.length, 0, p, 0, p.length)!;
+    // §6.7: "there is no mode in which the destination aliases the input". The
+    // whole-in-one-piece path is where a port is tempted to hand the input back,
+    // and a caller that stored the result would then watch it rot when the next
+    // `feed` reuses the buffer.
+    expect(got).not.toBe(p);
+    expect([...got]).toStrictEqual([...p]);
+    const before = [...got];
+    p.fill(0xee);
+    expect([...got]).toStrictEqual(before);
   });
 
   it("is unaffected by where the payload is cut — every offset 0..n", () => {
@@ -76,37 +83,36 @@ describe("PayloadAcc joins a split payload", () => {
   it("joins a byte-at-a-time feed, reporting null until the last byte", () => {
     const acc = new PayloadAcc();
     const seen: (Uint8Array | null)[] = [];
-    for (let i = 0; i < p.length; i++) seen.push(acc.take(p.length, i, p.subarray(i, i + 1)));
+    for (let i = 0; i < p.length; i++) seen.push(acc.take(p.length, i, p, i, i + 1));
     expect(seen.slice(0, -1).every((x) => x === null)).toBe(true);
     expect([...seen[seen.length - 1]!]).toStrictEqual([...p]);
   });
 
   it("copies out of the fed chunk, so a reused chunk cannot corrupt the join", () => {
-    // CORELIB_PLAN §6: a fed chunk is reusable the moment `feed` returns, and a
-    // streaming caller reuses one buffer. Only the joined halves are at stake —
-    // the whole-in-one-chunk result is documented as borrowed.
+    // CORELIB_PLAN §6.0: a fed chunk is reusable the moment `feed` returns, and a
+    // streaming caller reuses one buffer.
     const acc = new PayloadAcc();
     const scratch = new Uint8Array(4);
     scratch.set(p.subarray(0, 4));
-    expect(acc.take(p.length, 0, scratch)).toBeNull();
+    expect(acc.take(p.length, 0, scratch, 0, scratch.length)).toBeNull();
     scratch.fill(0xee);
     scratch.set(p.subarray(4, 8));
-    expect(acc.take(p.length, 4, scratch)).toBeNull();
+    expect(acc.take(p.length, 4, scratch, 0, scratch.length)).toBeNull();
     scratch.fill(0xee);
-    const got = acc.take(p.length, 8, p.subarray(8));
+    const got = acc.take(p.length, 8, p, 8, p.length);
     expect([...got!]).toStrictEqual([...p]);
   });
 
   it("returns a zero-length payload as an empty result", () => {
     const acc = new PayloadAcc();
-    const got = acc.take(0, 0, new Uint8Array(0));
+    const got = acc.take(0, 0, new Uint8Array(0), 0, 0);
     expect(got).not.toBeNull();
     expect(got!.length).toBe(0);
   });
 
   it("trims a chunk that runs past the declared total", () => {
     const acc = new PayloadAcc();
-    const got = acc.take(4, 0, p);
+    const got = acc.take(4, 0, p, 0, p.length);
     expect([...got!]).toStrictEqual([...p.subarray(0, 4)]);
   });
 
@@ -114,8 +120,8 @@ describe("PayloadAcc joins a split payload", () => {
     // The joined path's version of the same guard: without it the copy would
     // leave the corelib as a platform RangeError rather than a SofabError.
     const acc = new PayloadAcc();
-    expect(acc.take(6, 0, p.subarray(0, 3))).toBeNull();
-    const got = acc.take(6, 3, p.subarray(3, 9));
+    expect(acc.take(6, 0, p, 0, 3)).toBeNull();
+    const got = acc.take(6, 3, p, 3, 9);
     expect([...got!]).toStrictEqual([...p.subarray(0, 6)]);
   });
 });
@@ -124,11 +130,11 @@ describe("PayloadAcc keeps consecutive payloads apart", () => {
   it("does not clobber a finished payload with the next one", () => {
     const acc = new PayloadAcc();
     const first = payload(6);
-    expect(acc.take(6, 0, first.subarray(0, 3))).toBeNull();
-    const a = acc.take(6, 3, first.subarray(3))!;
+    expect(acc.take(6, 0, first, 0, 3)).toBeNull();
+    const a = acc.take(6, 3, first, 3, first.length)!;
     const second = payload(6).map((b) => b ^ 0xff);
-    expect(acc.take(6, 0, second.subarray(0, 3))).toBeNull();
-    acc.take(6, 3, second.subarray(3));
+    expect(acc.take(6, 0, second, 0, 3)).toBeNull();
+    acc.take(6, 3, second, 3, second.length);
     expect([...a]).toStrictEqual([...first]);
   });
 
@@ -137,18 +143,18 @@ describe("PayloadAcc keeps consecutive payloads apart", () => {
     // and no completion. The next `offset === 0` must reset rather than append.
     const acc = new PayloadAcc();
     const abandoned = payload(9);
-    expect(acc.take(9, 0, abandoned.subarray(0, 5))).toBeNull();
+    expect(acc.take(9, 0, abandoned, 0, 5)).toBeNull();
     const next = payload(4);
-    const got = acc.take(4, 0, next);
+    const got = acc.take(4, 0, next, 0, next.length);
     expect([...got!]).toStrictEqual([...next]);
   });
 
   it("ignores a fragment with no payload in progress", () => {
     const acc = new PayloadAcc();
-    expect(acc.take(8, 4, payload(4))).toBeNull();
+    expect(acc.take(8, 4, payload(4), 0, 4)).toBeNull();
     // …and the accumulator is still usable for a real payload afterwards.
     const p = payload(3);
-    expect([...acc.take(3, 0, p)!]).toStrictEqual([...p]);
+    expect([...acc.take(3, 0, p, 0, p.length)!]).toStrictEqual([...p]);
   });
 
   it("allocates nothing for a two-billion-byte claim it never starts", () => {
@@ -156,6 +162,6 @@ describe("PayloadAcc keeps consecutive payloads apart", () => {
     // Nothing is sized until a payload actually starts at offset 0, so a
     // fragment claiming one must return null rather than reserve the buffer.
     const acc = new PayloadAcc();
-    expect(acc.take(2 ** 31 - 1, 1, Uint8Array.of(1, 2, 3))).toBeNull();
+    expect(acc.take(2 ** 31 - 1, 1, Uint8Array.of(1, 2, 3), 0, 3)).toBeNull();
   });
 });

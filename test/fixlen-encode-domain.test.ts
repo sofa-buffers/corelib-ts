@@ -12,7 +12,7 @@
  *
  * `writeFixlen` is the byte-level entry point — the one writer that takes the
  * subtype from the caller instead of picking it — and is what the documented
- * bit-exact transcode path uses (`Cursor.readFp32Raw()` → `writeFixlen(id, raw,
+ * bit-exact transcode path uses (`Visitor.fp32`'s `bits` → `writeFp32Bits(id, bits`,
  * Fp32)`). It validated only the length ceiling (corelib-ts#110), so a caller
  * handing over a wrongly sized slice got silently malformed output instead of
  * an error. The typed writers (`writeFp32`, `writeFp64`, `writeString`,
@@ -20,7 +20,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { FixlenSubtype, OStream, SofabError, SofabErrorCode, decode } from "../src/index.js";
+import { FixlenSubtype, OStream, SofabError, SofabErrorCode, decode, growingOStream } from "../src/index.js";
 
 /** The reserved subtypes, as the runtime values a cast can smuggle in. */
 const RESERVED = [4, 5, 6, 7] as unknown as FixlenSubtype[];
@@ -45,12 +45,12 @@ function refused(os: OStream, fn: () => void): void {
 describe("writeFixlen rejects a reserved subtype (§4.6, §6.3)", () => {
   for (const sub of RESERVED) {
     it(`subtype 0x${(sub as number).toString(16)}`, () => {
-      const os = new OStream();
+      const os = growingOStream();
       refused(os, () => os.writeFixlen(0, Uint8Array.of(1), sub));
     });
 
     it(`subtype 0x${(sub as number).toString(16)} with an empty payload`, () => {
-      const os = new OStream();
+      const os = growingOStream();
       refused(os, () => os.writeFixlen(3, new Uint8Array(0), sub));
     });
   }
@@ -59,29 +59,29 @@ describe("writeFixlen rejects a reserved subtype (§4.6, §6.3)", () => {
 describe("writeFixlen rejects a wrong-width fp32 / fp64 payload (§4.6, §6.3)", () => {
   for (const len of [0, 1, 3, 5, 8]) {
     it(`fp32 of ${len} bytes`, () => {
-      const os = new OStream();
+      const os = growingOStream();
       refused(os, () => os.writeFixlen(0, new Uint8Array(len), FixlenSubtype.Fp32));
     });
   }
 
   for (const len of [0, 1, 4, 7, 9]) {
     it(`fp64 of ${len} bytes`, () => {
-      const os = new OStream();
+      const os = growingOStream();
       refused(os, () => os.writeFixlen(0, new Uint8Array(len), FixlenSubtype.Fp64));
     });
   }
 
   it("accepts the exact widths, and they match the typed writers byte for byte", () => {
-    const fp32 = new OStream();
+    const fp32 = growingOStream();
     fp32.writeFixlen(0, Uint8Array.of(0x00, 0x00, 0x80, 0x3f), FixlenSubtype.Fp32);
-    const typed32 = new OStream();
+    const typed32 = growingOStream();
     typed32.writeFp32(0, 1);
     expect(fp32.bytes()).toEqual(typed32.bytes());
     expect(fp32.bytes().subarray(0, 2)).toEqual(Uint8Array.of(0x02, 0x20)); // (4<<3)|0
 
-    const fp64 = new OStream();
+    const fp64 = growingOStream();
     fp64.writeFixlen(0, Uint8Array.of(0, 0, 0, 0, 0, 0, 0xf0, 0x3f), FixlenSubtype.Fp64);
-    const typed64 = new OStream();
+    const typed64 = growingOStream();
     typed64.writeFp64(0, 1);
     expect(fp64.bytes()).toEqual(typed64.bytes());
     expect(fp64.bytes().subarray(0, 2)).toEqual(Uint8Array.of(0x02, 0x41)); // (8<<3)|1
@@ -91,13 +91,13 @@ describe("writeFixlen rejects a wrong-width fp32 / fp64 payload (§4.6, §6.3)",
 describe("writeFixlen still takes any string / blob length", () => {
   for (const len of [0, 1, 4, 7, 8, 300]) {
     it(`blob of ${len} bytes`, () => {
-      const os = new OStream();
+      const os = growingOStream();
       os.writeBlob(9, new Uint8Array(len));
       expect(os.bytes().length).toBeGreaterThan(0);
     });
 
     it(`string of ${len} bytes`, () => {
-      const os = new OStream();
+      const os = growingOStream();
       os.writeFixlen(9, new Uint8Array(len).fill(0x61), FixlenSubtype.String);
       expect(os.bytes().length).toBeGreaterThan(0);
     });
@@ -120,7 +120,7 @@ describe("whatever writeFixlen accepts, a decoder accepts (§4.6)", () => {
   for (const sub of subtypes) {
     for (const len of [0, 3, 4, 7, 8]) {
       it(`subtype 0x${(sub as number).toString(16)}, ${len} bytes`, () => {
-        const os = new OStream();
+        const os = growingOStream();
         let threw = false;
         try {
           os.writeFixlen(11, new Uint8Array(len), sub);

@@ -17,9 +17,9 @@
 import {
   OStream,
   growingOStream,
-  Cursor,
   IStream,
   DecodeStatus,
+  decode,
   type FlushSink,
   type Visitor,
 } from "../../src/index.js";
@@ -35,7 +35,7 @@ class Point {
   }
 
   static decode(bytes: Uint8Array): Point {
-    return _decodeFromPoint(new Cursor(bytes));
+    return _decodeIntoPoint(bytes, new Point());
   }
 
   /** The streaming half: a reader bound to the corelib's resumable IStream. */
@@ -44,32 +44,22 @@ class Point {
   }
 }
 
-// The cursor-level steps sit beside the class, not on it: CORELIB_PLAN §6.1.1
+// The decode-into step sits beside the class, not on it: CORELIB_PLAN §6.1.1
 // closes the generated object's surface to encode / decode / try_decode /
 // serialize / deserialize / decoder, and `decode_from` / `decode_into` are two of
-// the spellings it names as forbidden. They stay module-private — reachable from
+// the spellings it names as forbidden. It stays module-private — reachable from
 // the sibling classes that decode into one another, and from nowhere else.
-
-function _decodeFromPoint(c: Cursor): Point {
-  return _decodeIntoPoint(c, new Point());
-}
 
 // Decodes into `o`, so a re-opened sequence continues the scope an earlier
 // opening populated (MESSAGE_SPEC §7.4).
-function _decodeIntoPoint(c: Cursor, o: Point): Point {
-  while (c.readHeader()) {
-    switch (c.id) {
-      case 1: o.x = Number(c.readSigned()); break;
-      case 2: o.y = Number(c.readSigned()); break;
-      // case 3: _decodeIntoChild(c, o.child); break;     // nested sequence
-      default: c.skip(c.wire); break;                     // forward-compatible
-    }
-  }
+function _decodeIntoPoint(bytes: Uint8Array, o: Point): Point {
+  decode(bytes, new PointVisitor(o));
   return o;
 }
 
-// generated alongside it: the visitor that fills a Point, one callback per
-// wire type instead of one `case` per id
+// generated alongside it: the visitor that fills a Point — the library's only
+// decode surface (§5.3.1), one callback per wire type instead of one `case` per id.
+// A visitor *is* the decode-into step: it writes into the object it was handed.
 class PointVisitor implements Visitor {
   private readonly out: Point;
   constructor(out: Point) { this.out = out; }
@@ -85,10 +75,9 @@ class PointVisitor implements Visitor {
 // ...and the handle Point.decoder() returns: an IStream plus its destination
 class PointDecoder {
   readonly message = new Point();
-  private readonly is = new IStream();
-  private readonly vis = new PointVisitor(this.message);
+  private readonly is = new IStream(new PointVisitor(this.message));
 
-  feed(chunk: Uint8Array): DecodeStatus { return this.is.feed(chunk, this.vis); }
+  feed(chunk: Uint8Array): DecodeStatus { return this.is.feed(chunk); }
   status(): DecodeStatus { return this.is.status(); }
 }
 
@@ -99,9 +88,11 @@ const os = growingOStream(); p.serialize(os);
 const wire = os.bytes().slice();
 const got = Point.decode(wire);            // got.x === 3, got.y === 4
 
-// streaming out: the same serialize(), over a 4-byte buffer with a sink
+// streaming out: the same serialize(), over a 4-byte buffer with a sink. The sink
+// is handed the installed buffer and the region's bounds — never memory from
+// anywhere else — so it copies out what it wants to keep.
 const parts: Uint8Array[] = [];
-const sink: FlushSink = (chunk) => { parts.push(chunk.slice()); };
+const sink: FlushSink = (buf, start, end) => { parts.push(buf.slice(start, end)); };
 const so = new OStream(new Uint8Array(4), 0, sink);
 p.serialize(so); so.flush();               // the same bytes, in pieces
 
@@ -112,7 +103,7 @@ for (const part of parts) st = dec.feed(part);
 
 // COMPLETE says the bytes so far ended on a field boundary, not that the
 // message is over — the caller's framing decides that, and a still-INCOMPLETE
-// status once the input really has ended is truncation (§5.2).
+// status once the input really has ended is truncation (§5.2.4).
 const streamed = st === DecodeStatus.Complete ? dec.message : null;
 
 export { Point, PointDecoder, PointVisitor, wire, got, parts, st, streamed };

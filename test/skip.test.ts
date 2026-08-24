@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { IStream, OStream, decode, type Visitor } from "../src/index.js";
+import { IStream, OStream, decode, type Visitor, growingOStream } from "../src/index.js";
 
 /** A message with fields surrounding a nested sub-sequence (itself nested). */
 function build(os: OStream): void {
@@ -24,7 +24,7 @@ function build(os: OStream): void {
 
 describe("skipping", () => {
   it("resyncs on the field after a fully skipped sub-sequence", () => {
-    const os = new OStream();
+    const os = growingOStream();
     build(os);
 
     // Visitor handles only the trailing field; everything else is skipped.
@@ -44,7 +44,7 @@ describe("skipping", () => {
   });
 
   it("skips correctly even when fed one byte at a time", () => {
-    const os = new OStream();
+    const os = growingOStream();
     build(os);
     const bytes = os.bytes();
 
@@ -55,18 +55,18 @@ describe("skipping", () => {
       },
     };
 
-    const is = new IStream();
-    for (let i = 0; i < bytes.length; i++) is.feed(bytes.subarray(i, i + 1), visitor);
-    is.end();
+    const is = new IStream(visitor);
+    for (let i = 0; i < bytes.length; i++) is.feed(bytes.subarray(i, i + 1));
+    is.status();
 
     expect(tail).toBe(999);
   });
 
   it("a fully empty visitor consumes the whole message and ends cleanly", () => {
-    const os = new OStream();
+    const os = growingOStream();
     build(os);
-    const is = new IStream();
-    is.feed(os.bytes(), {});
-    expect(() => is.end()).not.toThrow();
+    const is = new IStream({});
+    is.feed(os.bytes());
+    expect(() => is.status()).not.toThrow();
   });
 });
