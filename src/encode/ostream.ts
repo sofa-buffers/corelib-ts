@@ -863,7 +863,14 @@ export class OStream implements ByteSink {
     }
   }
 
-  /** Write the 4 little-endian bytes of an fp32 (§4.6). */
+  /**
+   * Write the 4 little-endian bytes of an fp32 (§4.6).
+   *
+   * Through the shared scratch, not a `DataView` over the buffer: building that
+   * handle costs ~129 ns against the ~2 ns it saves on one value (§6.6.2 allows the
+   * handle, arithmetic forbids it here). The bulk array path amortizes one over the
+   * whole run instead — see the kernel.
+   */
   private putFp32(value: number): void {
     if (this.buf.length - this.pos >= 4) {
       this.pos = packFp32(this.buf, this.pos, value);
@@ -906,7 +913,7 @@ export class OStream implements ByteSink {
     this.putByte(bits >>> 24);
   }
 
-  /** Write the 8 little-endian bytes of an fp64 (§4.6). */
+  /** Write the 8 little-endian bytes of an fp64 (§4.6) — see {@link putFp32}. */
   private putFp64(value: number): void {
     if (this.buf.length - this.pos >= 8) {
       this.pos = packFp64(this.buf, this.pos, value);
@@ -1021,19 +1028,21 @@ export class OStream implements ByteSink {
    * from `MAX_SIZE` or on the accumulator — is a single `set` of the caller's
    * array: a `memcpy`, and no view at all.
    *
-   * **A payload split across flushes takes a per-piece view, and that is a
-   * recorded deviation from §6.6.** `TypedArray.set` is the only `memcpy` this
-   * language exposes and it takes a *typed array* as its source, so copying a
-   * *range* of one needs a `subarray` — an object, hence an allocator call, hence
-   * something §6.6 forbids the codec "for anything at all". The allocation-free
-   * alternative is a byte loop, which measures 358 MB/s against 10,963 MB/s for
-   * `set`: a 30x tax on the one path that exists precisely because the payload is
-   * large. This port takes the view instead. The deviation is **bounded and
-   * shaped**: one view per copied piece (never per byte), never handed to anyone —
-   * it is consumed by `set` inside this method and unreachable from any caller, so
-   * §6.7's ban on exposing a borrowed slice is untouched, and so is §5.1.6, which
-   * is why the copy happens at all. `heap-free-codec.test.ts` pins that shape
-   * rather than waiving the rule, and the README records it (§9.0.2).
+   * **A payload split across flushes takes a per-piece view: a language-forced
+   * handle under §6.6.2.** `TypedArray.set` is the only `memcpy` this language
+   * exposes and it takes a *typed array* as its source, so copying a *range* of one
+   * needs a `subarray` — "the only way to name a region of the caller's buffer is a
+   * wrapper over it". It qualifies on both counts §6.6.2 names: it carries no
+   * message bytes (the storage is the caller's, on both ends) and no wire number
+   * sizes it (its extent is the room in the buffer). The allocation-free
+   * alternative is a byte loop, at 358 MB/s against 10,963 MB/s for `set` — a 30x
+   * tax on the one path that exists precisely because the payload is large.
+   *
+   * It never leaves this method: `set` consumes it and no caller can reach it, so
+   * §6.7's ban on exposing a borrowed value is untouched — and so is §5.1.6, which
+   * is why the copy happens at all rather than the payload being handed to the sink.
+   * The README itemises it with the port's other handles (§9.6), and
+   * `heap-free-codec.test.ts` pins its count and kind.
    */
   private writeRaw(data: Uint8Array): void {
     const total = data.length;

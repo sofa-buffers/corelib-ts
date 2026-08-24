@@ -63,9 +63,9 @@ full type declarations.
 | Generated-code friendly | One flat `Visitor` per message, all methods optional; nesting arrives as `sequenceBegin` / `sequenceEnd` events carrying id and depth, which generated code routes on. |
 | Reserve-offset | `new OStream(buf, offset)` leaves room at the front for a lower-layer header, saving a copy. The offset belongs to that installation and is consumed by the flush that hands the unit over; `setBuffer(buf, offset)` from inside the sink re-arms it, for header room in every packet. |
 | Caller-owned buffers | The encoder allocates no output buffer and grows none: it writes into yours, and asks the `BufferOwner` you named for the next one when it fills. `growingOStream()` is that owner ready-made. |
-| Heap-free codec | After construction the encoder and decoder allocate nothing (§6.6) — no views, no scratch, no growable state — with one recorded exception, under [Memory handling](#memory-handling). Verified two ways: no allocation primitive on a codec path, and a flat heap over a complete encode and decode. |
+| Heap-free codec | After construction the encoder and decoder allocate nothing (§6.6) — no views, no scratch, no growable state — apart from the **language-forced handles** §6.6.2 allows, itemised under [Memory handling](#memory-handling) and taken only where they measurably pay. Verified two ways: no allocation primitive on a codec path, and a flat heap over a complete encode and decode. |
 | No views | Nothing the decoder hands over aliases anything it owns (§6.7). A payload arrives as a range of the chunk **you** fed, so what you keep, you copied. |
-| Explicit endianness | IEEE-754 values are read / written little-endian via `DataView`, identical on every engine. |
+| Explicit endianness | IEEE-754 values are read / written little-endian — bit-for-bit identical on every engine, big-endian hosts included. |
 | Pluggable acceleration | The encoder's bulk array paths run through a swappable `Kernel`, and that interface is the entire seam: `setKernel(yourKernel)`. **No accelerated backend exists today** — the kernel is the pure-TypeScript one on every host unless you build and install your own (native addon or WASM); the library ships no loader for one. |
 
 ## Usage
@@ -551,31 +551,53 @@ Who owns the bytes:
   the call. Scalars are delivered by value. If any of this README ever describes a
   borrowed decoded value, either the README or the port is wrong.
 - **No wire value decides an allocation in the codec.** After construction the
-  encoder and decoder allocate nothing (§6.6): no per-message, per-field or
-  per-chunk allocation, no growable state, and no accumulator for a payload that
-  straddles a chunk — a decoder's whole memory is fixed-size state sized from this
-  format's constants (a `MAX_DEPTH` scope stack, a partial varint, an 8-byte float
-  landing zone). Constructing an `OStream` / `IStream` is the one allocating step,
-  and `decode()` reuses one decoder across calls so a one-shot caller does not pay
-  it per message. A `bigint` for an integer past `2^53` is not an exception: it is a
-  *value*, not storage, and the `lo` / `hi` halves beside it are there for a
-  consumer that would rather not have one.
-- **One recorded deviation from that rule, on the encode side.** A `string` /
-  `blob` payload **split across flushes** is copied with `set(data.subarray(…))`:
-  one view per copied piece. `TypedArray.set` is the only `memcpy` this language
-  exposes and it takes a typed array as its source, so copying a *range* needs a
-  view — an object, and therefore an allocator call §6.6 permits the codec nowhere.
-  The allocation-free alternative is a byte loop, measured at 358 MB/s against
-  10,963 MB/s for `set`, on the one path that exists *because* the payload is
-  large. This port takes the view.
+  encoder and decoder allocate nothing (§6.6) except the itemised handles below: no
+  per-message, per-field or per-chunk allocation, no growable state, and no
+  accumulator for a payload that straddles a chunk — a decoder's whole memory is
+  fixed-size state sized from this format's constants (a `MAX_DEPTH` scope stack, a
+  partial varint, an 8-byte float landing zone). Constructing an `OStream` /
+  `IStream` is the one allocating step, and `decode()` reuses one decoder across
+  calls so a one-shot caller does not pay it per message. A `bigint` for an integer
+  past `2^53` is not an exception: it is a *value*, not storage, and the `lo` / `hi`
+  halves beside it are there for a consumer that would rather not have one.
+- **The language-forced handles, itemised** (§6.6.2). JavaScript will not let a codec
+  place or take an IEEE-754 value at a byte offset, or copy a *range* of bytes,
+  without building an object first: `TypedArray.set` — the only `memcpy` there is —
+  takes a typed array as its source, and a float needs a `DataView`. §6.6.2 allows
+  such a handle where the language leaves no alternative, provided it carries no
+  message bytes and no wire number sizes it, and asks the port to list them. These
+  are all of them:
 
-  What the deviation is not: it is **bounded by pieces, never by bytes**, it is
-  confined to that one copy, and the view is consumed by `set` inside `writeRaw`
-  and never handed to anyone — so §6.7 (no borrowed value leaves the codec) and
-  §5.1.6 (the sink is only ever handed the installed buffer) hold unchanged.
-  `heap-free-codec.test.ts` asserts that shape rather than waiving the rule, and
-  every other path — the whole-payload `set`, a `MAX_SIZE` buffer, the accumulator,
-  and the entire decoder — still counts **zero**.
+  | handle | where | how many |
+  |---|---|---|
+  | `DataView` over the **output buffer** | `Kernel`, bulk `fp32` / `fp64` arrays | one per bulk call, and only from 64 `fp32` / 16 `fp64` elements up |
+  | `DataView` over the **fed chunk** | `IStream`, bulk float array reads | one per chunk, on the first run in it that clears the same thresholds |
+  | `subarray` of the caller's payload | `OStream.writeRaw`, as `set`'s source | one per copied piece, only when the payload does not fit the buffer |
+
+  Each addresses storage **you** supplied, each is sized by that storage and never by
+  a number from the wire, and none of them leaves the codec — so §6.7 (no borrowed
+  value reaches a caller) and §5.1.6 (the sink only ever sees the installed buffer)
+  are untouched.
+
+  **The thresholds are arithmetic, not taste.** Building a `DataView` costs ~129 ns
+  on Node 24, and the handle saves ~1.9 ns per `fp32` (writing 4.11 → 2.23 ns,
+  reading — value *and* raw bits, §6.5 — 3.27 → 1.46 ns) and ~7.3–8.0 ns per `fp64`
+  (writing 10.48 → 3.20 ns, reading 10.24 → 2.23 ns). So it only pays from about 68
+  `fp32` or 18 `fp64` elements up, and below that a shared 8-byte scratch word — fixed
+  state, not a handle — wins. The consequence is the one worth knowing: a **scalar**
+  float, a short float array, and a float array fed in chunks too small to hold a long
+  run all allocate **nothing at all**, on either side. Only bulk float arrays in
+  buffer-sized pieces reach the allowance. The copy source has no threshold to
+  weigh — it is the difference between `memcpy` at 10,963 MB/s and a byte loop at
+  358 MB/s.
+
+  `heap-free-codec.test.ts` asserts these counts exactly — including that the short
+  runs allocate nothing and that one element under the threshold builds no handle — so
+  an allocation not in this table fails the suite rather than hiding behind the
+  allowance. End to end on a 1000-element array (Callgrind, Ir/op): encoding costs
+  195.3 → 28.0 instructions per `fp32` and 182.2 → 25.8 per `fp64`, decoding
+  220.1 → 132.6 and 269.8 → 129.7. Every row of the shared benchmark suite is
+  unchanged, because none of its workloads has a float array long enough to qualify.
 - **The static helper layer allocates, on your behalf.** `PayloadAcc`,
   `ElementSeq`, `StringSeq`, `BlobSeq`, `decodeUtf8` and `elementsEqual` are the
   generated layer's code shipped here for reuse (ARCHITECTURE §8), not part of the
@@ -700,7 +722,7 @@ costs, and it is legible only under `Ir/op`. BENCH_SPEC's optional
 `blob 1MB passthrough` row is absent: pass-through is forbidden (§5.1.6), so every
 `string` / `blob` run is copied through the output buffer. Both copies are
 `TypedArray.set` — the whole payload when it fits, a range per flush when it does
-not, the latter being the recorded §6.6 deviation described under
+not, the latter through one of the itemised §6.6.2 handles under
 [Memory handling](#memory-handling).
 
 Since JS engines expose no portable cycle counter, `perf` uses CPU time/op as the

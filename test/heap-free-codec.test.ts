@@ -3,16 +3,13 @@
  *
  * §6.6.4 asks for **both** halves of the proof, and they catch different defects:
  *
- * - **read** — no allocation primitive is reachable from a codec entry point. In
- *   JavaScript "no allocator call" is not a `malloc` grep: it is `new Uint8Array`,
- *   a `subarray`/`slice` view, a `TextDecoder`, an array that grows. Those are
- *   spied on here for the duration of one encode and one decode.
- *
- *   **One deviation is recorded rather than asserted away**: a payload split across
- *   flushes is copied with `set(data.subarray(…))`, one view per piece, because the
- *   allocation-free alternative is a byte loop at a 30x cost (`writeRaw`). The test
- *   below pins that shape — bounded by pieces, never by bytes, never exposed — so a
- *   regression cannot hide behind it.
+ * - **read** — no allocation primitive is reachable from a codec entry point, apart
+ *   from the **language-forced handles** §6.6.2 allows. In JavaScript "no allocator
+ *   call" is not a `malloc` grep: it is `new Uint8Array`, a `subarray`/`slice` view,
+ *   a `DataView`, a `TextDecoder`, an array that grows. All of those are spied on
+ *   here, and the handles are asserted **by exact count and kind** — which is the
+ *   itemisation §6.6.2 asks for, in executable form. An allocation nobody listed
+ *   fails the count instead of hiding behind the paragraph.
  * - **measure** — an allocation count or heap high-water mark over a complete
  *   encode and decode, *after* the codec's one-time construction, which must be
  *   zero. A spy can be evaded by an allocation the runtime performs on the codec's
@@ -28,6 +25,7 @@
 import { describe, expect, it } from "vitest";
 import v8 from "node:v8";
 import vm from "node:vm";
+import { FP32_HANDLE_MIN, FP64_HANDLE_MIN } from "../src/constants.js";
 import {
   DecodeStatus,
   IStream,
@@ -46,6 +44,10 @@ const U_ARRAY = [1, 2, 3, 1_000_000];
 const S_ARRAY = [-1, -2, -3];
 const F32_ARRAY = [1, 2, 3];
 const F64_ARRAY = [1, 2];
+// Long enough that a handle over the buffer pays for itself — the *only* shape that
+// builds one on either side (FP32_HANDLE_MIN / FP64_HANDLE_MIN).
+const F32_BULK = Array.from({ length: FP32_HANDLE_MIN }, (_, i) => i + 0.5);
+const F64_BULK = Array.from({ length: FP64_HANDLE_MIN }, (_, i) => i + 0.25);
 
 /** A message with every wire type, including payloads longer than a small buffer. */
 function message(os: OStream): void {
@@ -95,44 +97,51 @@ function foldingVisitor(): Visitor & { acc: number } {
   };
 }
 
+/** What a run allocated, by kind. An absent kind never happened. */
+type Tally = Partial<Record<"DataView" | "subarray" | "slice" | "Uint8Array" | "Array" | "text", number>>;
+
 /**
- * Count every allocation primitive a codec path could reach, while `body` runs.
+ * Tally every allocation primitive a codec path could reach, while `body` runs.
  *
- * The `subarray` / `slice` counters are the JavaScript-specific half: a view is an
- * object, so handing one out is an allocation even though no bytes are copied —
- * which is exactly why the decoder reports `(src, start, end)` instead.
+ * The `subarray` / `slice` / `DataView` counters are the JavaScript-specific half: a
+ * view is an object, so building one is an allocation even though no bytes are
+ * copied. That is why the decoder reports `(src, start, end)` instead of handing one
+ * out — and, where the language leaves no alternative, why the ones it does build are
+ * itemised (§6.6.2) rather than waved through.
  */
-function allocationsDuring(body: () => void): number {
-  let n = 0;
+function allocationsDuring(body: () => void): Tally {
+  const tally: Tally = {};
+  const bump = (k: keyof Tally): void => {
+    tally[k] = (tally[k] ?? 0) + 1;
+  };
   const savedU8 = globalThis.Uint8Array;
   const savedArray = globalThis.Array;
+  const savedDataView = globalThis.DataView;
   const subarray = Uint8Array.prototype.subarray;
   const slice = Uint8Array.prototype.slice;
   const decodeText = TextDecoder.prototype.decode;
   const encodeText = TextEncoder.prototype.encode;
 
-  const count = <T extends (...args: never[]) => unknown>(fn: T): T =>
+  const count = <T extends (...args: never[]) => unknown>(fn: T, k: keyof Tally): T =>
     function (this: unknown, ...args: never[]) {
-      n++;
+      bump(k);
       return (fn as (...a: never[]) => unknown).apply(this, args);
     } as unknown as T;
+  const ctor = <T extends abstract new (...args: never[]) => unknown>(c: T, k: keyof Tally): T =>
+    new Proxy(c, {
+      construct(t, a: unknown[]) {
+        bump(k);
+        return Reflect.construct(t as never, a as never) as object;
+      },
+    });
 
-  Uint8Array.prototype.subarray = count(subarray);
-  Uint8Array.prototype.slice = count(slice);
-  TextDecoder.prototype.decode = count(decodeText);
-  TextEncoder.prototype.encode = count(encodeText);
-  (globalThis as { Uint8Array: unknown }).Uint8Array = new Proxy(savedU8, {
-    construct(t, a: unknown[]) {
-      n++;
-      return Reflect.construct(t, a) as object;
-    },
-  });
-  (globalThis as { Array: unknown }).Array = new Proxy(savedArray, {
-    construct(t, a: unknown[]) {
-      n++;
-      return Reflect.construct(t, a) as object;
-    },
-  });
+  Uint8Array.prototype.subarray = count(subarray, "subarray");
+  Uint8Array.prototype.slice = count(slice, "slice");
+  TextDecoder.prototype.decode = count(decodeText, "text");
+  TextEncoder.prototype.encode = count(encodeText, "text");
+  (globalThis as { Uint8Array: unknown }).Uint8Array = ctor(savedU8, "Uint8Array");
+  (globalThis as { Array: unknown }).Array = ctor(savedArray, "Array");
+  (globalThis as { DataView: unknown }).DataView = ctor(savedDataView, "DataView");
   try {
     body();
   } finally {
@@ -142,31 +151,84 @@ function allocationsDuring(body: () => void): number {
     TextEncoder.prototype.encode = encodeText;
     (globalThis as { Uint8Array: unknown }).Uint8Array = savedU8;
     (globalThis as { Array: unknown }).Array = savedArray;
+    (globalThis as { DataView: unknown }).DataView = savedDataView;
   }
-  return n;
+  return tally;
 }
 
-describe("read: no allocation primitive on a codec path (§6.6.4)", () => {
-  it("a complete encode into a caller buffer allocates nothing", () => {
+describe("read: the itemised handles, and nothing else (§6.6.2 / §6.6.4)", () => {
+  // §6.6.2 lets a codec allocate a **language-forced handle** — a view, a slice
+  // object, a span — where the language's only bulk primitive takes one instead of a
+  // pointer and a length, provided the object carries no message bytes and no wire
+  // number sizes it. It asks the port to *itemise* them. This port has three, and
+  // they are asserted by exact count and kind below, so an allocation nobody listed
+  // fails the count instead of hiding behind the paragraph:
+  //
+  //   1. a `DataView` over the **output** buffer, in the kernel's bulk float
+  //      packers — the only way to place an IEEE-754 value at a byte offset. One per
+  //      call, not per element, and only for an array of at least
+  //      {@link FP32_HANDLE_MIN} / {@link FP64_HANDLE_MIN} elements.
+  //   2. a `DataView` over the **fed chunk** — the mirror of 1 on the read side. One
+  //      per chunk, built on the first float **array** run long enough to pay for it.
+  //   3. a `subarray` of the caller's payload, as the source of `TypedArray.set` —
+  //      the only `memcpy` this language exposes takes a typed array. One per copied
+  //      piece, and only when the payload does not fit the buffer.
+  //
+  // Everything else on both sides counts **zero**, which is what the absence of any
+  // other key in these tallies says. Note what handles 1 and 2 are *not*: a scalar
+  // float and a short array build none, because a handle costs ~129 ns and saves
+  // ~2 ns per fp32 — the permission is §6.6.2's, the threshold is arithmetic's.
+
+  it("an encode into one buffer allocates nothing: every float run is short", () => {
+    // A message with both scalar floats and both float arrays — but the arrays are 3
+    // and 2 elements, far under the thresholds, so the packers stay on the shared
+    // scratch word and no handle is built. The payload fits too, so `set` takes the
+    // caller's array whole: no range, no `subarray` either.
     const os = new OStream(new Uint8Array(4096)); // construction may allocate
-    expect(allocationsDuring(() => message(os))).toBe(0);
+    expect(allocationsDuring(() => message(os))).toStrictEqual({});
   });
 
-  it("a streaming encode allocates one view per copied piece, and nothing else", () => {
-    // **The one recorded deviation from §6.6, pinned to its shape.**
-    //
-    // `TypedArray.set` is this language's only `memcpy` and it takes a typed array
-    // as its source, so copying a *range* needs a `subarray` — an object, and thus
-    // an allocator call §6.6 forbids "for anything at all". The allocation-free
-    // alternative is a byte loop at 358 MB/s against 10,963 MB/s, a 30x tax on the
-    // one path that exists because the payload is large, so this port takes the
-    // view (see `writeRaw`, and the README).
-    //
-    // What this test defends is that the deviation stays exactly that: **bounded
-    // by pieces, never by bytes**, and confined to the split-payload copy. A
-    // regression that started allocating per varint, per field or per byte would
-    // blow the bound; so would one that leaked a view to the sink (§5.1.6, checked
-    // separately below).
+  it("an encode with bulk float arrays: exactly one handle per packer call", () => {
+    // Handle 1, pinned. Two calls above the threshold, two handles — per *call*,
+    // never per element, which is what makes it a handle rather than a violation
+    // (`no wire number sizes it`): 64 floats and 6400 both cost one.
+    const os = new OStream(new Uint8Array(1 << 16));
+    expect(
+      allocationsDuring(() => {
+        os.writeFp32Array(1, F32_BULK);
+        os.writeFp64Array(2, F64_BULK);
+      }),
+    ).toStrictEqual({ DataView: 2 });
+
+    const big = new OStream(new Uint8Array(1 << 16));
+    const wide = Array.from({ length: 100 * FP32_HANDLE_MIN }, (_, i) => i);
+    expect(allocationsDuring(() => big.writeFp32Array(1, wide))).toStrictEqual({
+      DataView: 1,
+    });
+  });
+
+  it("one element under the threshold, and the handle is not built", () => {
+    // The boundary itself, both ways round — the arithmetic in FP32_HANDLE_MIN is
+    // load-bearing, so a change to it has to be a deliberate one.
+    const os = new OStream(new Uint8Array(1 << 16));
+    expect(
+      allocationsDuring(() => os.writeFp32Array(1, F32_BULK.slice(0, FP32_HANDLE_MIN - 1))),
+    ).toStrictEqual({});
+    expect(
+      allocationsDuring(() => os.writeFp64Array(2, F64_BULK.slice(0, FP64_HANDLE_MIN - 1))),
+    ).toStrictEqual({});
+    expect(allocationsDuring(() => os.writeFp32Array(3, F32_BULK))).toStrictEqual({
+      DataView: 1,
+    });
+  });
+
+  it("a streaming encode: one copy source per piece, and nothing else", () => {
+    // Through a 4-byte buffer every payload is split, so handle 3 appears — bounded
+    // by **pieces, never by bytes**, which is what the flush count below pins. No
+    // float handle: a 4-byte buffer takes one element per drain, which is nowhere
+    // near the threshold. A regression that started allocating per varint, per field
+    // or per byte would blow these numbers; so would one that leaked a view to the
+    // sink (§5.1.6, checked separately below).
     let sunk = 0;
     let flushes = 0;
     const os = new OStream(new Uint8Array(4), 0, (_b, start, end) => {
@@ -178,30 +240,85 @@ describe("read: no allocation primitive on a codec path (§6.6.4)", () => {
       os.flush();
     });
     expect(sunk).toBe(WIRE.length);
-    expect(allocs).toBeGreaterThan(0); // the deviation is real, and visible here
-    expect(allocs).toBeLessThanOrEqual(flushes); // …and one per piece, not per byte
-    // Two orders of magnitude of headroom against "per byte": the message is 40x
-    // the buffer, and the whole point is that the count tracks pieces.
-    expect(allocs).toBeLessThan(WIRE.length / 4);
+    expect(Object.keys(allocs).sort()).toStrictEqual(["subarray"]);
+    expect(allocs.subarray).toBeLessThanOrEqual(flushes);
+    // Two orders of magnitude of headroom against "per byte": the message is 40x the
+    // buffer, and the whole point is that the count tracks pieces.
+    expect(allocs.subarray).toBeLessThan(WIRE.length / 4);
   });
 
-  it("the same message into one buffer allocates nothing at all", () => {
-    // The control that keeps the deviation honest: with room for the payload there
-    // is no range to copy, so `set` takes the caller's array whole and the count
-    // is zero. Every shape §5.1.2 puts first — a `MAX_SIZE` buffer, the
-    // accumulator — is this case.
+  it("an encode with no float at all allocates nothing", () => {
+    // The control that keeps the itemisation honest: the handles are forced by
+    // *operations*, not held as a matter of course, so a message without floats and
+    // without a split payload allocates on no path at all.
     const os = new OStream(new Uint8Array(4096));
-    expect(allocationsDuring(() => message(os))).toBe(0);
+    expect(
+      allocationsDuring(() => {
+        os.writeUnsigned(1, 42);
+        os.writeSigned(2, -70_000);
+        os.writeString(3, "no floats here");
+        os.writeBlob(4, BLOB);
+        os.writeUnsignedArray(5, U_ARRAY);
+        os.writeSequenceBeginLazy(6);
+        os.writeUnsigned(1, 7);
+        os.writeSequenceEndKeep();
+      }),
+    ).toStrictEqual({});
   });
 
-  it("a complete one-shot decode allocates nothing after construction", () => {
+  it("a one-shot decode of short float runs allocates nothing", () => {
     const v = foldingVisitor();
     const is = new IStream(v);
-    expect(allocationsDuring(() => void is.feed(WIRE))).toBe(0);
+    expect(allocationsDuring(() => void is.feed(WIRE))).toStrictEqual({});
     expect(v.acc).not.toBe(0);
   });
 
-  it("a complete chunked decode allocates nothing after construction", () => {
+  it("a one-shot decode of a bulk float array: one handle for the whole chunk", () => {
+    // Handle 2, pinned. Both arrays clear their threshold, but the view is cached
+    // per chunk, so the second run reuses the first one's — one handle for the
+    // message, not one per array and certainly not one per element.
+    const bulk = (() => {
+      const os = growingOStream();
+      os.writeFp32Array(1, F32_BULK);
+      os.writeFp64Array(2, F64_BULK);
+      return os.bytes().slice();
+    })();
+    const v = foldingVisitor();
+    const is = new IStream(v);
+    expect(allocationsDuring(() => void is.feed(bulk))).toStrictEqual({ DataView: 1 });
+    expect(v.acc).not.toBe(0);
+  });
+
+  it("the same bulk array fed in short chunks builds no handle at all", () => {
+    // The run that decides is the one **left in this chunk**, not the array's count:
+    // 8 bytes at a time delivers one or two elements per drain, so every step takes
+    // the byte-load route and the message decodes identically with zero allocations.
+    const bulk = (() => {
+      const os = growingOStream();
+      os.writeFp32Array(1, F32_BULK);
+      return os.bytes().slice();
+    })();
+    const whole = foldingVisitor();
+    new IStream(whole).feed(bulk);
+
+    const piecemeal = foldingVisitor();
+    const is = new IStream(piecemeal);
+    const chunks = Array.from({ length: Math.ceil(bulk.length / 8) }, (_, i) =>
+      bulk.subarray(i * 8, i * 8 + 8),
+    );
+    expect(
+      allocationsDuring(() => {
+        for (const c of chunks) is.feed(c);
+      }),
+    ).toStrictEqual({});
+    expect(is.status()).toBe(DecodeStatus.Complete);
+    expect(piecemeal.acc).toBe(whole.acc); // same values, other route
+  });
+
+  it("a chunked decode allocates nothing at all", () => {
+    // One byte per feed: no float ever fits a chunk, so the handle is never built
+    // and the resumable float accumulator — fixed-size state, not a handle — carries
+    // the value instead. The same message, the same values, zero allocations.
     const v = foldingVisitor();
     const is = new IStream(v);
     // The chunk views belong to the caller, so they are built outside the
@@ -211,8 +328,36 @@ describe("read: no allocation primitive on a codec path (§6.6.4)", () => {
       allocationsDuring(() => {
         for (const c of chunks) is.feed(c);
       }),
-    ).toBe(0);
+    ).toStrictEqual({});
     expect(is.status()).toBe(DecodeStatus.Complete);
+  });
+
+  it("a decode with no float in the message allocates nothing", () => {
+    const noFloats = (() => {
+      const os = growingOStream();
+      os.writeUnsigned(1, 42);
+      os.writeString(2, "no floats here");
+      os.writeUnsignedArray(3, U_ARRAY);
+      return os.bytes().slice();
+    })();
+    const is = new IStream(foldingVisitor());
+    expect(allocationsDuring(() => void is.feed(noFloats))).toStrictEqual({});
+  });
+
+  it("reuses the chunk handle across feeds of the same buffer", () => {
+    // "Whether it allocates one per call or keeps one and reuses it is an
+    // optimization" (§6.6.2) — this port keeps one, so re-feeding the same buffer
+    // costs nothing after the first bulk float run.
+    const bulk = (() => {
+      const os = growingOStream();
+      os.writeFp64Array(1, F64_BULK);
+      return os.bytes().slice();
+    })();
+    const is = new IStream(foldingVisitor());
+    expect(allocationsDuring(() => void is.feed(bulk))).toStrictEqual({ DataView: 1 });
+    const again = new IStream(foldingVisitor());
+    again.feed(bulk);
+    expect(allocationsDuring(() => void again.feed(bulk))).toStrictEqual({});
   });
 });
 

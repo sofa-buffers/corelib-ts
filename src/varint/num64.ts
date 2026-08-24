@@ -1,10 +1,16 @@
 /**
  * 64-bit and IEEE-754 helpers.
  *
- * `bigint` masking utilities plus little-endian float pack/unpack built on a
- * single shared {@link DataView}. The format always stores `fp32` / `fp64`
- * little-endian regardless of host byte order, which a `DataView` gives us for
- * free (the `littleEndian` argument is passed explicitly everywhere).
+ * `bigint` coercion plus the float **bit** helpers: the conversions between an
+ * IEEE-754 value and its little-endian wire bits, over one shared
+ * {@link DataView}. The format stores `fp32` / `fp64` little-endian regardless of
+ * host byte order, which a `DataView` gives us for free (the `littleEndian`
+ * argument is passed explicitly everywhere).
+ *
+ * A single float goes through the shared scratch: one `DataView` construction costs
+ * ~129 ns on Node 24, about sixteen `fp64` reads, so a handle over the caller's
+ * buffer (CORELIB_PLAN §6.6.2) only pays for a *bulk* run — which is where the
+ * kernel and the decoder's array drain take one, and nowhere else.
  */
 
 import { argumentError } from "../errors.js";

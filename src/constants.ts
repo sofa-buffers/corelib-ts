@@ -122,6 +122,30 @@ export const DEFAULT_MAX_DYN_STRING_LEN = 16_777_216; // 16 MiB
 export const DEFAULT_MAX_DYN_BLOB_LEN = 67_108_864; // 64 MiB
 
 /**
+ * Elements a bulk `fp32` run needs before a `DataView` handle over the buffer pays
+ * for itself (CORELIB_PLAN §6.6.2 allows the handle; arithmetic decides when to take
+ * it).
+ *
+ * On Node 24, building the handle costs ~129 ns and it saves ~1.9 ns per `fp32`
+ * (4.11 → 2.23 ns writing, 3.27 → 1.46 ns reading including the raw bits §6.5
+ * needs), so it breaks even around 68 elements. Below the threshold the shared
+ * scratch word wins and no handle is built at all — which is why a message with one
+ * float, or a two-element array, allocates nothing.
+ *
+ * @internal
+ */
+export const FP32_HANDLE_MIN = 64;
+
+/**
+ * The `fp64` twin of {@link FP32_HANDLE_MIN}. A double saves far more per element —
+ * ~7.3 ns writing (10.48 → 3.20) and ~8.0 ns reading (10.24 → 2.23) — so it breaks
+ * even around 18.
+ *
+ * @internal
+ */
+export const FP64_HANDLE_MIN = 16;
+
+/**
  * Maximum nested-sequence depth (§4.9 / §6.2). An encoder must not open more
  * than this many nested sequences, and a decoder must reject a message that
  * nests deeper with an `InvalidMessage` error rather than risk unbounded

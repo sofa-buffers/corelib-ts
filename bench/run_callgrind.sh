@@ -112,7 +112,7 @@ trap 'rm -rf "$OUT"' EXIT
 # rather than filled with a placeholder.
 read -r -a WORKLOADS <<<"${WORKLOADS:-encode_u64_array encode_typical \
 encode_blob_oneshot encode_blob_streaming encode_composite decode_u64_array \
-decode_typical decode_blob decode_composite decode_composite_skip
+decode_typical decode_blob decode_composite decode_composite_skip \
 decode_declined}"
 
 BUNDLE="$OUT/bench.mjs"
