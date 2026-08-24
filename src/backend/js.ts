@@ -8,6 +8,7 @@
  */
 
 import { argumentError } from "../errors.js";
+import { FP32_HANDLE_MIN, FP64_HANDLE_MIN } from "../constants.js";
 import { HI, LO, S_U32, splitI64, splitU64 } from "../varint/bits64.js";
 import { encodeVarintNum } from "../varint/leb128.js";
 import { packFp32, packFp64, toBigInt } from "../varint/num64.js";
@@ -98,16 +99,40 @@ export const jsKernel: Kernel = {
     return pos;
   },
 
+  // Both float packers take one `DataView` over the destination *once the run is
+  // long enough to pay for it* — the language-forced handle of CORELIB_PLAN §6.6.2,
+  // and the only way to place an IEEE-754 value at a byte offset. It carries no
+  // message bytes (the storage is the caller's) and no wire number sizes it.
+  //
+  // The threshold is arithmetic, not taste. Measured on Node 24:
+  // `new DataView(buf.buffer, off, len)` costs **129 ns**, while the handle saves
+  // 1.9 ns per `fp32` (4.11 -> 2.23) and 7.3 ns per `fp64` (10.48 -> 3.20). So it
+  // breaks even at ~68 `fp32` and ~18 `fp64` elements; below that the scratch route
+  // wins, and a two-element array through a handle is a pessimisation.
   packFp32Array(values, out, pos) {
-    for (let i = 0; i < values.length; i++) {
-      pos = packFp32(out, pos, values[i]!);
+    const n = values.length;
+    if (n < FP32_HANDLE_MIN) {
+      for (let i = 0; i < n; i++) pos = packFp32(out, pos, values[i]!);
+      return pos;
+    }
+    const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
+    for (let i = 0; i < n; i++) {
+      dv.setFloat32(pos, values[i]!, true);
+      pos += 4;
     }
     return pos;
   },
 
   packFp64Array(values, out, pos) {
-    for (let i = 0; i < values.length; i++) {
-      pos = packFp64(out, pos, values[i]!);
+    const n = values.length;
+    if (n < FP64_HANDLE_MIN) {
+      for (let i = 0; i < n; i++) pos = packFp64(out, pos, values[i]!);
+      return pos;
+    }
+    const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
+    for (let i = 0; i < n; i++) {
+      dv.setFloat64(pos, values[i]!, true);
+      pos += 8;
     }
     return pos;
   },

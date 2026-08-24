@@ -33,6 +33,8 @@ import {
   ArrayKind,
   DecodeStatus,
   FIXLEN_MAX,
+  FP32_HANDLE_MIN,
+  FP64_HANDLE_MIN,
   FixlenSubtype,
   ID_MAX,
   MAX_DEPTH,
@@ -141,6 +143,24 @@ export class DecoderState {
    */
   private limitReason: string | null = null;
 
+  /**
+   * A `DataView` over the chunk currently being fed, and the chunk it addresses —
+   * the **language-forced handle** of CORELIB_PLAN §6.6.2, and the only way
+   * JavaScript lets a reader take an IEEE-754 value from a byte offset. Without it
+   * a float costs four or eight byte loads, a shift ladder and a round trip
+   * through a scratch word; with it, one call.
+   *
+   * It qualifies because it carries no message bytes (it addresses the *caller's*
+   * chunk) and no wire number sizes it (its extent is the chunk's). Built lazily
+   * and only where it pays: a float **array** whose remaining run inside this chunk
+   * clears {@link FP32_HANDLE_MIN} / {@link FP64_HANDLE_MIN}. A scalar float, a
+   * short array, a message with no float at all, and a byte-at-a-time feed each
+   * build none. Once built it is kept while the same chunk is being fed, and it
+   * never leaves this class.
+   */
+  private view: DataView | null = null;
+  private viewOf: Uint8Array | null = null;
+
   /** The current field's id. */
   private id = 0;
 
@@ -200,6 +220,12 @@ export class DecoderState {
    * opens. `have` is the one exception and *is* cleared: the `S.ArrayFp` bulk loop
    * reads it to decide whether an element is half-arrived.
    *
+   * `view`/`viewOf` are not cleared either, and deliberately: {@link dataView}
+   * keys the cached handle on the chunk it addresses, so a stale one is rebuilt the
+   * moment a different chunk arrives and reused — correctly — when the same buffer
+   * is decoded again. {@link release} still drops it, which is where it matters:
+   * a pooled machine must not keep the caller's last chunk alive between calls.
+   *
    * Clearing them all anyway cost 5573 → 5324 Ir/op on `decode: typical message`
    * (~4.5%), which is what a 21-field wipe costs when the message is 37 bytes. The
    * invariant is held by `pooled-decoder-state.test.ts`, which aborts a decode in
@@ -220,10 +246,15 @@ export class DecoderState {
     this.have = 0;
   }
 
-  /** Drop the visitor reference, so a pooled machine keeps nothing alive. */
+  /**
+   * Drop the references a pooled machine would otherwise keep alive: the caller's
+   * visitor, and the handle onto the caller's chunk.
+   */
   release(): void {
     this.root = SKIP;
     this.cur = SKIP;
+    this.view = null;
+    this.viewOf = null;
   }
 
   /** Feed `input` to the machine, dispatching to the bound visitor. */
@@ -575,17 +606,9 @@ export class DecoderState {
           // Bulk drain, as in the integer arms: an element wholly inside the
           // chunk is read straight out of it, and only a straddling one goes
           // through the byte-at-a-time accumulator below.
-          if (this.have === 0) {
-            while (idx < count && n - i >= size) {
-              const lo = u32le(input, i);
-              if (isFp32) {
-                cur.arrayFp32?.(id, idx, fp32FromBits(lo), lo >>> 0);
-              } else {
-                cur.arrayFp64?.(id, idx, fp64FromBits(lo, u32le(input, i + 4)));
-              }
-              i += size;
-              this.arrIndex = ++idx;
-            }
+          if (this.have === 0 && idx < count && n - i >= size) {
+            i = this.fpDrain(input, i, n, count, size, isFp32);
+            idx = this.arrIndex;
           }
           if (idx === count) {
             this.state = S.Header;
@@ -674,9 +697,15 @@ export class DecoderState {
       this.fixSub = sub as FixlenSubtype;
       if (n - i >= want) {
         this.state = S.Header;
+        // A *scalar* float is assembled from byte loads, not through a handle:
+        // building one costs ~129 ns against the ~2-8 ns it would save on a single
+        // value. §6.6.2 permits the handle; arithmetic rules it out here. Only the
+        // array drain below reads enough floats from one chunk to amortize it.
         const lo = u32le(input, i);
         if (want === 4) {
-          this.cur.fp32?.(this.id, fp32FromBits(lo), lo >>> 0);
+          // The bits are what came off the wire; §6.5 needs the value *and* them,
+          // because a double cannot carry an fp32 signaling NaN.
+          this.cur.fp32?.(this.id, fp32FromBits(lo), lo);
         } else {
           this.cur.fp64?.(this.id, fp64FromBits(lo, u32le(input, i + 4)));
         }
@@ -1052,6 +1081,70 @@ export class DecoderState {
     return (this.vHi >>> 0) * (TWO32 / 8) + (this.vLo >>> 3);
   }
 
+  /**
+   * Deliver every float element that lies wholly inside this chunk, from
+   * {@link arrIndex} on; returns the new read position.
+   *
+   * Its own method rather than a block inside {@link push}'s switch, and that is
+   * measured: inlined, the two loops push `push` past what V8 keeps cheap and every
+   * *other* decode path pays ~0.4% for code it never runs (`decode: typical` 5324 ->
+   * 5344 Ir/op, `decode: u64 array` 706.6k -> 709.8k). Out of line the call is paid
+   * once per drain, over a run of at least one element, and both figures come back.
+   *
+   * How many elements the chunk can still deliver decides the route. Past the
+   * threshold, one handle (§6.6.2) beats the byte loads and pays for itself; below
+   * it, building the handle costs more than the whole run saves. The two arms
+   * produce identical values — the split is arithmetic, not semantics (see
+   * {@link FP32_HANDLE_MIN}).
+   */
+  private fpDrain(
+    input: Uint8Array,
+    i: number,
+    n: number,
+    count: number,
+    size: number,
+    isFp32: boolean,
+  ): number {
+    const cur = this.cur;
+    const id = this.id;
+    let idx = this.arrIndex;
+    if (Math.min(count - idx, (n - i) / size) >= (isFp32 ? FP32_HANDLE_MIN : FP64_HANDLE_MIN)) {
+      const dv = this.dataView(input);
+      do {
+        if (isFp32) {
+          // Two reads of the same four bytes: §6.5 needs the value *and* the exact
+          // bits, and a double cannot carry an fp32 signaling NaN.
+          cur.arrayFp32?.(id, idx, dv.getFloat32(i, true), dv.getUint32(i, true));
+        } else {
+          cur.arrayFp64?.(id, idx, dv.getFloat64(i, true));
+        }
+        i += size;
+        this.arrIndex = ++idx;
+      } while (idx < count && n - i >= size);
+      return i;
+    }
+    do {
+      const lo = u32le(input, i);
+      if (isFp32) cur.arrayFp32?.(id, idx, fp32FromBits(lo), lo);
+      else cur.arrayFp64?.(id, idx, fp64FromBits(lo, u32le(input, i + 4)));
+      i += size;
+      this.arrIndex = ++idx;
+    } while (idx < count && n - i >= size);
+    return i;
+  }
+
+  /**
+   * The handle over `input`, built on demand and reused while the same chunk is
+   * being fed (see {@link view}).
+   */
+  private dataView(input: Uint8Array): DataView {
+    if (this.viewOf !== input) {
+      this.view = new DataView(input.buffer, input.byteOffset, input.byteLength);
+      this.viewOf = input;
+    }
+    return this.view!;
+  }
+
   /** Accumulate up to `need` raw float bytes into {@link fpLo} / {@link fpHi}. */
   private fpStep(input: Uint8Array, i: number, n: number): number {
     let have = this.have;
@@ -1075,7 +1168,11 @@ export class DecoderState {
   }
 }
 
-/** The four little-endian bytes at `i` as one 32-bit word (byte `k` in bits `8*k`). */
+/**
+ * The four little-endian bytes at `i` as one unsigned 32-bit word — the float
+ * routes that do not clear the {@link FP32_HANDLE_MIN} threshold read their raw
+ * bits this way, with no handle over the chunk.
+ */
 function u32le(b: Uint8Array, i: number): number {
   return (b[i]! | (b[i + 1]! << 8) | (b[i + 2]! << 16) | (b[i + 3]! << 24)) >>> 0;
 }
