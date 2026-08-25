@@ -231,6 +231,13 @@ describe("the schema bounds bind, and bind early (§7.1, §5.2)", () => {
     expectInvalid(() => strings(over, NONE, 5));
   });
 
+  it("bounds a blob element by its schema maxlen the same way", () => {
+    const ok = wrapper((os) => os.writeBlob(0, Uint8Array.of(1, 2, 3, 4, 5)));
+    expect(blobs(ok, NONE, 5)).toStrictEqual([Uint8Array.of(1, 2, 3, 4, 5)]);
+    const over = wrapper((os) => os.writeBlob(0, Uint8Array.of(1, 2, 3, 4, 5, 6)));
+    expectInvalid(() => blobs(over, NONE, 5));
+  });
+
   it("rejects an over-long element whose payload never arrives", () => {
     // The anti-folding case. Cut the message right after the element's fixlen
     // word: the bound is already decided, so the verdict must be INVALID and not
