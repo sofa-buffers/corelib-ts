@@ -176,3 +176,74 @@ describe("fixlen array: the schema count is applied after the element word (§4.
     expect(codeOf(() => decode(whole, fp64Bounded))).toBe(SofabErrorCode.InvalidMsg);
   });
 });
+
+/**
+ * §4.8.1 **step 3**, made explicit in `CORELIB_PLAN@c837108`: the subtype decides
+ * before any schema is consulted, and only `fp32` / `fp64` are fixlen-array
+ * subtypes at all.
+ *
+ * > rejects the field as **`INVALID`** if that subtype is anything other than
+ * > `fp32` or `fp64` — a `string` or `blob` subtype, or a reserved one — before
+ * > any schema is consulted (§4.8, §5.2.2).
+ *
+ * §5.2.2's single list now carries the row alongside the reserved-subtype one:
+ * "a fixlen **array** whose `fixlen_word` subtype is not `fp32`/`fp64`". It is a
+ * *format* violation, so it must not be routed into §7.3's skip — which is the
+ * mistake the clause was rewritten to close. Step 4's skip is for a fixed-width
+ * subtype that merely contradicts the declared element type (an `fp64` array
+ * where the schema said `fp32`), and that case is covered in `skip.test.ts`.
+ */
+describe("fixlen array: only fp32/fp64 are subtypes at all (§4.8.1 step 3, §5.2.2)", () => {
+  const greedy: Visitor = {
+    arrayBegin: () => true,
+    arrayFp32: () => undefined,
+    arrayFp64: () => undefined,
+    fixlenBegin: () => undefined,
+    string: () => undefined,
+    blob: () => undefined,
+  };
+
+  /** `count = 2`, then a `fixlen_word` of `(len << 3) | sub`, then the payload. */
+  function array(sub: number, len: number, withPayload: boolean): Uint8Array {
+    const head = [HDR, 0x02, (len << 3) | sub];
+    return Uint8Array.from(withPayload ? [...head, ...new Array<number>(2 * len).fill(0)] : head);
+  }
+
+  function streamed(buf: Uint8Array): DecodeStatus {
+    const is = new IStream(greedy);
+    try {
+      for (const b of buf) is.feed(Uint8Array.of(b));
+    } catch (e) {
+      if (e instanceof SofabError) return DecodeStatus.Invalid;
+      throw e;
+    }
+    return is.status();
+  }
+
+  it.each([
+    ["string", 2],
+    ["blob", 3],
+  ])("rejects a %s element word as INVALID, not as a skip", (_name, sub) => {
+    // With the payload present, a decoder that skipped instead would report
+    // COMPLETE — which is exactly the reading §4.8.1 step 3 forbids.
+    expect(codeOf(() => decode(array(sub, 4, true), greedy))).toBe(SofabErrorCode.InvalidMsg);
+    expect(streamed(array(sub, 4, true))).toBe(DecodeStatus.Invalid);
+
+    // …and without it, so the verdict cannot be coming from a short payload.
+    expect(codeOf(() => decode(array(sub, 4, false), greedy))).toBe(SofabErrorCode.InvalidMsg);
+    expect(streamed(array(sub, 4, false))).toBe(DecodeStatus.Invalid);
+  });
+
+  it("rejects a reserved element word the same way — the neighbouring §5.2.2 row", () => {
+    for (const sub of [4, 5, 6, 7]) {
+      expect(codeOf(() => decode(array(sub, 4, true), greedy))).toBe(SofabErrorCode.InvalidMsg);
+    }
+  });
+
+  it("accepts the two subtypes that exist — the control", () => {
+    expect(() => decode(array(0, 4, true), greedy)).not.toThrow();
+    expect(() => decode(array(1, 8, true), greedy)).not.toThrow();
+    expect(streamed(array(0, 4, true))).toBe(DecodeStatus.Complete);
+    expect(streamed(array(1, 8, true))).toBe(DecodeStatus.Complete);
+  });
+});
