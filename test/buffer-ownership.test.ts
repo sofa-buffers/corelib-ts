@@ -31,10 +31,13 @@
 import { describe, expect, it } from "vitest";
 import {
   type FlushSink,
+  type Kernel,
   OStream,
   SofabError,
   SofabErrorCode,
+  getKernel,
   growingOStream,
+  setKernel,
 } from "../src/index.js";
 
 /** The §6.3 code of whatever `fn` throws, or `undefined` if it returns. */
@@ -331,5 +334,96 @@ describe("the encoder has no growth mechanism at all (§6.6)", () => {
     write(growing);
     growing.flush();
     expect(Array.from(grow.bytes())).toEqual(Array.from(reference()));
+  });
+});
+
+
+describe("the accumulator keeps the message where the caller put it", () => {
+  it("does not fold a reserve offset into the message (corelib-ts#165)", () => {
+    // `growingOStream` is an ordinary streaming stream, so a caller may install
+    // its own buffer with header room (§5.1.5). The accumulating sink has to copy
+    // the MESSAGE, which begins at the stream's origin — not at index 0 of the
+    // buffer it was handed. Copying from 0 folded the reserved bytes in, and the
+    // corruption only appeared after the first enlargement, so nothing shorter
+    // than a message that outgrows its buffer catches it.
+    const RESERVE = 8;
+    const os = growingOStream(64);
+    os.setBuffer(new Uint8Array(64), RESERVE);
+    for (let i = 1; i < 40; i++) os.writeUnsigned(i, 1);
+
+    const ref = growingOStream(64);
+    for (let i = 1; i < 40; i++) ref.writeUnsigned(i, 1);
+
+    expect(os.bytesUsed).toBe(ref.bytesUsed);
+    expect(Array.from(os.bytes())).toEqual(Array.from(ref.bytes()));
+    // The reserved bytes are gone from the message, not merely zero: a run of
+    // leading zeros would also satisfy a byte comparison against a reference
+    // that had them too.
+    expect(os.bytes()[0]).not.toBe(0);
+  });
+
+  it("reports the message, not the buffer, before any flush too", () => {
+    const os = growingOStream(64);
+    os.setBuffer(new Uint8Array(64), 8);
+    os.writeUnsigned(1, 42);
+    expect(os.bytesUsed).toBe(2);
+    expect(Array.from(os.bytes())).toEqual([8, 42]);
+  });
+});
+
+describe("a flush carries the room the encoder wants (FlushSink's needed)", () => {
+  it("reaches the sink, and is 0 for an explicit flush", () => {
+    const seen: number[] = [];
+    const os = new OStream(new Uint8Array(8), 0, (_b, _s, _e, needed) => {
+      seen.push(needed ?? -1);
+    });
+    os.writeUnsigned(1, 1);
+    os.flush();
+    expect(seen).toEqual([0]); // an explicit flush asks for nothing in particular
+    seen.length = 0;
+    // A bulk write asks for its whole payload contiguously.
+    os.writeString(2, "y".repeat(50));
+    expect(seen.some((n) => n >= 50)).toBe(true);
+  });
+
+  it("keeps the bulk kernel route open on a default-capacity accumulator", () => {
+    // The regression this exists for: without `needed` the accumulating sink
+    // could only double blindly, so a 1000-element array written into the
+    // 256-byte default never got a buffer big enough and fell back to the
+    // element-at-a-time route on every attempt — identical bytes, none of the
+    // kernel's speed, and no test could see it.
+    const base = getKernel();
+    let bulk = 0;
+    const counting = {
+      ...base,
+      packFp64Array: (v: ArrayLike<number>, b: Uint8Array, p: number) => {
+        bulk++;
+        return base.packFp64Array(v, b, p);
+      },
+    } as Kernel;
+
+    const values = Array.from({ length: 1000 }, (_, i) => i * 1.5);
+    let bytes: number[] = [];
+    setKernel(counting);
+    try {
+      const os = growingOStream(); // the 256-byte default, deliberately
+      os.writeFp64Array(1, values);
+      bytes = Array.from(os.bytes());
+    } finally {
+      setKernel(base);
+    }
+    expect(bulk).toBe(1);
+
+    // …and the bytes are the ones the element-at-a-time route produces, so the
+    // faster path is not a different encoding.
+    // A 4-byte buffer cannot reserve 8000 contiguous bytes however it drains, so
+    // this stream is on the element-at-a-time route by construction.
+    const out: number[] = [];
+    const streamed = new OStream(new Uint8Array(4), 0, (b, s, e) => {
+      for (let i = s; i < e; i++) out.push(b[i]!);
+    });
+    streamed.writeFp64Array(1, values);
+    streamed.flush();
+    expect(out).toEqual(bytes);
   });
 });

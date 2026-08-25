@@ -110,36 +110,54 @@ function accumulatorBuffer(n: number): Uint8Array {
  * The accumulating flush sink (§5.1.5), shared by every accumulating stream and
  * holding no state of its own.
  *
- * `OStream.flush` invokes the sink as `this.flushSink(this.buf, this.start,
- * this.pos)` — a method call — so `this` here is the encoder that flushed, and
- * `buffer` is the storage it was writing into. Those are the only two things
- * this needs, which is why `growingOStream` allocates **nothing** per stream
- * beyond the storage itself: no closure, no context, no accumulator object.
+ * `OStream.flush` invokes the sink as a **method** of the stream, so `this` here
+ * is the encoder that flushed and `buffer` is the storage it was writing into.
+ * That is why `growingOStream` allocates **nothing** per stream beyond the
+ * storage itself: no closure, no context, no accumulator object.
  * `test/buffer-ownership.test.ts` pins the receiver, since a refactor of `flush`
  * that hoisted the sink into a local would break it.
  *
  * The encoder writes into the result all along, so the flushed bytes are already
- * where they belong and `end` is their absolute offset: absorbing a flush is
- * nothing at all. What is left is to make room and re-open the encoder over the
- * free tail, telling it that the first `end` bytes of the replacement are the
- * message it has already written (`carried`), so {@link OStream.bytes} keeps
- * reporting the message.
+ * where they belong: absorbing a flush is nothing at all. What is left is to make
+ * room and re-open the encoder over the free tail, telling it how much of the
+ * replacement is message it has already written (`carried`), so
+ * {@link OStream.bytes} keeps reporting the message.
+ *
+ * **Where the message begins is `this.bytesUsed`, never `0`.** At a flush the
+ * cursor is `end`, so the message occupies `[end - bytesUsed, end)`. The two
+ * coincide on an ordinary accumulating stream — and part the moment a caller
+ * installs a buffer with a reserve offset, which `growingOStream` permits like
+ * any other streaming stream. Copying from `0` there would fold the reserved
+ * bytes into the message and hand back a wire image with junk in front of it.
+ *
+ * **`needed` decides how much room to make.** A bulk write asks for its whole
+ * payload contiguously; without that number this could only double blindly, and
+ * a large array written into a small accumulator would fall back to the
+ * element-at-a-time route on every attempt — correct bytes, but none of the
+ * kernel's speed. `MIN_WINDOW` is the floor, so an ordinary flush behaves as
+ * before.
  */
 const ACCUMULATE = function (
   this: OStream,
   buffer: Uint8Array,
   _start: number,
   end: number,
+  needed = 0,
 ): void {
-  let acc = buffer;
-  if (acc.length - end < MIN_WINDOW) {
-    let cap = acc.length * 2;
-    if (cap < end + MIN_WINDOW) cap = end + MIN_WINDOW;
-    const next = accumulatorBuffer(cap);
-    next.set(acc.subarray(0, end));
-    acc = next;
+  const used = this.bytesUsed;
+  const window = needed > MIN_WINDOW ? needed : MIN_WINDOW;
+  if (buffer.length - end >= window) {
+    // The tail already holds what was asked for: re-open over it, with the
+    // message's own extent as `carried`. No copy, and no allocation at all.
+    this.setBuffer(buffer, end, used);
+    return;
   }
-  this.setBuffer(acc, end, end);
+  let cap = buffer.length * 2;
+  const want = used + window;
+  if (cap < want) cap = want;
+  const next = accumulatorBuffer(cap);
+  next.set(buffer.subarray(end - used, end));
+  this.setBuffer(next, used, used);
 } as FlushSink;
 
 /**
@@ -165,9 +183,10 @@ const ACCUMULATE = function (
  * @param initialCapacity bytes to start from; the accumulator enlarges itself
  * whenever the message outgrows it, so this only trades an initial allocation
  * against the number of enlargements and never limits the message. A caller with
- * a rough size in hand should pass it: a 100 KB payload written into the default
- * 256 bytes costs nine enlargements and about 2.5x the CPU of one that started
- * big enough.
+ * a rough size in hand should pass it: 100 KB of *small fields* grows by doubling
+ * and costs nine enlargements from the 256-byte default. A single large field
+ * does not — a bulk write hands the sink its `needed`, so the buffer reaches that
+ * size in one step and the write keeps its bulk route.
  */
 export function growingOStream(initialCapacity = DEFAULT_CAPACITY): OStream {
   if (!Number.isInteger(initialCapacity) || initialCapacity < 1) {

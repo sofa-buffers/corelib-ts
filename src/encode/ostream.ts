@@ -240,6 +240,20 @@ export class OStream implements ByteSink {
    * stream could never use and the two shapes would be indistinguishable.
    */
   flush(): void {
+    this.drain(0);
+  }
+
+  /**
+   * {@link flush}, plus the number of contiguous bytes the caller wants at the
+   * cursor afterwards — `0` when it wants none in particular.
+   *
+   * Split out from the public `flush` so the figure cannot be invented by a
+   * caller: it is the encoder's own reserve request, and a sink that sizes a
+   * replacement from it (`growingOStream`) has to be able to trust it. Everything
+   * else is identical, including that a sink which returns without installing has
+   * *copied* and the cursor resumes at `0`.
+   */
+  private drain(needed: number): void {
     if (this.flushSink && this.pos > this.start) {
       const installed = this.installs;
       // The installed buffer itself, with the region's coordinates — never a view
@@ -252,7 +266,7 @@ export class OStream implements ByteSink {
       // and allocates nothing per stream. Hoisting `this.flushSink` into a local
       // here would silently take that away — `test/buffer-ownership.test.ts`
       // pins the receiver.
-      this.flushSink(this.buf, this.start, this.pos);
+      this.flushSink(this.buf, this.start, this.pos, needed);
       // A `setBuffer` from inside the callback *is* the new installation and has
       // already placed the cursor at its own offset; only a bare return leaves
       // the old installation in place, and that one is the consumed case.
@@ -293,10 +307,12 @@ export class OStream implements ByteSink {
    * §5.1.5 handover, not a growth hook inside the encoder (§6.6).
    *
    * The accumulating stream `growingOStream` builds is an ordinary streaming
-   * stream, so this works on it too — but its sink recognises only its own
-   * storage and rejects a foreign buffer at the next flush, rather than silently
-   * losing the accumulated prefix. Encode into a plain
-   * `new OStream(buffer, offset, flush?)` to own the buffer yourself.
+   * stream, so this works on it too, and means exactly what it means anywhere
+   * else: the not-yet-flushed bytes in the old buffer are dropped, encoding
+   * continues into yours, and its sink takes over growing *that* one from the
+   * next flush — reserve offset included, since what it copies out is the
+   * message rather than the buffer. Encode into a plain
+   * `new OStream(buffer, offset, flush?)` to keep the buffer yours instead.
    */
   setBuffer(buffer: Uint8Array, offset = 0, carried = 0): void {
     checkHandover(buffer, offset, this.flushSink !== undefined, carried);
@@ -1099,7 +1115,7 @@ export class OStream implements ByteSink {
    */
   private tryEnsure(n: number): boolean {
     if (this.buf.length - this.pos >= n) return true;
-    this.flush();
+    this.drain(n);
     if (this.buf.length - this.pos >= n) return true;
     if (this.flushSink === undefined) {
       throw bufferFullError(
@@ -1136,7 +1152,7 @@ export class OStream implements ByteSink {
   private reserveBulk(n: number): boolean {
     if (this.buf.length - this.pos >= n) return true;
     if (this.flushSink === undefined) return false;
-    this.flush();
+    this.drain(n);
     return this.buf.length - this.pos >= n;
   }
 

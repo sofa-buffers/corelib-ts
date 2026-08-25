@@ -519,9 +519,11 @@ Who owns the bytes:
   the buffer it grew to, so a pooled encoder stops allocating. It is an ordinary
   streaming stream otherwise, so `setBuffer` works and means what it always means:
   the not-yet-flushed bytes are dropped and encoding continues into your buffer.
-  Pass an `initialCapacity` when you know roughly how large the message is — a
-  100 KB payload starting from the 256-byte default costs nine enlargements and
-  about 2.5x the CPU of one that started big enough.
+  Pass an `initialCapacity` when you know roughly how large the message is: a
+  message built from many small fields grows by doubling, so 100 KB of them costs
+  nine enlargements from the 256-byte default. A single large field does not — a
+  bulk write tells the accumulator how much contiguous room it wants, so the
+  buffer reaches that size in one step and the write keeps its bulk route.
 
   It reaches the encoder through `setBuffer(buffer, offset, carried)`, the third
   argument being how many bytes of the message the replacement already holds
