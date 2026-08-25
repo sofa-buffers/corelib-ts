@@ -634,10 +634,14 @@ An over-limit array count or string / blob length is rejected at the field's cou
 length header — **before** the array is announced or any payload piece reaches the
 visitor — by throwing `SofabError` with code `SofabErrorCode.LimitExceeded`. The
 decoder rejects, never clamps. A rejection at a count or length word is terminal:
-the stream re-reports it rather than resuming inside the abandoned field. Unlike
-`INVALID_MSG` it is not the `INVALID` outcome — the same bytes decode under a looser
-cap — so `status()` keeps saying so. The values are generated code's to choose, from
-the sofabgen config; the defaults exist so a decoder built without any is bounded.
+the stream re-reports it from every later `feed` rather than resuming inside the
+abandoned field. It is **not** the `INVALID` outcome — the same bytes decode under a
+looser cap — so `status()` never reports `INVALID` for it; nor does it report
+anything else about it, since the three-valued outcome has no value for "valid, but
+more than I am configured to accept". Read a cap rejection where it is raised, off
+the error channel, not by polling `status()`. The values are generated code's to
+choose, from the sofabgen config; the defaults exist so a decoder built without any
+is bounded.
 
 A cap applies **only to a field the schema leaves unbounded**. Where the schema
 declares a `count` / `maxlen`, that bound governs and an over-bound value is

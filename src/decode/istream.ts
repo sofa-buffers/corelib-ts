@@ -271,9 +271,17 @@ export class IStream {
    * it, so a caller that catches the throw and feeds on gets the same error again
    * from every later call — no further byte is consumed and no visitor method is
    * invoked — and {@link status} answers {@link DecodeStatus.Invalid} from then
-   * on. A receiver-limit rejection (`LIMIT_EXCEEDED`, {@link DecodeLimits}) does
-   * *not* latch: the bytes are well-formed, and it is a policy rejection rather
-   * than the `INVALID` outcome (§6.2.1).
+   * on.
+   *
+   * A receiver-limit rejection (`LIMIT_EXCEEDED`, {@link DecodeLimits}) travels
+   * the same channel and latches the same way — every later call re-throws it —
+   * but it is **not** the `INVALID` outcome and never becomes one: the bytes are
+   * well-formed and the same message decodes under a looser cap, so it is a
+   * policy rejection (§6.2.1, §6.3). The two stay distinguishable by their code,
+   * which is what §6.3 requires; §6.3 leaves the surfacing open between "a fourth
+   * decode outcome" and "a terminal failure carrying the `LimitExceeded` code on
+   * the error channel", and this port takes the second. The three-valued
+   * {@link status} therefore has no value for it — see there.
    */
   feed(chunk: Uint8Array): DecodeStatus {
     this.state.push(chunk);
@@ -292,6 +300,17 @@ export class IStream {
    * A convenience, never an obligation: the finish-less spec (§5.2.4) requires no
    * end step, and this is a pure accessor — it never throws, consumes nothing, and
    * never promotes an incomplete decode to an error.
+   *
+   * **This is not the limit channel.** A `LIMIT_EXCEEDED` rejection has no value
+   * in the three-valued outcome: `Invalid` would be wrong (the bytes are
+   * well-formed and §6.3 forbids folding a limit rejection into `INVALID`) and so
+   * would `Complete`, so a stream stopped by a cap keeps reporting the structural
+   * answer for the bytes it consumed — `Incomplete`, since a cap fires at a count
+   * or length word, i.e. inside a field. Read the cap rejection where it is
+   * raised: {@link feed} throws {@link SofabError} with
+   * {@link SofabErrorCode.LimitExceeded}, and every later {@link feed} re-throws
+   * it, so a caller polling this instead can only feed bytes that cannot be
+   * consumed.
    */
   status(): DecodeStatus {
     return this.state.finish();

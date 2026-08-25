@@ -24,6 +24,7 @@ import {
   DEFAULT_MAX_DYN_ARRAY_COUNT,
   DEFAULT_MAX_DYN_BLOB_LEN,
   DEFAULT_MAX_DYN_STRING_LEN,
+  DecodeStatus,
   IStream,
   SofabError,
   SofabErrorCode,
@@ -88,6 +89,32 @@ describe("decode limits: array count (maxArrayCount)", () => {
     const is = new IStream({}, { maxArrayCount: LIMIT });
     expect(codeOf(() => is.feed(oversize))).toBe(SofabErrorCode.LimitExceeded);
     expect(is.status()).not.toBe("INVALID");
+  });
+
+  it("is terminal on the error channel, and status() is not that channel", () => {
+    // A2-0167. §6.3 leaves the surfacing open — "either a fourth decode outcome,
+    // or a terminal failure carrying the `LimitExceeded` code on the error
+    // channel" — and this port takes the second, which is why the three-valued
+    // `status()` has nothing true to say about a cap rejection. What §6.3 does
+    // require is that the two stay distinguishable and that the rejection be
+    // terminal, both of which are pinned here.
+    const is = new IStream({}, { maxArrayCount: LIMIT });
+    expect(codeOf(() => is.feed(oversize))).toBe(SofabErrorCode.LimitExceeded);
+
+    // Terminal: every later feed re-reports it, consuming nothing.
+    expect(codeOf(() => is.feed(Uint8Array.of(0x00)))).toBe(SofabErrorCode.LimitExceeded);
+    expect(codeOf(() => is.feed(new Uint8Array(0)))).toBe(SofabErrorCode.LimitExceeded);
+
+    // Never folded into INVALID (§6.2.1, §6.3) and never COMPLETE: the outcome
+    // stays the structural answer for the bytes consumed, which is INCOMPLETE
+    // because a cap fires at a count/length word, inside a field.
+    expect(is.status()).toBe(DecodeStatus.Incomplete);
+
+    // The contrast that makes it a distinction rather than an accident: a
+    // *malformed* message does latch INVALID and status() says so.
+    const bad = new IStream({});
+    expect(codeOf(() => bad.feed(Uint8Array.of(0x02, 0x04)))).toBe(SofabErrorCode.InvalidMsg);
+    expect(bad.status()).toBe(DecodeStatus.Invalid);
   });
 
   it("accepts a count exactly at the limit, rejects one past it", () => {

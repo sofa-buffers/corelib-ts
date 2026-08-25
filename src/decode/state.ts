@@ -643,6 +643,15 @@ export class DecoderState {
    * that verdict is terminal: once {@link fail} has latched it this returns
    * {@link DecodeStatus.Invalid} for good, so a caller that swallowed the throw
    * and kept feeding cannot read back `Complete`.
+   *
+   * {@link limitReason} is deliberately **not** consulted. A cap rejection is
+   * terminal too and {@link push} re-throws it, but it is not the `INVALID`
+   * outcome and §6.3 forbids reporting it as one — and there is no value in the
+   * three-valued outcome that would be true of it. So a stream stopped by a cap
+   * keeps reporting the structural answer for the bytes it consumed, which is
+   * `Incomplete` (a cap fires at a count or length word, inside a field). The
+   * rejection is the error channel's, per §6.3's second option, and
+   * `IStream.status`'s doc says so to the caller.
    */
   finish(): DecodeStatus {
     if (this.invalidReason !== null) return DecodeStatus.Invalid;
