@@ -645,8 +645,12 @@ declares a `count` / `maxlen`, that bound governs and an over-bound value is
 learns a schema, so the split is made where the schema is known: generated code takes
 the declared size from `fixlenBegin` / `arrayBegin` — which carry it before any
 payload or element arrives — and configures caps that do not cut across its own
-declarations. `StringSeq` / `BlobSeq` / `ElementSeq` take both: the schema `count` as
-an index capacity, and a receiver cap for an array the schema left open.
+declarations. `StringSeq` / `BlobSeq` / `ElementSeq` take both, on both axes: the
+schema `count` and a receiver index cap, and the element `maxlen` and a receiver
+element-length cap (`receiverElemMax`) — a wrapper array's `string` / `blob` length
+words go to the collector, never to the generated visitor, so that is where the
+element's cap belongs. Each pair is exclusive: the schema half where the schema
+declared one, the receiver half where it did not.
 
 ## Build & test
 
