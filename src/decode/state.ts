@@ -462,9 +462,10 @@ export class DecoderState {
           const count = this.vNum();
           if (count > ARRAY_MAX) this.fail("array count out of range");
           // §6.2.1: a receiver cap bounds what this reader is handed, and a
-          // skipped scope hands it nothing. The format ceiling above binds
-          // either way — it bounds what the wire may express.
-          if (count > this.maxArrayCount && this.cur !== SKIP) {
+          // field it skips — a declined scope, or one whose callback this
+          // visitor does not declare — hands it nothing. The format ceiling
+          // above binds either way: it bounds what the wire may express.
+          if (count > this.maxArrayCount && this.arrayIsRead()) {
             this.failLimit(`array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`);
           }
           this.arrCount = count;
@@ -643,6 +644,15 @@ export class DecoderState {
    * that verdict is terminal: once {@link fail} has latched it this returns
    * {@link DecodeStatus.Invalid} for good, so a caller that swallowed the throw
    * and kept feeding cannot read back `Complete`.
+   *
+   * {@link limitReason} is deliberately **not** consulted. A cap rejection is
+   * terminal too and {@link push} re-throws it, but it is not the `INVALID`
+   * outcome and §6.3 forbids reporting it as one — and there is no value in the
+   * three-valued outcome that would be true of it. So a stream stopped by a cap
+   * keeps reporting the structural answer for the bytes it consumed, which is
+   * `Incomplete` (a cap fires at a count or length word, inside a field). The
+   * rejection is the error channel's, per §6.3's second option, and
+   * `IStream.status`'s doc says so to the caller.
    */
   finish(): DecodeStatus {
     if (this.invalidReason !== null) return DecodeStatus.Invalid;
@@ -674,6 +684,49 @@ export class DecoderState {
   private failLimit(message: string): never {
     this.limitReason = message;
     throw limitExceededError(message);
+  }
+
+  /**
+   * Does the current handler take this array at all?
+   *
+   * §6.2.1: *"a field the handler skips allocates nothing — it is walked, not
+   * materialized (§6.7.2). A `max_dyn_*` limit **MUST NOT** be applied to it, so
+   * a decode that steps over an over-cap field it was never going to read stays
+   * `COMPLETE`. The check belongs at the count/length header of a field that is
+   * actually **read**."*
+   *
+   * On a flat visitor (§6.0) the per-field intent is spelled by which callbacks
+   * exist: a missing one means the bytes are consumed and nothing is delivered,
+   * so there is no destination for a cap to bound. `arrayBegin` alone counts as
+   * read — it carries the announced count, which is the number a generated
+   * handler sizes its destination from, and that allocation is exactly what the
+   * cap is for.
+   *
+   * Asked **only once a count has already exceeded the cap**, so a conforming
+   * decode never pays for it. It subsumes the older `cur !== SKIP` test:
+   * {@link SKIP} declares no callback, so every probe here is `undefined` on it.
+   */
+  private arrayIsRead(): boolean {
+    const v = this.cur;
+    if (v.arrayBegin !== undefined) return true;
+    // A fixlen array's element kind is not known until its element-length word,
+    // which is one state later, so either float callback keeps it read.
+    if (this.arrIsFixlen) return v.arrayFp32 !== undefined || v.arrayFp64 !== undefined;
+    return this.arrKind === ArrayKind.Unsigned
+      ? v.arrayUnsigned !== undefined
+      : v.arraySigned !== undefined;
+  }
+
+  /**
+   * The same question for a `string` / `blob` field — see {@link arrayIsRead}.
+   * `fixlenBegin` counts on its own, for the same reason `arrayBegin` does: it
+   * carries the declared total before any payload, which is what a handler sizes
+   * a destination from.
+   */
+  private fixlenIsRead(sub: number): boolean {
+    const v = this.cur;
+    if (v.fixlenBegin !== undefined) return true;
+    return sub === FixlenSubtype.String ? v.string !== undefined : v.blob !== undefined;
   }
 
   /**
@@ -717,14 +770,12 @@ export class DecoderState {
     }
 
     // §6.2.1: the receiver cap is decided by this word, before any payload is
-    // accepted — and only for a scope someone is reading.
-    if (this.cur !== SKIP) {
-      if (sub === FixlenSubtype.String && len > this.maxStringLen) {
-        this.failLimit(`string length ${len} exceeds maxStringLen ${this.maxStringLen}`);
-      }
-      if (sub === FixlenSubtype.Blob && len > this.maxBlobLen) {
-        this.failLimit(`blob length ${len} exceeds maxBlobLen ${this.maxBlobLen}`);
-      }
+    // accepted — and only for a field someone is reading.
+    if (sub === FixlenSubtype.String && len > this.maxStringLen && this.fixlenIsRead(sub)) {
+      this.failLimit(`string length ${len} exceeds maxStringLen ${this.maxStringLen}`);
+    }
+    if (sub === FixlenSubtype.Blob && len > this.maxBlobLen && this.fixlenIsRead(sub)) {
+      this.failLimit(`blob length ${len} exceeds maxBlobLen ${this.maxBlobLen}`);
     }
     this.fixSub = sub as FixlenSubtype;
     this.fixLen = len;

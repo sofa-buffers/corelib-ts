@@ -270,7 +270,7 @@ describe("sequence-array growth (§7.2 item 8)", () => {
     // the field the throw abandoned.
     const os = growingOStream();
     os.writeUnsignedArray(1, new Array(CAP + 1).fill(0));
-    const is = new IStream({}, { maxArrayCount: CAP });
+    const is = new IStream({ arrayBegin: () => undefined }, { maxArrayCount: CAP });
     expect(() => is.feed(os.bytes().slice())).toThrow(
       expect.objectContaining({ code: SofabErrorCode.LimitExceeded }),
     );

@@ -20,9 +20,11 @@
  *   sink there is nowhere to drain to, so no minimum applies.
  *
  * Where the message has no schema-derived bound, the allocating half is the
- * caller's, and {@link growingOStream} builds that caller ready-made: an encoder
- * over a buffer supplied — and replaced as the message grows — by a
- * {@link BufferOwner} of its own.
+ * caller's, and CORELIB_PLAN §5.1.2 names the shape it takes: "install a scratch
+ * buffer **with a sink** that appends into the growing result". `growingOStream`
+ * (`./accumulate.ts`) is that caller ready-made — a **helper** (§6.6.1) built out
+ * of the streaming mode below, owning storage the encoder never sees the whole
+ * of. `OStream` itself has no growth mechanism at all.
  *
  * Generated code typically writes one field per message field; the methods map
  * one-to-one onto the wire types. Problems throw {@link SofabError}.
@@ -70,15 +72,7 @@ import {
 } from "../varint/num64.js";
 import { encodeZigzagVarintLoHi } from "../varint/zigzag.js";
 import { type ByteSink, utf8Length, utf8Write, utf8WriteSink } from "./fixlen.js";
-import type { BufferOwner, FlushSink } from "./sink.js";
-
-/**
- * Capacity {@link growingOStream} starts from when the caller names none. Only
- * a starting point: its owner replaces the buffer with a bigger one as the
- * message grows, so this trades an initial allocation against the number of
- * replacements, and decides nothing about the bytes.
- */
-const DEFAULT_CAPACITY = 256;
+import type { FlushSink } from "./sink.js";
 
 /**
  * Largest magnitude a signed scalar takes on the number fast path: its zig-zag
@@ -96,9 +90,17 @@ const SIGNED_FAST_MAX = 0x10_0000_0000_0000; // 2^52
  * sink there is no minimum — no flush can occur, so nothing can be split, and
  * the exact-`MAX_SIZE` case must stay exact.
  */
-function checkHandover(buffer: Uint8Array, offset: number, streaming: boolean): void {
+function checkHandover(
+  buffer: Uint8Array,
+  offset: number,
+  streaming: boolean,
+  carried: number,
+): void {
   if (offset < 0 || offset > buffer.length) {
     throw argumentError(`offset ${offset} out of range`);
+  }
+  if (!Number.isInteger(carried) || carried < 0 || carried > offset) {
+    throw argumentError(`carried ${carried} out of range 0..${offset}`);
   }
   if (streaming && buffer.length - offset < MIN_OUTPUT_BUFFER) {
     throw argumentError(
@@ -111,31 +113,38 @@ function checkHandover(buffer: Uint8Array, offset: number, streaming: boolean): 
 /**
  * Encoder for the SofaBuffers wire format. Each `write*` method appends one
  * field and maps one-to-one onto a wire type. It writes into the buffer the
- * caller supplies and into no other: it allocates none of its own and grows
- * none it was given (CORELIB_PLAN §5.1). Hand it a buffer that holds the whole
+ * caller supplies and into no other: it allocates none of its own, grows
+ * none it was given, and has no hook through which anything else could grow one
+ * for it (CORELIB_PLAN §5.1.2, §6.6). Hand it a buffer that holds the whole
  * message, or one that drains to a {@link FlushSink} as it fills so the message
  * can outgrow it. Invalid arguments and a full buffer with no sink throw
  * {@link SofabError}. To let the buffer follow the message instead, encode into
- * the accumulator {@link growingOStream} builds.
+ * the accumulator `growingOStream` builds — a helper over the streaming mode,
+ * not a mode of this class.
  */
 export class OStream implements ByteSink {
   private buf: Uint8Array;
   private pos: number;
+  /**
+   * Where the **current flush unit** begins in {@link buf}: the first byte the
+   * next {@link flush} hands to the sink.
+   */
   private start: number;
+  /**
+   * Where the **message so far** begins in {@link buf} — what {@link bytes} and
+   * {@link bytesUsed} report from.
+   *
+   * Equal to {@link start} for every ordinary stream, and the two move together:
+   * what has not been flushed is the whole of what is still in the buffer. They
+   * part only when a caller installs a replacement that **already holds** the
+   * earlier bytes of this message (`setBuffer`'s `carried` argument) — the shape
+   * an accumulating caller uses, where each new window opens after the bytes the
+   * previous one left behind in the same storage. Keeping the two apart is what
+   * lets that caller be an ordinary sink (§5.1.5) instead of a growth hook
+   * inside the encoder (§6.6).
+   */
+  private origin: number;
   private readonly flushSink: FlushSink | undefined;
-  /**
-   * Who to ask for the next buffer once this one is full — the caller that owns
-   * the storage this encode runs on (CORELIB_PLAN §5.1). Absent on a plain
-   * caller buffer, which is then written exactly as it was handed over.
-   */
-  private readonly owner: BufferOwner | undefined;
-  /**
-   * Whether asking that owner is certain to produce room, so a bulk reserve can
-   * be relied on. Not a mode of the encoder: it only picks between two
-   * implementations of the same bytes — a bulk one that reserves the worst case
-   * up front and a streaming one that emits element by element.
-   */
-  private readonly canGrow: boolean;
   private depth = 0;
   /**
    * Ids of the innermost open sequences whose header has not been written yet
@@ -176,39 +185,44 @@ export class OStream implements ByteSink {
   private readonly kernel: Kernel;
 
   /**
-   * Encoder over a caller buffer, optionally draining to `flush` as it fills and,
-   * where the caller owns storage it can enlarge, asking `owner` for the next
-   * buffer instead of reporting `BUFFER_FULL`.
+   * Encoder over a caller buffer, optionally draining to `flush` as it fills.
+   *
+   * Those are the only two buffer models there are (CORELIB_PLAN §5.1.1): the
+   * buffer the caller hands over, and whatever a sink installs in its place
+   * (§5.1.5). There is no third parameter through which the encoder could be
+   * given something to enlarge — growing a destination from a write path is what
+   * §6.6's second violation row names, whoever owns the allocator.
    *
    * Constructing one is the only allocating step (§6.6): it sizes the hold-back
    * run from `MAX_DEPTH` and reads the active kernel once. No `write*` call after
    * that allocates anything.
    */
-  constructor(buffer: Uint8Array, offset = 0, flush?: FlushSink, owner?: BufferOwner) {
+  constructor(buffer: Uint8Array, offset = 0, flush?: FlushSink) {
     this.kernel = getKernel();
     this.pending = new Array<number>(MAX_DEPTH);
-    checkHandover(buffer, offset, flush !== undefined);
+    checkHandover(buffer, offset, flush !== undefined, 0);
     this.buf = buffer;
     this.start = offset;
+    this.origin = offset;
     this.pos = offset;
     this.flushSink = flush;
-    this.owner = owner;
-    this.canGrow = owner !== undefined;
   }
 
-  /** Bytes currently held in the buffer (since construction or the last flush). */
+  /** Bytes of the message currently held in the buffer (see {@link bytes}). */
   get bytesUsed(): number {
-    return this.pos - this.start;
+    return this.pos - this.origin;
   }
 
   /**
-   * The encoded message so far, as a view into the working buffer. On a stream
-   * whose buffer follows the message ({@link growingOStream}) that is the whole
-   * message; with a flush sink it is only the not-yet-flushed tail. The view is
-   * valid until the next write.
+   * The encoded message so far, as a view into the working buffer: everything
+   * written since construction, the last {@link reset}, or the last flush the
+   * sink returned from without installing a buffer. With a flush sink that is
+   * normally only the not-yet-flushed tail; on a stream whose sink hands back a
+   * replacement carrying the earlier bytes — the accumulator `growingOStream`
+   * builds — it is the whole message. The view is valid until the next write.
    */
   bytes(): Uint8Array {
-    return this.buf.subarray(this.start, this.pos);
+    return this.buf.subarray(this.origin, this.pos);
   }
 
   /**
@@ -226,17 +240,39 @@ export class OStream implements ByteSink {
    * stream could never use and the two shapes would be indistinguishable.
    */
   flush(): void {
+    this.drain(0);
+  }
+
+  /**
+   * {@link flush}, plus the number of contiguous bytes the caller wants at the
+   * cursor afterwards — `0` when it wants none in particular.
+   *
+   * Split out from the public `flush` so the figure cannot be invented by a
+   * caller: it is the encoder's own reserve request, and a sink that sizes a
+   * replacement from it (`growingOStream`) has to be able to trust it. Everything
+   * else is identical, including that a sink which returns without installing has
+   * *copied* and the cursor resumes at `0`.
+   */
+  private drain(needed: number): void {
     if (this.flushSink && this.pos > this.start) {
       const installed = this.installs;
       // The installed buffer itself, with the region's coordinates — never a view
       // this encoder built (§6.6: no allocation after construction) and never
       // memory from anywhere else (§5.1.6: pass-through is forbidden).
-      this.flushSink(this.buf, this.start, this.pos);
+      //
+      // Called as a **method of this stream**, deliberately: a sink written as a
+      // plain function then receives the encoder as `this`, which is how
+      // `growingOStream` (`./accumulate.ts`) ships a stateless module-level sink
+      // and allocates nothing per stream. Hoisting `this.flushSink` into a local
+      // here would silently take that away — `test/buffer-ownership.test.ts`
+      // pins the receiver.
+      this.flushSink(this.buf, this.start, this.pos, needed);
       // A `setBuffer` from inside the callback *is* the new installation and has
       // already placed the cursor at its own offset; only a bare return leaves
       // the old installation in place, and that one is the consumed case.
       if (this.installs === installed) {
         this.start = 0;
+        this.origin = 0;
         this.pos = 0;
       }
     }
@@ -261,23 +297,28 @@ export class OStream implements ByteSink {
    * one is rejected here, with {@link SofabErrorCode.Argument}, leaving the
    * encoder on the buffer it already had. A sink-less stream has no minimum.
    *
-   * A stream whose buffer comes from a {@link BufferOwner} — everything
-   * {@link growingOStream} builds — rejects this outright: its owner supplies
-   * buffers through the grow hook and expects the message so far to still be in
-   * the one it last handed over, so installing a foreign buffer would strand
-   * those bytes. Encode into a plain `new OStream(buffer, offset, flush?)` to
-   * own the buffer yourself.
+   * `carried` says how many bytes **immediately before `offset`** the
+   * replacement already holds of *this* message — normally `0`, because a fresh
+   * buffer holds none. A caller that keeps the whole message in one growing
+   * store passes the length it copied across, so {@link bytes} keeps reporting
+   * the message rather than only the piece written after the swap. It changes
+   * nothing on the wire and nothing about flushing: the next flush still begins
+   * at `offset`. `growingOStream` is the caller this exists for; it is the
+   * §5.1.5 handover, not a growth hook inside the encoder (§6.6).
+   *
+   * The accumulating stream `growingOStream` builds is an ordinary streaming
+   * stream, so this works on it too, and means exactly what it means anywhere
+   * else: the not-yet-flushed bytes in the old buffer are dropped, encoding
+   * continues into yours, and its sink takes over growing *that* one from the
+   * next flush — reserve offset included, since what it copies out is the
+   * message rather than the buffer. Encode into a plain
+   * `new OStream(buffer, offset, flush?)` to keep the buffer yours instead.
    */
-  setBuffer(buffer: Uint8Array, offset = 0): void {
-    if (this.owner !== undefined) {
-      throw argumentError(
-        "this stream's buffer belongs to its BufferOwner; use " +
-          "new OStream(buffer, offset, flush) to encode into a buffer of your own",
-      );
-    }
-    checkHandover(buffer, offset, this.flushSink !== undefined);
+  setBuffer(buffer: Uint8Array, offset = 0, carried = 0): void {
+    checkHandover(buffer, offset, this.flushSink !== undefined, carried);
     this.buf = buffer;
     this.start = offset;
+    this.origin = offset - carried;
     this.pos = offset;
     // Counted *after* the checks: a rejected buffer is not an installation, and
     // a flush in progress must still see the one it handed over (§5.1).
@@ -290,7 +331,8 @@ export class OStream implements ByteSink {
    * encode. Any view previously returned by {@link bytes} is invalidated.
    */
   reset(): void {
-    this.pos = this.start;
+    this.pos = this.origin;
+    this.start = this.origin;
     this.depth = 0;
     this.nPending = 0;
   }
@@ -1029,20 +1071,21 @@ export class OStream implements ByteSink {
    * array: a `memcpy`, and no view at all.
    *
    * **A payload split across flushes takes a per-piece view: a language-forced
-   * handle under §6.6.2.** `TypedArray.set` is the only `memcpy` this language
-   * exposes and it takes a *typed array* as its source, so copying a *range* of one
-   * needs a `subarray` — "the only way to name a region of the caller's buffer is a
-   * wrapper over it". It qualifies on both counts §6.6.2 names: it carries no
-   * message bytes (the storage is the caller's, on both ends) and no wire number
-   * sizes it (its extent is the room in the buffer). The allocation-free
-   * alternative is a byte loop, at 358 MB/s against 10,963 MB/s for `set` — a 30x
-   * tax on the one path that exists precisely because the payload is large.
+   * handle under CORELIB_PLAN §6.6.2.** `TypedArray.set` is the only `memcpy`
+   * this language exposes and it takes a *typed array* as its source, so copying a
+   * *range* of one needs a `subarray` — §6.6.2's "the only way to name a region of
+   * the caller's buffer is a wrapper over it". It has the two properties that
+   * clause requires: it carries no message bytes (the storage is the caller's, on
+   * both ends) and no wire number sizes it (a handle over a thousand bytes costs
+   * what a handle over ten costs). The allocation-free alternative is a byte loop,
+   * measured at 358 MB/s against 10,963 MB/s for `set`.
    *
    * It never leaves this method: `set` consumes it and no caller can reach it, so
-   * §6.7's ban on exposing a borrowed value is untouched — and so is §5.1.6, which
-   * is why the copy happens at all rather than the payload being handed to the sink.
-   * The README itemises it with the port's other handles (§9.6), and
-   * `heap-free-codec.test.ts` pins its count and kind.
+   * §6.7's ban on exposing a value that outlives its callback is untouched — and so
+   * is §5.1.6, which is why the copy happens at all rather than the payload being
+   * handed to the sink. §6.6.2 asks the port to make such handles visible rather
+   * than invisible: the README itemises it (§9.6) and `heap-free-codec.test.ts`
+   * pins its count and kind.
    */
   private writeRaw(data: Uint8Array): void {
     const total = data.length;
@@ -1072,9 +1115,8 @@ export class OStream implements ByteSink {
    */
   private tryEnsure(n: number): boolean {
     if (this.buf.length - this.pos >= n) return true;
-    this.flush();
+    this.drain(n);
     if (this.buf.length - this.pos >= n) return true;
-    if (this.grow(n)) return true;
     if (this.flushSink === undefined) {
       throw bufferFullError(
         `output buffer full: need ${n} more bytes, have ${this.buf.length - this.pos}`,
@@ -1091,23 +1133,27 @@ export class OStream implements ByteSink {
    *
    * The room already at the cursor counts on **any** buffer, which is what makes
    * the one-shot `new OStream(buf)` case — a caller buffer sized from the
-   * schema's `MAX_SIZE`, the shape CORELIB_PLAN §5.1 puts first — as fast as the
-   * accumulating one: it used to be gated on {@link canGrow} alone, so a message
-   * encoded into a caller's own buffer took `TextEncoder` for every string and
-   * the element loop for every array — measured at 1.9 µs against 0.16 µs for
-   * the same five-field message once the bulk routes were open to it.
+   * schema's `MAX_SIZE`, the shape CORELIB_PLAN §5.1 puts first — the fast one:
+   * without it a message encoded into a caller's own buffer took `TextEncoder`
+   * for every string and the element loop for every array, measured at 1.9 µs
+   * against 0.16 µs for the same five-field message.
    *
-   * Beyond that room only an *owner* may be asked, and deliberately so. A bulk
-   * array reserve asks for the **worst case** (10 bytes per element), which an
-   * owner simply allocates, while a fixed caller buffer that cannot take the
-   * worst case may still hold the real encoding comfortably — so demanding it
-   * there would turn a message that fits into a spurious `BUFFER_FULL`. Asking
-   * only when an owner can answer keeps {@link tryEnsure}'s throw out of a path
-   * whose `false` is a legitimate answer.
+   * Beyond that room only a **sink** may be asked, and only by draining. Emptying
+   * the buffer is the one thing that can produce room without an allocation
+   * anywhere (§6.6), and it is legal wherever this is called — every caller has
+   * just written a complete header, so the cursor is on a boundary between atomic
+   * units (§5.1.3). A sink that installs a larger replacement (§5.1.5) therefore
+   * re-opens the bulk route by itself, which is how the accumulating helper keeps
+   * it. Nothing is *demanded*: a `false` sends the caller down its
+   * element-at-a-time route, which produces the identical bytes, so a fixed
+   * buffer too narrow for the worst case never turns into a spurious
+   * `BUFFER_FULL`.
    */
   private reserveBulk(n: number): boolean {
     if (this.buf.length - this.pos >= n) return true;
-    return this.canGrow && this.tryEnsure(n);
+    if (this.flushSink === undefined) return false;
+    this.drain(n);
+    return this.buf.length - this.pos >= n;
   }
 
   /**
@@ -1132,136 +1178,8 @@ export class OStream implements ByteSink {
     if (room === 0) {
       this.flush();
       room = this.buf.length - this.pos;
-      if (room === 0) {
-        if (!this.grow(want)) throw bufferFullError("output buffer full");
-        room = this.buf.length - this.pos;
-      }
+      if (room === 0) throw bufferFullError("output buffer full");
     }
     return Math.min(room, want);
   }
-
-  /**
-   * Ask the buffer's **owner** for a buffer with room for `n` more bytes at
-   * `pos`; `true` once one is installed. The corelib allocates no output buffer
-   * of its own and never enlarges the one it was handed (CORELIB_PLAN §5.1), so
-   * where the caller named no owner the answer is always `no` and what does not
-   * fit is flushed or reported instead.
-   *
-   * A replacement too short for `pos + n` is treated as a refusal: the encoder
-   * never writes past the end of a buffer it was given, and an out-of-range
-   * write on a `Uint8Array` is silently dropped rather than caught, so this test
-   * is what keeps a mistaken owner from losing bytes.
-   */
-  private grow(n: number): boolean {
-    const owner = this.owner;
-    if (owner === undefined) return false;
-    const next = owner(this.buf, this.pos, n);
-    if (next === undefined || next.length - this.pos < n) return false;
-    this.buf = next;
-    return true;
-  }
-}
-
-/**
- * Bytes per slab the accumulator carves its buffers out of (see
- * {@link accumulatorBuffer}). Node's own `Buffer.allocUnsafe` pool is 8 KiB for
- * the same reason and the same trade-off.
- */
-const SLAB_BYTES = 8192;
-
-/**
- * The largest buffer taken from a slab. Half a slab, so a carve can never leave
- * most of a fresh slab unusable, and a request bigger than this gets storage of
- * its own — where one allocation per message is amortised by the message anyway.
- */
-const SLAB_MAX_TAKE = SLAB_BYTES >>> 1;
-
-let slab: Uint8Array | null = null;
-/** How much of {@link slab} has been handed out; never given back. */
-let slabUsed = 0;
-
-/**
- * Storage for the accumulator {@link growingOStream} builds: `n` bytes, carved
- * from a shared slab.
- *
- * V8 keeps a typed array's bytes inside the JS heap only up to **64 bytes**; one
- * byte more and the backing store is an external allocation, which on Node 24
- * measures ~1.4 µs — against ~60 ns for a slab carve, and against the ~300 ns it
- * takes to *encode* a small message. That single allocation was 45% of the
- * profile of `encode: typical message` and the reason the workload ran at 15 MB/s
- * while decode ran at 28. Carving amortises it over a whole slab.
- *
- * A carved region is handed out **once** and never recycled, so this changes
- * nothing an encoder or its caller can observe: two accumulators never share
- * bytes, and a slab is fresh (zero-filled) storage, so no previous message's
- * bytes can be read out of one. What it does change is lifetime — a retained
- * `bytes()` view keeps its whole slab alive, exactly as a retained
- * `Buffer.allocUnsafe` slice does — which is why {@link OStream.bytes} already
- * documents `.slice()` for a view that must outlive the encode.
- */
-function accumulatorBuffer(n: number): Uint8Array {
-  if (n > SLAB_MAX_TAKE) return new Uint8Array(n);
-  let s = slab;
-  if (s === null || s.length - slabUsed < n) {
-    s = slab = new Uint8Array(SLAB_BYTES);
-    slabUsed = 0;
-  }
-  const from = slabUsed;
-  slabUsed = from + n;
-  return s.subarray(from, slabUsed);
-}
-
-/**
- * The doubling accumulator {@link growingOStream} installs: hand back a buffer
- * twice the size (or as much more as the reserve needs) with the message copied
- * in. Module-level and stateless — everything it needs is in its arguments — so
- * an accumulating encoder costs no closure and no extra object.
- */
-const growOwner: BufferOwner = (current, used, needed) => {
-  let cap = current.length * 2;
-  if (cap < used + needed) cap = used + needed;
-  const next = accumulatorBuffer(cap);
-  next.set(current.subarray(0, used));
-  return next;
-};
-
-/**
- * An {@link OStream} whose **buffer follows the message** — the ready-made form
- * of the caller CORELIB_PLAN §5.1 puts the allocation in.
- *
- * §5.1 is explicit that the corelib allocates no output buffer: "the
- * generated-object layer allocates; the corelib does not", installing storage it
- * sized from the schema and driving the encoder "over a buffer it supplies like
- * any other caller". Where the schema bounds the message, that storage is one
- * `MAX_SIZE` buffer and a plain `new OStream(buf)` is the whole story. Where it
- * does not, sizing from a ceiling would truncate the first message that exceeds
- * it, so the caller keeps a buffer of its own and enlarges it as the message
- * grows. This builds that caller — an encoder over a buffer supplied, and
- * replaced when it fills, by the doubling {@link BufferOwner} below — so that
- * neither generated code nor a hand-written one-shot encode has to write it
- * again.
- *
- * It is the one-liner for the 90% case, where the message comfortably fits in
- * memory:
- *
- * ```ts
- * const os = growingOStream();
- * os.writeUnsigned(1, 42);
- * const wire = os.bytes();   // the whole message, as a view valid until the next write
- * ```
- *
- * {@link OStream.bytes} is therefore the **whole** message here rather than a
- * not-yet-flushed tail, and no write reports `BUFFER_FULL`. The buffer belongs
- * to the owner, so {@link OStream.setBuffer} is refused on such a stream: a
- * caller that wants to supply the buffer wants a plain `new OStream(buffer)`.
- *
- * @param initialCapacity bytes to start from; the buffer is replaced with a
- * bigger one whenever the message outgrows it, so this only trades an initial
- * allocation against the number of replacements and never limits the message.
- */
-export function growingOStream(initialCapacity = DEFAULT_CAPACITY): OStream {
-  if (!Number.isInteger(initialCapacity) || initialCapacity < 1) {
-    throw argumentError(`initial capacity ${initialCapacity} must be a positive integer`);
-  }
-  return new OStream(accumulatorBuffer(initialCapacity), 0, undefined, growOwner);
 }

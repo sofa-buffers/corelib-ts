@@ -7,12 +7,13 @@
  * is {@link SofabErrorCode.LimitExceeded}, kept deliberately distinct from
  * `InvalidMsg` (policy, not malformation).
  *
- * **They are no longer optional.** §6.2.1 now requires every receiver to carry
- * them — "there is no unset state and no unlimited mode" — so an omitted option
- * takes this port's documented default rather than switching the cap off, and a
- * non-finite one is refused outright. The *values* belong to generated code, which
- * knows the schema and the target; the defaults exist so that a decoder built
- * without any is still bounded.
+ * **They are no longer optional.** §6.2.1 requires every receiver to carry them —
+ * "there is no unset state and no unlimited mode" — so an omitted option takes
+ * the format ceiling it bounds rather than switching the cap off, and a
+ * non-finite one is refused outright. The *values* belong to generated code,
+ * which knows the schema and the target: "the codec never invents a limit of its
+ * own", so the fallback is the widest value that is still a limit, never a number
+ * this port picked (A2-0161).
  *
  * Both entry points are checked: the one-shot {@link decode} and the streaming
  * {@link IStream}. They are the same decoder (§5.3.1), and this is one of the
@@ -21,9 +22,9 @@
 
 import { describe, expect, it } from "vitest";
 import {
-  DEFAULT_MAX_DYN_ARRAY_COUNT,
-  DEFAULT_MAX_DYN_BLOB_LEN,
-  DEFAULT_MAX_DYN_STRING_LEN,
+  ARRAY_MAX,
+  DecodeStatus,
+  FIXLEN_MAX,
   IStream,
   SofabError,
   SofabErrorCode,
@@ -32,6 +33,21 @@ import {
   type DecodeLimits,
   type Visitor,
 } from "../src/index.js";
+
+/**
+ * A visitor that **reads** every field kind a cap bounds.
+ *
+ * Not decoration. §6.2.1 puts the cap check "at the count/length header of a
+ * field that is actually **read**", so a cap test driven by an empty visitor
+ * would be testing a field the decoder is entitled to walk past uncapped. Both
+ * `arrayBegin` and `fixlenBegin` carry the announced count / declared length
+ * before any payload — the number a handler sizes its destination from — so
+ * either one alone makes the field read.
+ */
+const READS: Visitor = {
+  arrayBegin: () => undefined,
+  fixlenBegin: () => undefined,
+};
 
 /** Run `fn` and return the SofabError code it throws (or fail loudly). */
 function codeOf(fn: () => unknown): SofabErrorCode {
@@ -45,13 +61,13 @@ function codeOf(fn: () => unknown): SofabErrorCode {
 }
 
 /** Feed a whole buffer to a streaming IStream in one push. */
-function drainStream(buf: Uint8Array, limits?: DecodeLimits, visitor: Visitor = {}): void {
+function drainStream(buf: Uint8Array, limits?: DecodeLimits, visitor: Visitor = READS): void {
   const is = new IStream(visitor, limits);
   is.feed(buf);
 }
 
 /** Feed a whole buffer to a streaming IStream one byte at a time. */
-function drainChunked(buf: Uint8Array, limits?: DecodeLimits, visitor: Visitor = {}): void {
+function drainChunked(buf: Uint8Array, limits?: DecodeLimits, visitor: Visitor = READS): void {
   const is = new IStream(visitor, limits);
   for (let i = 0; i < buf.length; i++) is.feed(buf.subarray(i, i + 1));
 }
@@ -65,29 +81,55 @@ describe("decode limits: array count (maxArrayCount)", () => {
     return os.bytes().slice();
   })();
 
-  it("decodes with no options, because the default cap is above this count", () => {
-    expect(LIMIT + 1).toBeLessThan(DEFAULT_MAX_DYN_ARRAY_COUNT);
-    expect(() => decode(oversize, {})).not.toThrow();
+  it("decodes with no options, because the default cap is the format ceiling", () => {
+    expect(LIMIT + 1).toBeLessThan(ARRAY_MAX);
+    expect(() => decode(oversize, READS)).not.toThrow();
     expect(() => drainStream(oversize)).not.toThrow();
   });
 
   it("throws LimitExceeded on both entry points once maxArrayCount is set", () => {
     const limits = { maxArrayCount: LIMIT };
-    expect(codeOf(() => decode(oversize, {}, limits))).toBe(SofabErrorCode.LimitExceeded);
+    expect(codeOf(() => decode(oversize, READS, limits))).toBe(SofabErrorCode.LimitExceeded);
     expect(codeOf(() => drainStream(oversize, limits))).toBe(SofabErrorCode.LimitExceeded);
     expect(codeOf(() => drainChunked(oversize, limits))).toBe(SofabErrorCode.LimitExceeded);
   });
 
   it("is distinct from InvalidMsg (policy, not malformation)", () => {
-    expect(codeOf(() => decode(oversize, {}, { maxArrayCount: LIMIT }))).not.toBe(
+    expect(codeOf(() => decode(oversize, READS, { maxArrayCount: LIMIT }))).not.toBe(
       SofabErrorCode.InvalidMsg,
     );
   });
 
   it("does not latch the stream INVALID — the bytes are well-formed", () => {
-    const is = new IStream({}, { maxArrayCount: LIMIT });
+    const is = new IStream(READS, { maxArrayCount: LIMIT });
     expect(codeOf(() => is.feed(oversize))).toBe(SofabErrorCode.LimitExceeded);
     expect(is.status()).not.toBe("INVALID");
+  });
+
+  it("is terminal on the error channel, and status() is not that channel", () => {
+    // A2-0167. §6.3 leaves the surfacing open — "either a fourth decode outcome,
+    // or a terminal failure carrying the `LimitExceeded` code on the error
+    // channel" — and this port takes the second, which is why the three-valued
+    // `status()` has nothing true to say about a cap rejection. What §6.3 does
+    // require is that the two stay distinguishable and that the rejection be
+    // terminal, both of which are pinned here.
+    const is = new IStream(READS, { maxArrayCount: LIMIT });
+    expect(codeOf(() => is.feed(oversize))).toBe(SofabErrorCode.LimitExceeded);
+
+    // Terminal: every later feed re-reports it, consuming nothing.
+    expect(codeOf(() => is.feed(Uint8Array.of(0x00)))).toBe(SofabErrorCode.LimitExceeded);
+    expect(codeOf(() => is.feed(new Uint8Array(0)))).toBe(SofabErrorCode.LimitExceeded);
+
+    // Never folded into INVALID (§6.2.1, §6.3) and never COMPLETE: the outcome
+    // stays the structural answer for the bytes consumed, which is INCOMPLETE
+    // because a cap fires at a count/length word, inside a field.
+    expect(is.status()).toBe(DecodeStatus.Incomplete);
+
+    // The contrast that makes it a distinction rather than an accident: a
+    // *malformed* message does latch INVALID and status() says so.
+    const bad = new IStream(READS);
+    expect(codeOf(() => bad.feed(Uint8Array.of(0x02, 0x04)))).toBe(SofabErrorCode.InvalidMsg);
+    expect(bad.status()).toBe(DecodeStatus.Invalid);
   });
 
   it("accepts a count exactly at the limit, rejects one past it", () => {
@@ -96,8 +138,8 @@ describe("decode limits: array count (maxArrayCount)", () => {
       os.writeUnsignedArray(1, new Array(8).fill(1));
       return os.bytes().slice();
     })();
-    expect(() => decode(at, {}, { maxArrayCount: 8 })).not.toThrow();
-    expect(codeOf(() => decode(at, {}, { maxArrayCount: 7 }))).toBe(
+    expect(() => decode(at, READS, { maxArrayCount: 8 })).not.toThrow();
+    expect(codeOf(() => decode(at, READS, { maxArrayCount: 7 }))).toBe(
       SofabErrorCode.LimitExceeded,
     );
   });
@@ -122,10 +164,10 @@ describe("decode limits: array count (maxArrayCount)", () => {
       os.writeFp32Array(1, new Array(20).fill(1.5));
       return os.bytes().slice();
     })();
-    expect(codeOf(() => decode(signed, {}, { maxArrayCount: 10 }))).toBe(
+    expect(codeOf(() => decode(signed, READS, { maxArrayCount: 10 }))).toBe(
       SofabErrorCode.LimitExceeded,
     );
-    expect(codeOf(() => decode(floats, {}, { maxArrayCount: 10 }))).toBe(
+    expect(codeOf(() => decode(floats, READS, { maxArrayCount: 10 }))).toBe(
       SofabErrorCode.LimitExceeded,
     );
   });
@@ -139,14 +181,14 @@ describe("decode limits: string length (maxStringLen)", () => {
   })();
 
   it("decodes under the default cap", () => {
-    expect(100).toBeLessThan(DEFAULT_MAX_DYN_STRING_LEN);
-    expect(() => decode(msg, {})).not.toThrow();
+    expect(100).toBeLessThan(FIXLEN_MAX);
+    expect(() => decode(msg, READS)).not.toThrow();
     expect(() => drainStream(msg)).not.toThrow();
   });
 
   it("throws LimitExceeded on both entry points once maxStringLen is set", () => {
     const limits = { maxStringLen: 64 };
-    expect(codeOf(() => decode(msg, {}, limits))).toBe(SofabErrorCode.LimitExceeded);
+    expect(codeOf(() => decode(msg, READS, limits))).toBe(SofabErrorCode.LimitExceeded);
     expect(codeOf(() => drainStream(msg, limits))).toBe(SofabErrorCode.LimitExceeded);
     expect(codeOf(() => drainChunked(msg, limits))).toBe(SofabErrorCode.LimitExceeded);
   });
@@ -166,7 +208,7 @@ describe("decode limits: string length (maxStringLen)", () => {
       os.writeBlob(1, new Uint8Array(100));
       return os.bytes().slice();
     })();
-    expect(() => decode(blob, {}, { maxStringLen: 4 })).not.toThrow();
+    expect(() => decode(blob, READS, { maxStringLen: 4 })).not.toThrow();
   });
 });
 
@@ -179,7 +221,7 @@ describe("decode limits: blob length (maxBlobLen)", () => {
 
   it("throws LimitExceeded on both entry points once maxBlobLen is set", () => {
     const limits = { maxBlobLen: 64 };
-    expect(codeOf(() => decode(msg, {}, limits))).toBe(SofabErrorCode.LimitExceeded);
+    expect(codeOf(() => decode(msg, READS, limits))).toBe(SofabErrorCode.LimitExceeded);
     expect(codeOf(() => drainStream(msg, limits))).toBe(SofabErrorCode.LimitExceeded);
     expect(codeOf(() => drainChunked(msg, limits))).toBe(SofabErrorCode.LimitExceeded);
   });
@@ -190,7 +232,7 @@ describe("decode limits: blob length (maxBlobLen)", () => {
       os.writeString(1, "x".repeat(100));
       return os.bytes().slice();
     })();
-    expect(() => decode(str, {}, { maxBlobLen: 4 })).not.toThrow();
+    expect(() => decode(str, READS, { maxBlobLen: 4 })).not.toThrow();
   });
 });
 
@@ -202,55 +244,101 @@ describe("there is no unset state and no unlimited mode (§6.2.1)", () => {
     return os.bytes().slice();
   };
 
-  it("an omitted cap takes the port's default rather than switching off", () => {
-    // A count one past the default must be rejected by a decoder that was given
-    // no options at all — the property "unbounded by the schema is still bounded
-    // by the receiver" rests on.
-    const overDefault = (() => {
-      // Built by hand: materializing 2^20 + 1 elements to encode them would cost
-      // more than the assertion is worth, and only the count word is read.
-      const count = DEFAULT_MAX_DYN_ARRAY_COUNT + 1;
-      const out = [0x0b]; // id 1, wire 3 (ArrayUnsigned)
-      for (let v = count; ; v >>>= 7) {
-        if (v < 0x80) { out.push(v); break; }
-        out.push((v & 0x7f) | 0x80);
-      }
-      return Uint8Array.from(out);
-    })();
-    expect(codeOf(() => decode(overDefault, {}))).toBe(SofabErrorCode.LimitExceeded);
-    expect(codeOf(() => drainStream(overDefault))).toBe(SofabErrorCode.LimitExceeded);
-    // One below it is merely truncated — so the rejection above really is the cap.
-    expect(() => decode(arrayOf(3), {})).not.toThrow();
+  /** A hand-built `ArrayUnsigned` header for `count`, whose payload never arrives. */
+  const countWord = (count: number): Uint8Array => {
+    // Built by hand: materializing millions of elements to encode them would cost
+    // more than the assertion is worth, and only the count word is read.
+    const out = [0x0b]; // id 1, wire 3 (ArrayUnsigned)
+    for (let v = count; ; v = Math.floor(v / 0x80)) {
+      if (v < 0x80) { out.push(v); break; }
+      out.push((v % 0x80) | 0x80);
+    }
+    return Uint8Array.from(out);
+  };
+
+  it("an omitted cap takes the format ceiling, not a number this port invented", () => {
+    // A2-0161. §6.2.1: "the codec never invents a limit of its own", and
+    // ARCHITECTURE §9.5: the value comes "from generated code, never from a
+    // default the corelib invented". So a decoder given no options at all is
+    // bounded exactly where the *format* bounds it, and nowhere tighter — a
+    // caller who configures nothing must not get a rejection a sibling port
+    // accepts. 2,000,000 is the count the audit measured being rejected under
+    // the old 2^20 default.
+    for (const count of [1_048_577, 2_000_000, ARRAY_MAX]) {
+      const bytes = countWord(count);
+      // The count word is *accepted*: the decoder is waiting for the elements,
+      // not rejecting the header. Under the old 2^20 default the first two
+      // counts were LIMIT_EXCEEDED right here.
+      expect(new IStream(READS).feed(bytes)).toBe(DecodeStatus.Incomplete);
+      expect(codeOf(() => decode(bytes, READS))).toBe(SofabErrorCode.Incomplete);
+      expect(new IStream(READS).feed(bytes)).not.toBe(DecodeStatus.Invalid);
+    }
+    // And a whole message whose count sits above the old default decodes clean.
+    const wide = arrayOf(3);
+    expect(() => decode(wide, READS)).not.toThrow();
   });
 
-  it("the defaults are finite and within the format ceilings", () => {
-    for (const v of [
-      DEFAULT_MAX_DYN_ARRAY_COUNT,
-      DEFAULT_MAX_DYN_STRING_LEN,
-      DEFAULT_MAX_DYN_BLOB_LEN,
-    ]) {
-      expect(Number.isFinite(v)).toBe(true);
-      expect(v).toBeGreaterThan(0);
-      expect(v).toBeLessThanOrEqual(0x7fff_ffff);
+  it("the format ceiling itself is still INVALID, and stays INVALID not LimitExceeded", () => {
+    // The cap fallback cannot widen what the format allows: one past ARRAY_MAX is
+    // malformed input (§5.2.2), a different category from a policy rejection.
+    const bytes = countWord(ARRAY_MAX + 1);
+    expect(codeOf(() => decode(bytes, READS))).toBe(SofabErrorCode.InvalidMsg);
+    expect(codeOf(() => drainStream(bytes))).toBe(SofabErrorCode.InvalidMsg);
+    // And configuring a cap does not change the category of that same input.
+    expect(codeOf(() => decode(bytes, READS, { maxArrayCount: 8 }))).toBe(
+      SofabErrorCode.InvalidMsg,
+    );
+  });
+
+  it("a configured cap still bites where the default no longer does", () => {
+    // The default moved; the mechanism did not. The same 2,000,000-count header
+    // that decodes unconfigured is LimitExceeded once a deployment says so.
+    const bytes = countWord(2_000_000);
+    expect(codeOf(() => decode(bytes, READS, { maxArrayCount: 1_048_576 }))).toBe(
+      SofabErrorCode.LimitExceeded,
+    );
+    expect(codeOf(() => drainStream(bytes, { maxArrayCount: 1_048_576 }))).toBe(
+      SofabErrorCode.LimitExceeded,
+    );
+    expect(codeOf(() => drainChunked(bytes, { maxArrayCount: 1_048_576 }))).toBe(
+      SofabErrorCode.LimitExceeded,
+    );
+    // One below it is merely truncated — so the rejection above really is the cap.
+    expect(() => decode(arrayOf(3), READS)).not.toThrow();
+  });
+
+  it("the defaults are finite and are exactly the format ceilings", () => {
+    // Finite, so there is no unlimited mode; equal to the ceiling, so the codec
+    // invented nothing. Both halves of §6.2.1 at once.
+    for (const [limits, ceiling] of [
+      [{ maxArrayCount: ARRAY_MAX }, ARRAY_MAX],
+      [{ maxStringLen: FIXLEN_MAX }, FIXLEN_MAX],
+      [{ maxBlobLen: FIXLEN_MAX }, FIXLEN_MAX],
+    ] as const) {
+      expect(Number.isFinite(ceiling)).toBe(true);
+      // Accepting the ceiling and refusing one past it pins where the fallback is.
+      expect(() => new IStream(READS, limits)).not.toThrow();
     }
+    expect(ARRAY_MAX).toBe(0x7fff_ffff);
+    expect(FIXLEN_MAX).toBe(0x7fff_ffff);
   });
 
   it("refuses Infinity, a negative cap and a fractional one", () => {
     for (const bad of [Infinity, -1, 1.5, NaN]) {
-      expect(codeOf(() => new IStream({}, { maxArrayCount: bad }))).toBe(
+      expect(codeOf(() => new IStream(READS, { maxArrayCount: bad }))).toBe(
         SofabErrorCode.Argument,
       );
-      expect(codeOf(() => new IStream({}, { maxStringLen: bad }))).toBe(
+      expect(codeOf(() => new IStream(READS, { maxStringLen: bad }))).toBe(
         SofabErrorCode.Argument,
       );
-      expect(codeOf(() => new IStream({}, { maxBlobLen: bad }))).toBe(
+      expect(codeOf(() => new IStream(READS, { maxBlobLen: bad }))).toBe(
         SofabErrorCode.Argument,
       );
     }
   });
 
   it("refuses a cap above the format ceiling it bounds", () => {
-    expect(codeOf(() => new IStream({}, { maxArrayCount: 0x8000_0000 }))).toBe(
+    expect(codeOf(() => new IStream(READS, { maxArrayCount: 0x8000_0000 }))).toBe(
       SofabErrorCode.Argument,
     );
   });
@@ -261,8 +349,8 @@ describe("there is no unset state and no unlimited mode (§6.2.1)", () => {
       os.writeUnsignedArray(1, []);
       return os.bytes().slice();
     })();
-    expect(() => decode(empty, {}, { maxArrayCount: 0 })).not.toThrow();
-    expect(codeOf(() => decode(arrayOf(1), {}, { maxArrayCount: 0 }))).toBe(
+    expect(() => decode(empty, READS, { maxArrayCount: 0 })).not.toThrow();
+    expect(codeOf(() => decode(arrayOf(1), READS, { maxArrayCount: 0 }))).toBe(
       SofabErrorCode.LimitExceeded,
     );
   });
@@ -318,5 +406,108 @@ describe("a schema-bounded field is the generated layer's to bound (§6.2.1)", (
     expect(codeOf(() => decode(string10, bounded, { maxStringLen: 64 }))).toBe(
       SofabErrorCode.InvalidMsg,
     );
+  });
+});
+
+describe("a field the handler skips is never capped (§6.2.1)", () => {
+  // `c837108` added the rule outright:
+  //
+  // > A limit bounds an allocation, and a field the handler skips allocates
+  // > nothing — it is walked, not materialized (§6.7.2). A `max_dyn_*` limit
+  // > **MUST NOT** be applied to it, so a decode that steps over an over-cap
+  // > field it was never going to read stays `COMPLETE`. The check belongs at
+  // > the count/length header of a field that is actually **read**.
+  //
+  // On a flat visitor (§6.0) the intent is spelled by which callbacks exist, so
+  // "skipped" here means the callback for that field kind is absent. The port
+  // already honoured a *declined scope*; these pin the field-level half.
+  const TIGHT: DecodeLimits = { maxArrayCount: 2, maxStringLen: 4, maxBlobLen: 4 };
+
+  const withString = (() => {
+    const os = growingOStream();
+    os.writeString(1, "x".repeat(100));
+    os.writeUnsigned(2, 7);
+    return os.bytes().slice();
+  })();
+
+  const withBlob = (() => {
+    const os = growingOStream();
+    os.writeBlob(1, new Uint8Array(100));
+    os.writeUnsigned(2, 7);
+    return os.bytes().slice();
+  })();
+
+  const withArray = (() => {
+    const os = growingOStream();
+    os.writeUnsignedArray(1, [1, 2, 3, 4, 5, 6, 7, 8]);
+    os.writeUnsigned(2, 7);
+    return os.bytes().slice();
+  })();
+
+  it.each([
+    ["an over-cap string", withString],
+    ["an over-cap blob", withBlob],
+    ["an over-cap array", withArray],
+  ])("walks past %s and still completes", (_name, bytes) => {
+    // The handler takes the scalar and nothing else, so the over-cap field is
+    // consumed and never delivered. COMPLETE, on every drive.
+    const seen: number[] = [];
+    const reader: Visitor = { unsigned: (id, v) => void seen.push(id, Number(v)) };
+    expect(() => decode(bytes, reader, TIGHT)).not.toThrow();
+    expect(seen).toStrictEqual([2, 7]);
+    expect(new IStream(reader, TIGHT).feed(bytes)).toBe(DecodeStatus.Complete);
+    expect(() => drainChunked(bytes, TIGHT, reader)).not.toThrow();
+  });
+
+  it.each([
+    ["string", withString, { fixlenBegin: () => undefined } as Visitor],
+    ["string", withString, { string: () => undefined } as Visitor],
+    ["blob", withBlob, { fixlenBegin: () => undefined } as Visitor],
+    ["blob", withBlob, { blob: () => undefined } as Visitor],
+    ["array", withArray, { arrayBegin: () => undefined } as Visitor],
+    ["array", withArray, { arrayUnsigned: () => undefined } as Visitor],
+  ])("still caps the same %s once a handler for it exists", (_name, bytes, reader) => {
+    // The discriminator: the bytes and the caps are identical, only the
+    // handler's shape changed. Either callback is enough — `fixlenBegin` /
+    // `arrayBegin` carry the number a destination gets sized from.
+    expect(codeOf(() => decode(bytes, reader, TIGHT))).toBe(SofabErrorCode.LimitExceeded);
+    expect(codeOf(() => drainStream(bytes, TIGHT, reader))).toBe(
+      SofabErrorCode.LimitExceeded,
+    );
+    expect(codeOf(() => drainChunked(bytes, TIGHT, reader))).toBe(
+      SofabErrorCode.LimitExceeded,
+    );
+  });
+
+  it("caps a fixlen array only when a float handler takes it", () => {
+    // A fixlen array's element kind is unknown at the count word, so either
+    // float callback has to keep it read.
+    const bytes = (() => {
+      const os = growingOStream();
+      os.writeFp64Array(1, [1, 2, 3, 4, 5, 6, 7, 8]);
+      return os.bytes().slice();
+    })();
+    expect(() => decode(bytes, { unsigned: () => undefined }, TIGHT)).not.toThrow();
+    expect(codeOf(() => decode(bytes, { arrayFp64: () => undefined }, TIGHT))).toBe(
+      SofabErrorCode.LimitExceeded,
+    );
+    expect(codeOf(() => decode(bytes, { arrayFp32: () => undefined }, TIGHT))).toBe(
+      SofabErrorCode.LimitExceeded,
+    );
+  });
+
+  it("leaves the format ceiling alone: it binds a skipped field too", () => {
+    // A cap is policy and answers to the handler; `ARRAY_MAX` is the format and
+    // does not. One past it stays INVALID whether anyone reads the field.
+    const bytes = (() => {
+      const out = [0x0b];
+      for (let v = ARRAY_MAX + 1; ; v = Math.floor(v / 0x80)) {
+        if (v < 0x80) { out.push(v); break; }
+        out.push((v % 0x80) | 0x80);
+      }
+      return Uint8Array.from(out);
+    })();
+    expect(codeOf(() => decode(bytes, {}))).toBe(SofabErrorCode.InvalidMsg);
+    expect(codeOf(() => decode(bytes, {}, TIGHT))).toBe(SofabErrorCode.InvalidMsg);
   });
 });

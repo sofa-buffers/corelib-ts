@@ -104,24 +104,6 @@ export const VARINT_MAX_BYTES = 10;
 export const MIN_OUTPUT_BUFFER = 1;
 
 /**
- * This port's default cap on the element count of a **schema-unbounded** array
- * (CORELIB_PLAN §6.2.1).
- *
- * §6.2.1 requires every receiver to carry finite caps — "unbounded by the schema
- * is still bounded by the receiver", with no unset state and no unlimited mode —
- * while leaving the *values* to generated code, which knows the schema and the
- * target. This is what a decoder built without any gets instead: bounded, not
- * open. Override it per decoder with {@link DecodeLimits}.
- */
-export const DEFAULT_MAX_DYN_ARRAY_COUNT = 1_048_576; // 2^20 elements
-
-/** This port's default cap on a schema-unbounded `string` payload, in bytes (§6.2.1). */
-export const DEFAULT_MAX_DYN_STRING_LEN = 16_777_216; // 16 MiB
-
-/** This port's default cap on a schema-unbounded `blob` payload, in bytes (§6.2.1). */
-export const DEFAULT_MAX_DYN_BLOB_LEN = 67_108_864; // 64 MiB
-
-/**
  * Elements a bulk `fp32` run needs before a `DataView` handle over the buffer pays
  * for itself (CORELIB_PLAN §6.6.2 allows the handle; arithmetic decides when to take
  * it).
@@ -131,6 +113,12 @@ export const DEFAULT_MAX_DYN_BLOB_LEN = 67_108_864; // 64 MiB
  * needs), so it breaks even around 68 elements. Below the threshold the shared
  * scratch word wins and no handle is built at all — which is why a message with one
  * float, or a two-element array, allocates nothing.
+ *
+ * End to end on a 1000-element array (Callgrind, `bench/run_callgrind.sh`, Ir/op):
+ * encoding costs 195.3 → 28.0 instructions per `fp32` and 182.2 → 25.8 per `fp64`;
+ * decoding 220.1 → 132.6 and 269.8 → 129.7. No workload in the shared benchmark
+ * suite has a float run long enough to reach the threshold, so every row of it is
+ * unchanged either way.
  *
  * @internal
  */

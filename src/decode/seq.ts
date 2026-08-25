@@ -13,12 +13,12 @@
  * and {@link StringSeq.element} per payload piece — and places each value at
  * `out[id]`.
  *
- * Every part of that is schema-independent. The index bound (the schema `count`),
- * the per-element byte bound (the element `maxlen`) and the receiver-side index
- * cap arrive as constructor arguments — runtime values — and the field name is
- * carried along only so a rejection can say which field it was about. So the
- * collectors belong here rather than being re-emitted, textually identical, into
- * every generated package (ARCHITECTURE §8).
+ * Every part of that is schema-independent. Both bounds on the index (the schema
+ * `count`, the receiver cap) and both on the element's byte length (the element
+ * `maxlen`, the receiver cap) arrive as constructor arguments — runtime values —
+ * and the field name is carried along only so a rejection can say which field it
+ * was about. So the collectors belong here rather than being re-emitted, textually
+ * identical, into every generated package (ARCHITECTURE §8).
  *
  * Four rules are implemented here and are worth stating once, since nothing in the
  * shared vectors can distinguish an implementation that gets them wrong from one
@@ -33,12 +33,20 @@
  *   exactly right and no trailing fill is ever needed.
  * - **A repeated element id replaces.** Last occurrence wins per id (§7.4);
  *   placing at `out[id]` does that by construction, with no bookkeeping.
- * - **A rejected id extends nothing.** Both bounds are checked before the
+ * - **A rejected id extends nothing.** Every bound is checked before the
  *   destination grows, so a rejection leaves the array exactly as it was and a
  *   lower id delivered afterwards still lands correctly.
+ *
+ * **Two bounds, never both** (§6.2.1). Index and element length each carry a
+ * schema bound and a receiver cap, and exactly one of the pair applies: where the
+ * schema declared a bound its violation is `INVALID` — a statement about validity
+ * — and where it declared none the receiver's cap governs and its violation is
+ * `LIMIT_EXCEEDED`, a policy rejection on well-formed bytes. "They **MUST NOT** be
+ * applied to a field the schema already bounds", so the caps are exclusive with
+ * the bounds and never additive.
  */
 
-import { DEFAULT_MAX_DYN_ARRAY_COUNT, FixlenSubtype } from "../constants.js";
+import { ARRAY_MAX, FIXLEN_MAX, FixlenSubtype } from "../constants.js";
 import { invalidMsgError, limitExceededError } from "../errors.js";
 import type { PayloadAcc } from "./acc.js";
 import { decodeUtf8 } from "./text.js";
@@ -68,7 +76,10 @@ const UNBOUNDED = -1;
  * @param receiverCap The receiver-side index cap for a schema-unbounded array
  * (§6.2.1): `id >= receiverCap` is `LIMIT_EXCEEDED`, a policy rejection. There is
  * no unlimited setting — a wrapper array announces no count, so the index is the
- * only place a receiver can bound it.
+ * only place a receiver can bound it. It defaults to {@link ARRAY_MAX}, the
+ * format ceiling: §6.2.1 puts the *number* in generated code, so a helper
+ * constructed without one falls back to the widest value that is still a limit
+ * rather than to one this port invented.
  */
 export class ElementSeq<T> {
   constructor(
@@ -76,7 +87,7 @@ export class ElementSeq<T> {
     readonly def: T,
     readonly cap: number = UNBOUNDED,
     readonly name: string = "array",
-    readonly receiverCap: number = DEFAULT_MAX_DYN_ARRAY_COUNT,
+    readonly receiverCap: number = ARRAY_MAX,
   ) {}
 
   /**
@@ -135,12 +146,19 @@ export class ElementSeq<T> {
  * @param cap The schema `count`, an index **capacity**: an element id at or above
  * it is `INVALID` (§7.1/§5.1) — a statement about validity. Leave it at `-1` for
  * an array the schema left unbounded, where `receiverCap` governs instead.
- * @param elemMax The element `maxlen` in bytes, or `-1` for unbounded.
+ * @param elemMax The element `maxlen` in bytes, or `-1` for an element the schema
+ * left open, where `receiverElemMax` governs instead.
  * @param name The schema field name, used only in the rejection message.
  * @param receiverCap The receiver-side index cap that applies **only** when the
  * schema left the array unbounded (§6.2.1): exceeding it is `LIMIT_EXCEEDED`, a
  * policy rejection, not `INVALID`. There is no unlimited setting — a wrapper array
  * announces no count, so the index is the only place a receiver can bound it.
+ * @param receiverElemMax The receiver-side `max_dyn_string_len` for an element the
+ * schema left unbounded (§6.2.1), checked at the length word and answered with
+ * `LIMIT_EXCEEDED`. A wrapper array's `string` elements never reach the generated
+ * visitor — their length words come here — so this is where that cap belongs
+ * (corelib-ts#164). Defaults to {@link FIXLEN_MAX}, the format ceiling — finite,
+ * as §6.2.1 admits no unset state, and not a number this port invented.
  */
 export class StringSeq {
   /** The index rules and both index bounds, shared with every other element kind. */
@@ -152,7 +170,8 @@ export class StringSeq {
     readonly cap: number = UNBOUNDED,
     readonly elemMax: number = UNBOUNDED,
     readonly name: string = "array",
-    readonly receiverCap: number = DEFAULT_MAX_DYN_ARRAY_COUNT,
+    readonly receiverCap: number = ARRAY_MAX,
+    readonly receiverElemMax: number = FIXLEN_MAX,
   ) {
     this.slots = new ElementSeq(out, "", cap, name, receiverCap);
   }
@@ -198,12 +217,19 @@ export class StringSeq {
     this.slots.place(id, text);
   }
 
-  /** Both bounds for one element. Rejects **before** the destination grows. */
+  /** Every bound for one element. Rejects **before** the destination grows. */
   private check(id: number, total: number): void {
     this.slots.checkIndex(id);
-    if (this.elemMax >= 0 && total > this.elemMax) {
-      throw invalidMsgError(
-        `${this.name} element: string byte length above schema maxlen ${this.elemMax}`,
+    if (this.elemMax >= 0) {
+      if (total > this.elemMax) {
+        throw invalidMsgError(
+          `${this.name} element: string byte length above schema maxlen ${this.elemMax}`,
+        );
+      }
+    } else if (total > this.receiverElemMax) {
+      throw limitExceededError(
+        `${this.name} element: string byte length ${total} exceeds the receiver cap ` +
+          `${this.receiverElemMax}`,
       );
     }
   }
@@ -221,10 +247,13 @@ export class StringSeq {
  * @param out The destination, placed at `out[id]`.
  * @param acc The decoder's shared {@link PayloadAcc}.
  * @param cap The schema `count` as an index capacity, or `-1` for unbounded.
- * @param elemMax The element `maxlen` in bytes, or `-1` for unbounded.
+ * @param elemMax The element `maxlen` in bytes, or `-1` for an element the schema
+ * left open, where `receiverElemMax` governs instead.
  * @param name The schema field name, used only in the rejection message.
  * @param receiverCap The receiver-side index cap for a schema-unbounded array
  * (§6.2.1) — see {@link StringSeq}.
+ * @param receiverElemMax The receiver-side `max_dyn_blob_len` for a schema-unbounded
+ * element (§6.2.1) — see {@link StringSeq}.
  */
 export class BlobSeq {
   /** The index rules and both index bounds, shared with every other element kind. */
@@ -236,7 +265,8 @@ export class BlobSeq {
     readonly cap: number = UNBOUNDED,
     readonly elemMax: number = UNBOUNDED,
     readonly name: string = "array",
-    readonly receiverCap: number = DEFAULT_MAX_DYN_ARRAY_COUNT,
+    readonly receiverCap: number = ARRAY_MAX,
+    readonly receiverElemMax: number = FIXLEN_MAX,
   ) {
     this.slots = new ElementSeq(out, NO_BYTES, cap, name, receiverCap);
   }
@@ -262,12 +292,19 @@ export class BlobSeq {
     this.slots.place(id, payload);
   }
 
-  /** Both bounds for one element. Rejects **before** the destination grows. */
+  /** Every bound for one element. Rejects **before** the destination grows. */
   private check(id: number, total: number): void {
     this.slots.checkIndex(id);
-    if (this.elemMax >= 0 && total > this.elemMax) {
-      throw invalidMsgError(
-        `${this.name} element: blob byte length above schema maxlen ${this.elemMax}`,
+    if (this.elemMax >= 0) {
+      if (total > this.elemMax) {
+        throw invalidMsgError(
+          `${this.name} element: blob byte length above schema maxlen ${this.elemMax}`,
+        );
+      }
+    } else if (total > this.receiverElemMax) {
+      throw limitExceededError(
+        `${this.name} element: blob byte length ${total} exceeds the receiver cap ` +
+          `${this.receiverElemMax}`,
       );
     }
   }

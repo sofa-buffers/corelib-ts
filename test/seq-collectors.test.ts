@@ -19,8 +19,11 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  ARRAY_MAX,
   BlobSeq,
   DecodeStatus,
+  ElementSeq,
+  FIXLEN_MAX,
   FixlenSubtype,
   IStream,
   OStream,
@@ -229,6 +232,13 @@ describe("the schema bounds bind, and bind early (§7.1, §5.2)", () => {
     expectInvalid(() => strings(over, NONE, 5));
   });
 
+  it("bounds a blob element by its schema maxlen the same way", () => {
+    const ok = wrapper((os) => os.writeBlob(0, Uint8Array.of(1, 2, 3, 4, 5)));
+    expect(blobs(ok, NONE, 5)).toStrictEqual([Uint8Array.of(1, 2, 3, 4, 5)]);
+    const over = wrapper((os) => os.writeBlob(0, Uint8Array.of(1, 2, 3, 4, 5, 6)));
+    expectInvalid(() => blobs(over, NONE, 5));
+  });
+
   it("rejects an over-long element whose payload never arrives", () => {
     // The anti-folding case. Cut the message right after the element's fixlen
     // word: the bound is already decided, so the verdict must be INVALID and not
@@ -331,6 +341,102 @@ describe("a wrapper array the schema left unbounded is bounded by the receiver (
     } catch (e) {
       expect((e as SofabError).code).toBe(SofabErrorCode.InvalidMsg);
     }
+  });
+});
+
+describe("an element the schema left unbounded is bounded by the receiver too (§6.2.1)", () => {
+  // corelib-ts#164. The index already had both bounds; the element **byte length**
+  // had only the schema half, so an element of an array declared without `maxlen`
+  // was bounded by nothing in the collector — and a wrapper array's `string` /
+  // `blob` length words never reach the generated visitor, they come here.
+  const elemCap = 8;
+
+  /** A `StringSeq` with no schema `maxlen` and a receiver element cap. */
+  function seq(out: string[]): StringSeq {
+    return new StringSeq(out, new PayloadAcc(), NONE, NONE, "tags", 1024, elemCap);
+  }
+
+  function codeOf(fn: () => unknown): SofabErrorCode | undefined {
+    try {
+      fn();
+      return undefined;
+    } catch (e) {
+      expect(e).toBeInstanceOf(SofabError);
+      return (e as SofabError).code;
+    }
+  }
+
+  it("accepts an element of exactly the cap", () => {
+    const out: string[] = [];
+    decode(wrapper((os) => os.writeString(0, "x".repeat(elemCap))), router(seq(out), FixlenSubtype.String));
+    expect(out).toStrictEqual(["x".repeat(elemCap)]);
+  });
+
+  it("rejects one byte more as LIMIT_EXCEEDED, not INVALID_MSG", () => {
+    const out: string[] = [];
+    const over = wrapper((os) => os.writeString(0, "x".repeat(elemCap + 1)));
+    expect(codeOf(() => decode(over, router(seq(out), FixlenSubtype.String)))).toBe(
+      SofabErrorCode.LimitExceeded,
+    );
+    // Nothing was placed: the length word is checked before any payload byte.
+    expect(out).toStrictEqual([]);
+  });
+
+  it("fires at the length word, so a message cut inside the element still rejects", () => {
+    // §5.2.3's ordering, for the receiver cap: the verdict may not depend on where
+    // the chunk boundary fell.
+    const whole = wrapper((os) => os.writeString(0, "x".repeat(elemCap + 1)));
+    const cut = whole.subarray(0, whole.length - 4);
+    const out: string[] = [];
+    const is = new IStream(router(seq(out), FixlenSubtype.String));
+    expect(codeOf(() => {
+      for (const b of cut) is.feed(Uint8Array.of(b));
+      return is.status();
+    })).toBe(SofabErrorCode.LimitExceeded);
+  });
+
+  it("defers to the schema maxlen where there is one — INVALID, not the cap", () => {
+    // §6.2.1: a cap "MUST NOT be applied to a field the schema already bounds".
+    // The schema bound is looser than the receiver cap here, so an additive
+    // reading would reject and the exclusive one must not.
+    const out: string[] = [];
+    const seqBounded = new StringSeq(out, new PayloadAcc(), NONE, 32, "tags", 1024, elemCap);
+    const wire = wrapper((os) => os.writeString(0, "x".repeat(elemCap + 4)));
+    decode(wire, router(seqBounded, FixlenSubtype.String));
+    expect(out).toStrictEqual(["x".repeat(elemCap + 4)]);
+
+    // …and past the schema bound it is INVALID, the validity answer.
+    const out2: string[] = [];
+    const seq2 = new StringSeq(out2, new PayloadAcc(), NONE, 32, "tags", 1024, elemCap);
+    const over = wrapper((os) => os.writeString(0, "x".repeat(33)));
+    expect(codeOf(() => decode(over, router(seq2, FixlenSubtype.String)))).toBe(
+      SofabErrorCode.InvalidMsg,
+    );
+  });
+
+  it("bounds a blob element the same way", () => {
+    const out: Uint8Array[] = [];
+    const bs = new BlobSeq(out, new PayloadAcc(), NONE, NONE, "chunks", 1024, elemCap);
+    const over = wrapper((os) => os.writeBlob(0, new Uint8Array(elemCap + 1)));
+    expect(codeOf(() => decode(over, router(bs, FixlenSubtype.Blob)))).toBe(
+      SofabErrorCode.LimitExceeded,
+    );
+    expect(out).toStrictEqual([]);
+  });
+
+  it("defaults to the format ceiling: finite, and not a number invented here (§6.2.1)", () => {
+    // A2-0161. Finite, so there is no unset state and no unlimited mode; equal to
+    // the format ceiling, so the helper invented no policy — §6.2.1 puts the
+    // numbers in generated code, which passes them here.
+    const s = new StringSeq([], new PayloadAcc());
+    const b = new BlobSeq([], new PayloadAcc());
+    expect(Number.isFinite(s.receiverElemMax)).toBe(true);
+    expect(Number.isFinite(b.receiverElemMax)).toBe(true);
+    expect(s.receiverElemMax).toBe(FIXLEN_MAX);
+    expect(b.receiverElemMax).toBe(FIXLEN_MAX);
+    expect(s.receiverCap).toBe(ARRAY_MAX);
+    expect(b.receiverCap).toBe(ARRAY_MAX);
+    expect(new ElementSeq<number>([], 0).receiverCap).toBe(ARRAY_MAX);
   });
 });
 
