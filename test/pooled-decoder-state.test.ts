@@ -31,6 +31,15 @@ import {
   type Visitor,
 } from "../src/index.js";
 
+/**
+ * A visitor that reads the field kinds a receiver cap bounds. §6.2.1 caps only a
+ * field that is actually read, so the cap-rejection cases below need one.
+ */
+const READS: Visitor = {
+  arrayBegin: () => undefined,
+  fixlenBegin: () => undefined,
+};
+
 /** A reference message touching every construct the decoder keeps state for. */
 function reference(): Uint8Array {
   const os = growingOStream();
@@ -96,7 +105,7 @@ const ABORTS: [string, () => string][] = [
   ],
   [
     "a terminal receiver-cap rejection (LIMIT_EXCEEDED, which also latches)",
-    () => codeOf(() => decode(REFERENCE, {}, { maxArrayCount: 1 })),
+    () => codeOf(() => decode(REFERENCE, READS, { maxArrayCount: 1 })),
   ],
   [
     "a visitor that throws mid-message",
@@ -156,12 +165,12 @@ describe("a pooled decoder carries nothing from the decode before it", () => {
   });
 
   it("does not leak a cap: tight limits on one decode do not bind the next", () => {
-    expect(codeOf(() => decode(REFERENCE, {}, { maxArrayCount: 1 }))).toBe(
+    expect(codeOf(() => decode(REFERENCE, READS, { maxArrayCount: 1 }))).toBe(
       SofabErrorCode.LimitExceeded,
     );
     expect(codeOf(() => decode(REFERENCE, {}))).toBe("none");
     // …and the reverse: a loose decode does not loosen a tight one after it.
-    expect(codeOf(() => decode(REFERENCE, {}, { maxStringLen: 1 }))).toBe(
+    expect(codeOf(() => decode(REFERENCE, READS, { maxStringLen: 1 }))).toBe(
       SofabErrorCode.LimitExceeded,
     );
   });

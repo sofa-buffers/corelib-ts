@@ -146,7 +146,15 @@ describe("a skipped subtree and the two kinds of bound", () => {
   // skipped scope hands it nothing. corelib-dart takes the same position —
   // its cap sits inside `if (read)`, and `_decideRead` is false while skipping.
   const CAPS = { maxStringLen: 4, maxBlobLen: 2, maxArrayCount: 1 };
-  const skipper: Visitor = { sequenceBegin: () => false };
+  // It declines *sequences*, and reads every field kind a cap bounds. Both
+  // halves matter: §6.2.1 caps only a field that is read, so without the
+  // handlers the tests below would pass for the wrong reason — nothing is
+  // capped anywhere — and the declined-scope rule would go unexercised.
+  const skipper: Visitor = {
+    sequenceBegin: () => false,
+    fixlenBegin: () => undefined,
+    arrayBegin: () => undefined,
+  };
 
   it("does not apply the receiver caps inside it (contiguous)", () => {
     expect(() => decode(message(), skipper, CAPS)).not.toThrow();

@@ -651,6 +651,17 @@ anything else about it, since the three-valued outcome has no value for "valid, 
 more than I am configured to accept". Read a cap rejection where it is raised, off
 the error channel, not by polling `status()`.
 
+A cap applies **only to a field you read**. A limit bounds an allocation, and a
+field the visitor steps over allocates nothing — so a decode that walks past an
+over-cap field it was never going to read stays `COMPLETE` (§6.2.1). On this flat
+visitor that intent is spelled by which callbacks you declare: a `string` field is
+read if you declare `string` or `fixlenBegin`, an array if you declare `arrayBegin`
+or the element callback for its kind, and a whole subtree is skipped by answering
+`false` from `sequenceBegin`. Declare none of them and the bytes are consumed
+uncapped, because nothing was ever handed to you. The **format ceilings** are not
+yours to waive this way: a count above `ARRAY_MAX` or a length above `FIXLEN_MAX`
+stays `INVALID` whether anyone reads the field.
+
 A cap applies **only to a field the schema leaves unbounded**. Where the schema
 declares a `count` / `maxlen`, that bound governs and an over-bound value is
 `INVALID_MSG`, never `LimitExceeded`. This decoder is driven by wire type and never

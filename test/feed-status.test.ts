@@ -96,7 +96,8 @@ describe("INVALID stays readable as a status (§5.2)", () => {
   });
 
   it("a LIMIT_EXCEEDED rejection leaves a readable, non-INVALID status (§6.2.1)", () => {
-    const is = new IStream({}, { maxArrayCount: 1 });
+    // A handler for the array, because §6.2.1 caps only a field that is read.
+    const is = new IStream({ arrayBegin: () => undefined }, { maxArrayCount: 1 });
     expect(() => is.feed(Uint8Array.of(0x03, 0x02, 0x01, 0x02))).toThrow(
       expect.objectContaining({ code: SofabErrorCode.LimitExceeded }),
     );
