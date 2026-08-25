@@ -62,8 +62,8 @@ full type declarations.
 | Full 64-bit fidelity | Scalars round-trip the entire `uint64` / `int64` range: `number` when exact, `bigint` beyond `2^53-1`, and every integer callback carries the exact `lo` / `hi` halves beside the value for a `bigint`-free consumer (`Long`). |
 | Generated-code friendly | One flat `Visitor` per message, all methods optional; nesting arrives as `sequenceBegin` / `sequenceEnd` events carrying id and depth, which generated code routes on. |
 | Reserve-offset | `new OStream(buf, offset)` leaves room at the front for a lower-layer header, saving a copy. The offset belongs to that installation and is consumed by the flush that hands the unit over; `setBuffer(buf, offset)` from inside the sink re-arms it, for header room in every packet. |
-| Caller-owned buffers | The encoder allocates no output buffer and grows none: it writes into yours, and asks the `BufferOwner` you named for the next one when it fills. `growingOStream()` is that owner ready-made. |
-| Heap-free codec | After construction the encoder and decoder allocate nothing (§6.6) — no views, no scratch, no growable state — apart from the **language-forced handles** §6.6.2 allows, itemised under [Memory handling](#memory-handling) and taken only where they measurably pay. Verified two ways: no allocation primitive on a codec path, and a flat heap over a complete encode and decode. |
+| Caller-owned buffers | The encoder allocates no output buffer, grows none, and has no hook that could grow one for it: it writes into yours, and when it fills it flushes to your sink, which may install the next buffer. `growingOStream()` is that caller ready-made — a scratch buffer with a sink that accumulates the result. |
+| No payload storage in the codec | After construction the encoder and decoder allocate no storage a wire number sizes (§6.6) — no views, no scratch, no growable state — apart from the **language-forced handles** of §6.6.2, itemised under [Memory handling](#memory-handling). Verified two ways: no allocation primitive on a codec path, and a flat heap over a complete encode and decode. |
 | No views | Nothing the decoder hands over aliases anything it owns (§6.7). A payload arrives as a range of the chunk **you** fed, so what you keep, you copied. |
 | Explicit endianness | IEEE-754 values are read / written little-endian — bit-for-bit identical on every engine, big-endian hosts included. |
 | Pluggable acceleration | The encoder's bulk array paths run through a swappable `Kernel`, and that interface is the entire seam: `setKernel(yourKernel)`. **No accelerated backend exists today** — the kernel is the pure-TypeScript one on every host unless you build and install your own (native addon or WASM); the library ships no loader for one. |
@@ -508,17 +508,23 @@ Who owns the bytes:
   sizes differ. `reset()` and `bytes()` follow the current installation, so after
   a flush they are relative to `0`; on a sink-less stream, which can never flush,
   the reservation stands for the life of the encode.
-- **Encode into memory (`growingOStream()`, `BufferOwner`).** The allocating
-  half is the caller's role, and a caller that owns its storage names a
-  `BufferOwner`: when the buffer fills, the encoder asks it for the next one — at
-  least `used + needed` bytes, holding the first `used` of the old — instead of
-  enlarging what it was handed. `growingOStream(initialCapacity?)` is that owner
-  ready-made, a doubling accumulator: it never throws `BUFFER_FULL`, its
-  `bytes()` is the **whole** message (a view — `.slice()` it if it must outlive
-  the next write or growth), and `reset()` keeps the buffer it grew to, so a
-  pooled encoder stops allocating. The buffer belongs to the owner, so
-  `setBuffer` on such a stream throws `ARGUMENT`: hand a buffer of your own to a
-  plain `OStream` instead.
+- **Encode into memory (`growingOStream()`).** The allocating half is the
+  caller's role. `growingOStream(initialCapacity?)` is that caller ready-made: a
+  scratch buffer installed **with a sink** that accumulates the result (§5.1.2).
+  It never throws `BUFFER_FULL`, its `bytes()` is the **whole** message (a view —
+  `.slice()` it if it must outlive the next write or growth), and `reset()` keeps
+  the buffer it grew to, so a pooled encoder stops allocating. It is an ordinary
+  streaming stream otherwise, so `setBuffer` works and means what it always means:
+  the not-yet-flushed bytes are dropped and encoding continues into your buffer.
+  Pass an `initialCapacity` when you know roughly how large the message is — a
+  100 KB payload starting from the 256-byte default costs nine enlargements and
+  about 2.5x the CPU of one that started big enough.
+
+  It reaches the encoder through `setBuffer(buffer, offset, carried)`, the third
+  argument being how many bytes of the message the replacement already holds
+  before `offset`. That is what keeps `bytes()` meaning "the message" across an
+  enlargement, and it is available to any caller that keeps a message in one
+  growing store.
 
   Its storage is **carved from a shared slab** while it is small enough (up to
   4 KiB of an 8 KiB slab). A carve is handed out once and never recycled, so no
@@ -551,8 +557,9 @@ Who owns the bytes:
   the call. Scalars are delivered by value. If any of this README ever describes a
   borrowed decoded value, either the README or the port is wrong.
 - **No wire value decides an allocation in the codec.** After construction the
-  encoder and decoder allocate nothing (§6.6) except the itemised handles below: no
-  per-message, per-field or per-chunk allocation, no growable state, and no
+  encoder and decoder allocate no payload storage (§6.6), and nothing at all except
+  the itemised handles below: no per-message, per-field or per-chunk allocation,
+  no growable state, and no
   accumulator for a payload that straddles a chunk — a decoder's whole memory is
   fixed-size state sized from this format's constants (a `MAX_DEPTH` scope stack, a
   partial varint, an 8-byte float landing zone). Constructing an `OStream` /
@@ -563,10 +570,8 @@ Who owns the bytes:
 - **The language-forced handles, itemised** (§6.6.2). JavaScript will not let a codec
   place or take an IEEE-754 value at a byte offset, or copy a *range* of bytes,
   without building an object first: `TypedArray.set` — the only `memcpy` there is —
-  takes a typed array as its source, and a float needs a `DataView`. §6.6.2 allows
-  such a handle where the language leaves no alternative, provided it carries no
-  message bytes and no wire number sizes it, and asks the port to list them. These
-  are all of them:
+  takes a typed array as its source, and a float needs a `DataView`. These are all
+  of them:
 
   | handle | where | how many |
   |---|---|---|
@@ -575,29 +580,13 @@ Who owns the bytes:
   | `subarray` of the caller's payload | `OStream.writeRaw`, as `set`'s source | one per copied piece, only when the payload does not fit the buffer |
 
   Each addresses storage **you** supplied, each is sized by that storage and never by
-  a number from the wire, and none of them leaves the codec — so §6.7 (no borrowed
-  value reaches a caller) and §5.1.6 (the sink only ever sees the installed buffer)
-  are untouched.
-
-  **The thresholds are arithmetic, not taste.** Building a `DataView` costs ~129 ns
-  on Node 24, and the handle saves ~1.9 ns per `fp32` (writing 4.11 → 2.23 ns,
-  reading — value *and* raw bits, §6.5 — 3.27 → 1.46 ns) and ~7.3–8.0 ns per `fp64`
-  (writing 10.48 → 3.20 ns, reading 10.24 → 2.23 ns). So it only pays from about 68
-  `fp32` or 18 `fp64` elements up, and below that a shared 8-byte scratch word — fixed
-  state, not a handle — wins. The consequence is the one worth knowing: a **scalar**
-  float, a short float array, and a float array fed in chunks too small to hold a long
-  run all allocate **nothing at all**, on either side. Only bulk float arrays in
-  buffer-sized pieces reach the allowance. The copy source has no threshold to
-  weigh — it is the difference between `memcpy` at 10,963 MB/s and a byte loop at
-  358 MB/s.
-
-  `heap-free-codec.test.ts` asserts these counts exactly — including that the short
-  runs allocate nothing and that one element under the threshold builds no handle — so
-  an allocation not in this table fails the suite rather than hiding behind the
-  allowance. End to end on a 1000-element array (Callgrind, Ir/op): encoding costs
-  195.3 → 28.0 instructions per `fp32` and 182.2 → 25.8 per `fp64`, decoding
-  220.1 → 132.6 and 269.8 → 129.7. Every row of the shared benchmark suite is
-  unchanged, because none of its workloads has a float array long enough to qualify.
+  a number from the wire, and none of them leaves the codec. A **scalar** float, a
+  float array below the element threshold, and a float array fed in chunks too small
+  to hold a long run all build no handle at all: they go through a shared 8-byte
+  scratch word, which is fixed state. `heap-free-codec.test.ts` asserts these counts
+  exactly, including the short runs that allocate nothing and the element one under
+  the threshold. The thresholds and what they were derived from are on
+  `FP32_HANDLE_MIN` / `FP64_HANDLE_MIN` in the API documentation.
 - **The static helper layer allocates, on your behalf.** `PayloadAcc`,
   `ElementSeq`, `StringSeq`, `BlobSeq`, `decodeUtf8` and `elementsEqual` are the
   generated layer's code shipped here for reuse (ARCHITECTURE §8), not part of the

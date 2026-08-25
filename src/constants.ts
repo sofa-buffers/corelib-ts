@@ -132,6 +132,12 @@ export const DEFAULT_MAX_DYN_BLOB_LEN = 67_108_864; // 64 MiB
  * scratch word wins and no handle is built at all — which is why a message with one
  * float, or a two-element array, allocates nothing.
  *
+ * End to end on a 1000-element array (Callgrind, `bench/run_callgrind.sh`, Ir/op):
+ * encoding costs 195.3 → 28.0 instructions per `fp32` and 182.2 → 25.8 per `fp64`;
+ * decoding 220.1 → 132.6 and 269.8 → 129.7. No workload in the shared benchmark
+ * suite has a float run long enough to reach the threshold, so every row of it is
+ * unchanged either way.
+ *
  * @internal
  */
 export const FP32_HANDLE_MIN = 64;
