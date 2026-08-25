@@ -326,8 +326,11 @@ try {
 is.status(); // INVALID — never COMPLETE, never INCOMPLETE
 ```
 
-A receiver-side cap (`LIMIT_EXCEEDED`, see [Decode limits](#decode-limits)) does
-*not* poison the stream: it is a policy rejection, not the `INVALID` outcome.
+A receiver-side cap (`LIMIT_EXCEEDED`, see [Decode limits](#decode-limits)) is
+terminal in the same way — every further `feed` re-throws it — but it is **not** the
+`INVALID` outcome: the bytes are well-formed and decode under a looser cap, so
+`status()` never answers `INVALID` for it. It is read off the error channel, not
+from `status()`.
 
 ### 64-bit values without `bigint`
 
@@ -615,14 +618,21 @@ Who owns the bytes:
 
 Every decoder carries receiver-side caps, and there is no unset state and no
 unlimited mode (§6.2.1): a field the schema leaves unbounded is still bounded by the
-receiver. An omitted option takes this port's default rather than switching the cap
-off, and `Infinity` is refused with `ARGUMENT`.
+receiver. An omitted option takes the format ceiling it bounds rather than switching
+the cap off, and `Infinity`, a negative value, a fractional one and anything above
+the ceiling are refused with `ARGUMENT`.
 
 | cap | default | bounds |
 |---|---|---|
-| `maxArrayCount` | `DEFAULT_MAX_DYN_ARRAY_COUNT` = 1,048,576 | elements in a schema-unbounded array |
-| `maxStringLen` | `DEFAULT_MAX_DYN_STRING_LEN` = 16,777,216 | bytes of a schema-unbounded `string` |
-| `maxBlobLen` | `DEFAULT_MAX_DYN_BLOB_LEN` = 67,108,864 | bytes of a schema-unbounded `blob` |
+| `maxArrayCount` | `ARRAY_MAX` = 2,147,483,647 | elements in a schema-unbounded array |
+| `maxStringLen` | `FIXLEN_MAX` = 2,147,483,647 | bytes of a schema-unbounded `string` |
+| `maxBlobLen` | `FIXLEN_MAX` = 2,147,483,647 | bytes of a schema-unbounded `blob` |
+
+The numbers belong to generated code, which knows the schema and the deployment;
+§6.2.1 says the codec "never invents a limit of its own". So the fallback is the
+widest value that is still a limit — the ceiling above which the count or length is
+already `INVALID` — and not a number chosen here. A decoder built without limits is
+bounded exactly where the format bounds it; pass your own to bound it tighter.
 
 ```ts
 const limits = { maxArrayCount: 65536, maxStringLen: 1 << 20, maxBlobLen: 1 << 20 };
@@ -639,9 +649,7 @@ abandoned field. It is **not** the `INVALID` outcome — the same bytes decode u
 looser cap — so `status()` never reports `INVALID` for it; nor does it report
 anything else about it, since the three-valued outcome has no value for "valid, but
 more than I am configured to accept". Read a cap rejection where it is raised, off
-the error channel, not by polling `status()`. The values are generated code's to
-choose, from the sofabgen config; the defaults exist so a decoder built without any
-is bounded.
+the error channel, not by polling `status()`.
 
 A cap applies **only to a field the schema leaves unbounded**. Where the schema
 declares a `count` / `maxlen`, that bound governs and an over-bound value is

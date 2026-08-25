@@ -19,10 +19,11 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  ARRAY_MAX,
   BlobSeq,
-  DEFAULT_MAX_DYN_BLOB_LEN,
-  DEFAULT_MAX_DYN_STRING_LEN,
   DecodeStatus,
+  ElementSeq,
+  FIXLEN_MAX,
   FixlenSubtype,
   IStream,
   OStream,
@@ -423,13 +424,19 @@ describe("an element the schema left unbounded is bounded by the receiver too (�
     expect(out).toStrictEqual([]);
   });
 
-  it("is finite by default: there is no unset state (§6.2.1)", () => {
+  it("defaults to the format ceiling: finite, and not a number invented here (§6.2.1)", () => {
+    // A2-0161. Finite, so there is no unset state and no unlimited mode; equal to
+    // the format ceiling, so the helper invented no policy — §6.2.1 puts the
+    // numbers in generated code, which passes them here.
     const s = new StringSeq([], new PayloadAcc());
     const b = new BlobSeq([], new PayloadAcc());
     expect(Number.isFinite(s.receiverElemMax)).toBe(true);
     expect(Number.isFinite(b.receiverElemMax)).toBe(true);
-    expect(s.receiverElemMax).toBe(DEFAULT_MAX_DYN_STRING_LEN);
-    expect(b.receiverElemMax).toBe(DEFAULT_MAX_DYN_BLOB_LEN);
+    expect(s.receiverElemMax).toBe(FIXLEN_MAX);
+    expect(b.receiverElemMax).toBe(FIXLEN_MAX);
+    expect(s.receiverCap).toBe(ARRAY_MAX);
+    expect(b.receiverCap).toBe(ARRAY_MAX);
+    expect(new ElementSeq<number>([], 0).receiverCap).toBe(ARRAY_MAX);
   });
 });
 

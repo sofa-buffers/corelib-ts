@@ -5,14 +5,20 @@
  * §7.2) declares no ceiling on the wire, which would let the **sender** dictate
  * the **receiver's** memory. So every receiver carries these caps, and §6.2.1 is
  * explicit that **there is no unset state and no unlimited mode**: an omitted
- * option here takes this port's default ({@link DEFAULT_MAX_DYN_ARRAY_COUNT},
- * {@link DEFAULT_MAX_DYN_STRING_LEN}, {@link DEFAULT_MAX_DYN_BLOB_LEN}), it does
- * not switch the cap off. `Infinity` is rejected for the same reason.
+ * option here takes the format-wide ceiling it bounds ({@link ARRAY_MAX},
+ * {@link FIXLEN_MAX}), not "off". `Infinity` is rejected for the same reason,
+ * and so is any value above the ceiling.
  *
- * The numbers are **not** the codec's to choose. §6.2.1 puts them in generated
- * code, which knows the schema and the target, and the values are a per-language,
- * per-deployment judgement; the defaults here exist only so that a decoder built
- * without any are still bounded. Pass your own whenever you know better.
+ * **The numbers are not the codec's to choose, and this port invents none.**
+ * §6.2.1: "The limits come from generated code, which knows the schema and the
+ * target … the codec never invents a limit of its own and never clamps to one",
+ * and SofaBuffers ARCHITECTURE §9.5 says the value comes "from generated code,
+ * never from a default the corelib invented". So an omitted cap falls back to
+ * the widest value that is still a limit — the format ceiling above which the
+ * count or length is already `INVALID` (§6.2) — rather than to a number this
+ * port picked. A decoder built without limits is therefore bounded exactly as
+ * the format bounds it, and one built by generated code is bounded by the
+ * deployment's own numbers. Pass yours.
  *
  * They are **configuration, not schema**:
  *
@@ -36,35 +42,31 @@
  * corruption wearing a safety jacket.
  */
 
-import {
-  ARRAY_MAX,
-  DEFAULT_MAX_DYN_ARRAY_COUNT,
-  DEFAULT_MAX_DYN_BLOB_LEN,
-  DEFAULT_MAX_DYN_STRING_LEN,
-  FIXLEN_MAX,
-} from "../constants.js";
+import { ARRAY_MAX, FIXLEN_MAX } from "../constants.js";
 import { argumentError } from "../errors.js";
 
 /**
  * Receiver-side caps, all optional at the surface and all finite in effect: an
- * omitted one takes this port's default, and there is no way to ask for none
- * (§6.2.1).
+ * omitted one takes the format ceiling it bounds, and there is no way to ask for
+ * none (§6.2.1).
  */
 export interface DecodeLimits {
   /**
    * Reject an array whose element `count` exceeds this, before the array is
-   * materialized. Defaults to {@link DEFAULT_MAX_DYN_ARRAY_COUNT}.
+   * materialized. Defaults to {@link ARRAY_MAX}, above which the count is
+   * already `INVALID`.
    */
   maxArrayCount?: number;
   /**
    * Reject a UTF-8 string whose declared byte length exceeds this, before the
-   * payload is decoded or streamed. Defaults to
-   * {@link DEFAULT_MAX_DYN_STRING_LEN}.
+   * payload is decoded or streamed. Defaults to {@link FIXLEN_MAX}, above which
+   * the length is already `INVALID`.
    */
   maxStringLen?: number;
   /**
    * Reject a blob whose declared byte length exceeds this, before the payload is
-   * accepted or streamed. Defaults to {@link DEFAULT_MAX_DYN_BLOB_LEN}.
+   * accepted or streamed. Defaults to {@link FIXLEN_MAX}, above which the length
+   * is already `INVALID`.
    */
   maxBlobLen?: number;
 }
@@ -73,29 +75,29 @@ export interface DecodeLimits {
 // plain number fields, and a one-shot decode re-binds them per message — so an
 // object here would be an allocation per message on a path that has none (§6.6).
 
-/** @internal The array-count cap in effect: the caller's, or this port's default. */
+/** @internal The array-count cap in effect: the caller's, or the format ceiling. */
 export function capArrayCount(limits?: DecodeLimits): number {
-  return cap(limits?.maxArrayCount, DEFAULT_MAX_DYN_ARRAY_COUNT, ARRAY_MAX, "maxArrayCount");
+  return cap(limits?.maxArrayCount, ARRAY_MAX, "maxArrayCount");
 }
 
 /** @internal The string-length cap in effect. */
 export function capStringLen(limits?: DecodeLimits): number {
-  return cap(limits?.maxStringLen, DEFAULT_MAX_DYN_STRING_LEN, FIXLEN_MAX, "maxStringLen");
+  return cap(limits?.maxStringLen, FIXLEN_MAX, "maxStringLen");
 }
 
 /** @internal The blob-length cap in effect. */
 export function capBlobLen(limits?: DecodeLimits): number {
-  return cap(limits?.maxBlobLen, DEFAULT_MAX_DYN_BLOB_LEN, FIXLEN_MAX, "maxBlobLen");
+  return cap(limits?.maxBlobLen, FIXLEN_MAX, "maxBlobLen");
 }
 
 /**
- * One cap: the default when omitted, otherwise a finite non-negative integer no
- * larger than the format ceiling it bounds. `Infinity` is not an accepted value —
+ * One cap: the format ceiling when omitted, otherwise a finite non-negative
+ * integer no larger than that ceiling. `Infinity` is not an accepted value —
  * "unlimited" is exactly what §6.2.1 removed — and a cap above the ceiling would
  * be one the format can never reach.
  */
-function cap(value: number | undefined, fallback: number, ceiling: number, name: string): number {
-  if (value === undefined) return fallback;
+function cap(value: number | undefined, ceiling: number, name: string): number {
+  if (value === undefined) return ceiling;
   if (!Number.isInteger(value) || value < 0 || value > ceiling) {
     throw argumentError(
       `${name} must be an integer in 0..${ceiling} (got ${value}); ` +

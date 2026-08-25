@@ -46,12 +46,7 @@
  * the bounds and never additive.
  */
 
-import {
-  DEFAULT_MAX_DYN_ARRAY_COUNT,
-  DEFAULT_MAX_DYN_BLOB_LEN,
-  DEFAULT_MAX_DYN_STRING_LEN,
-  FixlenSubtype,
-} from "../constants.js";
+import { ARRAY_MAX, FIXLEN_MAX, FixlenSubtype } from "../constants.js";
 import { invalidMsgError, limitExceededError } from "../errors.js";
 import type { PayloadAcc } from "./acc.js";
 import { decodeUtf8 } from "./text.js";
@@ -81,7 +76,10 @@ const UNBOUNDED = -1;
  * @param receiverCap The receiver-side index cap for a schema-unbounded array
  * (§6.2.1): `id >= receiverCap` is `LIMIT_EXCEEDED`, a policy rejection. There is
  * no unlimited setting — a wrapper array announces no count, so the index is the
- * only place a receiver can bound it.
+ * only place a receiver can bound it. It defaults to {@link ARRAY_MAX}, the
+ * format ceiling: §6.2.1 puts the *number* in generated code, so a helper
+ * constructed without one falls back to the widest value that is still a limit
+ * rather than to one this port invented.
  */
 export class ElementSeq<T> {
   constructor(
@@ -89,7 +87,7 @@ export class ElementSeq<T> {
     readonly def: T,
     readonly cap: number = UNBOUNDED,
     readonly name: string = "array",
-    readonly receiverCap: number = DEFAULT_MAX_DYN_ARRAY_COUNT,
+    readonly receiverCap: number = ARRAY_MAX,
   ) {}
 
   /**
@@ -159,7 +157,8 @@ export class ElementSeq<T> {
  * schema left unbounded (§6.2.1), checked at the length word and answered with
  * `LIMIT_EXCEEDED`. A wrapper array's `string` elements never reach the generated
  * visitor — their length words come here — so this is where that cap belongs
- * (corelib-ts#164). Finite by default: §6.2.1 admits no unset state.
+ * (corelib-ts#164). Defaults to {@link FIXLEN_MAX}, the format ceiling — finite,
+ * as §6.2.1 admits no unset state, and not a number this port invented.
  */
 export class StringSeq {
   /** The index rules and both index bounds, shared with every other element kind. */
@@ -171,8 +170,8 @@ export class StringSeq {
     readonly cap: number = UNBOUNDED,
     readonly elemMax: number = UNBOUNDED,
     readonly name: string = "array",
-    readonly receiverCap: number = DEFAULT_MAX_DYN_ARRAY_COUNT,
-    readonly receiverElemMax: number = DEFAULT_MAX_DYN_STRING_LEN,
+    readonly receiverCap: number = ARRAY_MAX,
+    readonly receiverElemMax: number = FIXLEN_MAX,
   ) {
     this.slots = new ElementSeq(out, "", cap, name, receiverCap);
   }
@@ -266,8 +265,8 @@ export class BlobSeq {
     readonly cap: number = UNBOUNDED,
     readonly elemMax: number = UNBOUNDED,
     readonly name: string = "array",
-    readonly receiverCap: number = DEFAULT_MAX_DYN_ARRAY_COUNT,
-    readonly receiverElemMax: number = DEFAULT_MAX_DYN_BLOB_LEN,
+    readonly receiverCap: number = ARRAY_MAX,
+    readonly receiverElemMax: number = FIXLEN_MAX,
   ) {
     this.slots = new ElementSeq(out, NO_BYTES, cap, name, receiverCap);
   }
