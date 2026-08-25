@@ -238,8 +238,10 @@ export class IStream {
   /**
    * @param visitor The field handler this stream drives, for its whole life.
    * @param limits Receiver-side caps (§6.2.1). Every cap is finite: an omitted
-   * one takes this port's documented default rather than meaning "no limit" —
-   * there is no unset state and no unlimited mode. An over-limit array count or
+   * one takes the format ceiling it bounds rather than meaning "no limit" — there
+   * is no unset state and no unlimited mode, and §6.2.1 puts the *numbers* in
+   * generated code, so the codec falls back to a bound the format already
+   * enforces instead of inventing one. An over-limit array count or
    * string / blob length throws {@link SofabError} (`LIMIT_EXCEEDED`) from
    * {@link feed}, at the offending field's header and before any of its payload
    * reaches the visitor.
@@ -332,8 +334,9 @@ export class IStream {
  * input throws `INVALID_MSG`, while input that ends inside a field — truncation or
  * an unclosed sequence — throws `INCOMPLETE`. A complete message returns normally.
  *
- * Pass `limits` ({@link DecodeLimits}) to override this port's default
- * receiver-side caps; an over-limit field throws `LIMIT_EXCEEDED` at its header,
+ * Pass `limits` ({@link DecodeLimits}) to bound the fields the schema leaves open;
+ * an omitted cap takes the format ceiling, so a decode with none rejects nothing
+ * the format accepts. An over-limit field throws `LIMIT_EXCEEDED` at its header,
  * before it is materialized.
  */
 export function decode(
