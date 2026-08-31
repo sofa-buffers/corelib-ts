@@ -460,6 +460,124 @@ describe("an element the schema left unbounded is bounded by the receiver too (�
   });
 });
 
+describe("a cap that was never stated is a caller mistake, not a policy rejection (§6.2.1)", () => {
+  // The category defect. Both receiver bounds are required arguments with no
+  // default, but a required argument can still arrive as `-1`, `undefined` or
+  // `Infinity` from an untyped caller — and the collector then had two wrong
+  // answers, one for each spelling:
+  //
+  //  * `-1` (or any negative): every `id >= -1` and every `total > -1` is true, so
+  //    it failed closed with LIMIT_EXCEEDED — naming a receiver policy the
+  //    deployment never set. §6.3: LimitExceeded means "raise my limit or the
+  //    sender must send less", and there is no limit here to raise. §6.2.1 says
+  //    the same thing from the other side: a bound reached because no cap was
+  //    stated "is the FORMAT's bound, not a receiver cap, and a port MUST NOT
+  //    present it as one".
+  //  * `undefined`/`NaN`: every comparison against NaN is false, so it failed
+  //    *open* and the array decoded uncapped — §6.2.1's "MUST NOT read an omitted
+  //    argument as unlimited", verbatim.
+  //
+  // Both are mistakes in the **call**, which is `Argument` (§6.3's third row:
+  // "every remaining caller mistake is InvalidArgument"). Refused at construction,
+  // so the behaviour stays fail-closed: no element is ever accepted.
+  const NO_CAP: number[] = [-1, -7, Number.NaN, Number.POSITIVE_INFINITY];
+
+  /** The code thrown by `fn`, or `undefined` if it returned. */
+  function codeOf(fn: () => unknown): SofabErrorCode | undefined {
+    try {
+      fn();
+      return undefined;
+    } catch (e) {
+      expect(e).toBeInstanceOf(SofabError);
+      return (e as SofabError).code;
+    }
+  }
+
+  it.each(NO_CAP)("refuses %s as an index cap with ARGUMENT, not LIMIT_EXCEEDED", (bad) => {
+    expect(codeOf(() => new ElementSeq<string>([], "", NONE, "tags", bad))).toBe(
+      SofabErrorCode.Argument,
+    );
+    expect(codeOf(() => new StringSeq([], new PayloadAcc(), NONE, NONE, "tags", bad, WIDE_LEN))).toBe(
+      SofabErrorCode.Argument,
+    );
+    expect(codeOf(() => new BlobSeq([], new PayloadAcc(), NONE, NONE, "chunks", bad, WIDE_LEN))).toBe(
+      SofabErrorCode.Argument,
+    );
+  });
+
+  it.each(NO_CAP)("refuses %s as an element-length cap the same way", (bad) => {
+    expect(codeOf(() => new StringSeq([], new PayloadAcc(), NONE, NONE, "tags", WIDE_INDEX, bad))).toBe(
+      SofabErrorCode.Argument,
+    );
+    expect(codeOf(() => new BlobSeq([], new PayloadAcc(), NONE, NONE, "chunks", WIDE_INDEX, bad))).toBe(
+      SofabErrorCode.Argument,
+    );
+  });
+
+  it("does not answer LIMIT_EXCEEDED for a negative cap (the fail-closed half)", () => {
+    // The exact shape the audit named: with `receiverCap = -1` every index is
+    // "over the cap", so element 0 of a perfectly ordinary array was rejected as
+    // LIMIT_EXCEEDED — a receiver policy the deployment never set. The rejection
+    // is right; the category was not.
+    const out: string[] = [];
+    expect(
+      codeOf(() => {
+        const seq = new StringSeq(out, new PayloadAcc(), NONE, NONE, "tags", -1, -1);
+        decode(wrapper((os) => os.writeString(0, "a")), router(seq, FixlenSubtype.String));
+      }),
+    ).toBe(SofabErrorCode.Argument);
+    expect(out).toStrictEqual([]);
+  });
+
+  it("never decodes uncapped when the caps are missing (the fail-open half)", () => {
+    // The pre-fix behaviour for an omitted argument: `id >= undefined` is false,
+    // so a wrapper array with no cap at all placed an element at index 100000.
+    // Nothing is decoded now — the collector cannot even be built.
+    const out: string[] = [];
+    const missing = undefined as unknown as number;
+    expect(
+      codeOf(() => {
+        const seq = new StringSeq(out, new PayloadAcc(), NONE, NONE, "tags", missing, missing);
+        decode(wrapper((os) => os.writeString(100_000, "far")), router(seq, FixlenSubtype.String));
+      }),
+    ).toBe(SofabErrorCode.Argument);
+    expect(out).toStrictEqual([]);
+  });
+
+  it("still answers LIMIT_EXCEEDED where a cap WAS stated", () => {
+    // The category the fix must not swallow: a real, finite, deployment-supplied
+    // cap that the wire exceeds is a policy rejection and stays one (§6.3).
+    const out: string[] = [];
+    const seq = new StringSeq(out, new PayloadAcc(), NONE, NONE, "tags", 4, 8);
+    expect(codeOf(() => decode(wrapper((os) => os.writeString(4, "x")), router(seq, FixlenSubtype.String)))).toBe(
+      SofabErrorCode.LimitExceeded,
+    );
+    const out2: string[] = [];
+    const seq2 = new StringSeq(out2, new PayloadAcc(), NONE, NONE, "tags", 4, 8);
+    expect(
+      codeOf(() => decode(wrapper((os) => os.writeString(0, "x".repeat(9))), router(seq2, FixlenSubtype.String))),
+    ).toBe(SofabErrorCode.LimitExceeded);
+  });
+
+  it("leaves an inert receiver bound alone — the check is the else of the schema bound", () => {
+    // §6.2.1: the caps "MUST NOT be applied to a field the schema already bounds".
+    // Where the schema stated the bound, the receiver number beside it never runs,
+    // so it is not required to be a number — and a schema-bounded array still
+    // answers INVALID, from the bound, with the unstated cap sitting inert.
+    const out: string[] = [];
+    const seq = new StringSeq(out, new PayloadAcc(), 2, 4, "tags", NONE, NONE);
+    expect(codeOf(() => decode(wrapper((os) => os.writeString(0, "ok")), router(seq, FixlenSubtype.String)))).toBe(
+      undefined,
+    );
+    expect(out).toStrictEqual(["ok"]);
+    const out2: string[] = [];
+    const seq2 = new StringSeq(out2, new PayloadAcc(), 2, 4, "tags", NONE, NONE);
+    expect(codeOf(() => decode(wrapper((os) => os.writeString(2, "over")), router(seq2, FixlenSubtype.String)))).toBe(
+      SofabErrorCode.InvalidMsg,
+    );
+  });
+});
+
 describe("what a collector must not treat as an element", () => {
   it("skips an element of the wrong fixlen subtype instead of rejecting it (§7.3)", () => {
     // A blob among strings is a schema mismatch, and §7.3 makes that a skip —

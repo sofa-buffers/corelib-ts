@@ -664,6 +664,17 @@ that bound governs and its violation is `INVALID_MSG`, a statement about *validi
 where it declared none the receiver cap governs and its violation is
 `LIMIT_EXCEEDED`, a *policy* rejection on well-formed bytes.
 
+A receiver bound that is about to govern and **states no cap** — negative, `NaN`
+(what an omitted argument becomes in JavaScript), `Infinity` — is refused at
+construction with `SofabErrorCode.Argument`. It is neither of the two categories
+above: no receiver policy was set, so there is no `LIMIT_EXCEEDED` to raise
+("a format ceiling reached because no cap was stated is the **format's** bound …
+and a port **MUST NOT** present it as one"), and no unlimited mode to fall back to
+("**MUST NOT** read an omitted argument as *unlimited*"). It is a mistake in the
+call, which §6.3 makes `InvalidArgument`. The refusal is fail-closed: nothing is
+decoded through a collector that could not be built. A bound the schema half makes
+inert is not checked — §6.2.1 forbids applying it at all.
+
 **What this decoder still owes the layer that holds the numbers** is the enforcement
 point §6.2.1 requires — the count / length header, before the allocation the cap
 exists to prevent, and behind the MESSAGE_SPEC §7.3 tag test:

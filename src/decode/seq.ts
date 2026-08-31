@@ -58,10 +58,18 @@
  * The *schema* bounds beside them (`cap`, `elemMax`) are required too, with
  * {@link UNBOUNDED} as the explicit "the schema declared none" spelling: an absent
  * schema bound is a fact about the schema, which only the caller knows.
+ *
+ * **And an argument that states no cap is a caller mistake, not a policy
+ * rejection.** A required argument can still arrive as `-1`, `undefined` or
+ * `Infinity` from an untyped caller, and the same reasoning applies one level in:
+ * no receiver policy was set, so there is no `LIMIT_EXCEEDED` to report and no
+ * unlimited mode to fall back to. Such a bound is refused at construction with
+ * `Argument` (§6.3's third row: "every remaining caller mistake is
+ * `InvalidArgument`") — see {@link requireReceiverBound}.
  */
 
 import { FixlenSubtype } from "../constants.js";
-import { invalidMsgError, limitExceededError } from "../errors.js";
+import { argumentError, invalidMsgError, limitExceededError } from "../errors.js";
 import type { PayloadAcc } from "./acc.js";
 import { decodeUtf8 } from "./text.js";
 
@@ -78,6 +86,51 @@ const NO_BYTES = new Uint8Array(0);
  * bound has to be spelled. This is the spelling for "there is none".
  */
 export const UNBOUNDED = -1;
+
+/**
+ * Reject a receiver bound that is not a bound, **before** it is ever compared
+ * against (CORELIB_PLAN §6.2.1, §6.3).
+ *
+ * §6.2.1 lets this library perform the comparison but never own the number: a
+ * codec "**MUST NOT** hold a limit of its own, **MUST NOT** supply a default for
+ * one it was not given, **MUST NOT** read an omitted argument as *unlimited*, and
+ * **MUST NOT** clamp to one". A caller that hands over `-1`, `undefined`/`NaN` or
+ * `Infinity` for a bound that is about to **govern** has stated no cap at all, and
+ * there are only two things this class could do about it — and both were wrong:
+ *
+ * - it used to **fail closed with `LIMIT_EXCEEDED`** for a negative bound, naming
+ *   a receiver policy the deployment never set. `LimitExceeded` means "raise my
+ *   limit or the sender must send less" (§6.3); there is no limit to raise;
+ * - and it **failed open** for `undefined`/`NaN` — every comparison against `NaN`
+ *   is `false`, so `id >= receiverCap` never fired and the array decoded
+ *   uncapped. That is §6.2.1's "read an omitted argument as *unlimited*",
+ *   verbatim.
+ *
+ * Neither is a property of the message or of the deployment: it is a mistake in
+ * the **call**, which §6.3's third row makes `InvalidArgument` — "every remaining
+ * caller mistake is `InvalidArgument`". Reported at construction, so it is still
+ * fail-closed (no element is ever accepted) and the per-element comparison below
+ * stays a single `>=` on a number already known to be finite and non-negative.
+ *
+ * Checked only where the receiver bound actually applies. §6.2.1: the caps "**MUST
+ * NOT** be applied to a field the schema already bounds" — where `schemaBound` is
+ * stated it governs alone, the receiver bound beside it is inert, and a number
+ * that is forbidden to be applied cannot be required to be stated.
+ */
+function requireReceiverBound(
+  schemaBound: number,
+  receiver: number,
+  what: string,
+  name: string,
+): void {
+  if (schemaBound >= 0) return; // the schema bound governs; the cap never runs
+  if (Number.isFinite(receiver) && receiver >= 0) return;
+  throw argumentError(
+    `${name}: ${what} is ${receiver}, which states no cap — the schema left this ` +
+      `field unbounded, and §6.2.1 admits no unset state and no unlimited mode. ` +
+      `The number is generated code's to supply.`,
+  );
+}
 
 /**
  * The slots of a wrapper-sequence array: the index rules of MESSAGE_SPEC §5.1 and
@@ -100,7 +153,9 @@ export const UNBOUNDED = -1;
  * no unlimited setting — a wrapper array announces no count, so the index is the
  * only place a receiver can bound it. **Required, with no default**: the number is
  * generated code's, and falling back to `ARRAY_MAX` would report a policy
- * rejection against a format ceiling nobody configured (§6.2.1).
+ * rejection against a format ceiling nobody configured (§6.2.1). A value that
+ * states no cap at all — negative, `NaN`, `Infinity` — is `Argument` at
+ * construction, never `LIMIT_EXCEEDED` ({@link requireReceiverBound}).
  */
 export class ElementSeq<T> {
   constructor(
@@ -109,7 +164,9 @@ export class ElementSeq<T> {
     readonly cap: number,
     readonly name: string,
     readonly receiverCap: number,
-  ) {}
+  ) {
+    requireReceiverBound(cap, receiverCap, "the receiver array-index cap", name);
+  }
 
   /**
    * Bound-check `id` and grow `out` to `id + 1`, filling any gap — and the slot
@@ -144,6 +201,10 @@ export class ElementSeq<T> {
         throw invalidMsgError(`${this.name}: array index above schema capacity ${this.cap}`);
       }
     } else if (id >= this.receiverCap) {
+      // A plain `>=`, and it is exact: the constructor already refused a
+      // `receiverCap` that is not a finite non-negative number, so there is no
+      // NaN comparison to fall through here and no unstated cap to misreport as
+      // a policy rejection (`requireReceiverBound`, §6.2.1/§6.3).
       throw limitExceededError(
         `${this.name}: array index ${id} exceeds the receiver cap ${this.receiverCap}`,
       );
@@ -197,6 +258,8 @@ export class StringSeq {
     readonly receiverCap: number,
     readonly receiverElemMax: number,
   ) {
+    // The index bound is validated by `ElementSeq`; this is the length bound's half.
+    requireReceiverBound(elemMax, receiverElemMax, "the receiver element-length cap", name);
     this.slots = new ElementSeq(out, "", cap, name, receiverCap);
   }
 
@@ -293,6 +356,8 @@ export class BlobSeq {
     readonly receiverCap: number,
     readonly receiverElemMax: number,
   ) {
+    // The index bound is validated by `ElementSeq`; this is the length bound's half.
+    requireReceiverBound(elemMax, receiverElemMax, "the receiver element-length cap", name);
     this.slots = new ElementSeq(out, NO_BYTES, cap, name, receiverCap);
   }
 
