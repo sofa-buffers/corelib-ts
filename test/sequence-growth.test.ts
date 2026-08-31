@@ -30,7 +30,9 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  DecodeStatus,
   ElementSeq,
+  FIXLEN_MAX,
   IStream,
   PayloadAcc,
   SofabError,
@@ -87,7 +89,7 @@ function build(c: GrowthCase): Uint8Array {
  * recognised by its (id, depth), and the elements go to a {@link StringSeq}.
  */
 function stringCollector(c: GrowthCase, out: string[], cap = CAP): Visitor {
-  const seq = new StringSeq(out, new PayloadAcc(), -1, -1, "elements", cap);
+  const seq = new StringSeq(out, new PayloadAcc(), -1, -1, "elements", cap, FIXLEN_MAX);
   let inArray = false;
   return {
     sequenceBegin: (id, depth) => {
@@ -161,19 +163,22 @@ function replay(
 }
 
 /** One-shot, and chunked at every size from one byte up — the outcome must not move. */
+// The cap travels in the collector each visitor was built with, not in a decode
+// argument: this codec holds no limit (§6.2.1), so there is nothing to configure
+// on `decode` / `IStream` any more.
 const DRIVES: [string, (bytes: Uint8Array, visitor: Visitor) => void][] = [
-  ["one-shot", (bytes, visitor) => decode(bytes, visitor, { maxArrayCount: CAP })],
+  ["one-shot", (bytes, visitor) => decode(bytes, visitor)],
   [
     "one byte at a time",
     (bytes, visitor) => {
-      const is = new IStream(visitor, { maxArrayCount: CAP });
+      const is = new IStream(visitor);
       for (let i = 0; i < bytes.length; i++) is.feed(bytes.subarray(i, i + 1));
     },
   ],
   [
     "three bytes at a time",
     (bytes, visitor) => {
-      const is = new IStream(visitor, { maxArrayCount: CAP });
+      const is = new IStream(visitor);
       for (let i = 0; i < bytes.length; i += 3) is.feed(bytes.subarray(i, i + 3));
     },
   ],
@@ -264,19 +269,26 @@ describe("sequence-array growth (§7.2 item 8)", () => {
     expect(out[5_000]).toBe("");
   });
 
-  it("keeps a decoder-side cap rejection terminal (§6.3)", () => {
-    // The count-prefixed twin: a cap the *decoder* enforces latches, so a caller
-    // that catches the throw and feeds on is re-told rather than resumed inside
-    // the field the throw abandoned.
+  it("caps the count-prefixed twin at its count word, from the visitor (§6.2.1)", () => {
+    // The count-prefixed array, for contrast with the wrapper above: it announces
+    // its length, so the cap is compared at the count word — in `arrayBegin`,
+    // which the codec raises there and which holds the number, because the codec
+    // does not. Rejected before a single element is delivered.
     const os = growingOStream();
     os.writeUnsignedArray(1, new Array(CAP + 1).fill(0));
-    const is = new IStream({ arrayBegin: () => undefined }, { maxArrayCount: CAP });
+    const seen: number[] = [];
+    const is = new IStream({
+      arrayBegin(_id, _kind, count) {
+        if (count > CAP) throw new SofabError(SofabErrorCode.LimitExceeded, "over cap");
+      },
+      arrayUnsigned: () => void seen.push(1),
+    });
     expect(() => is.feed(os.bytes().slice())).toThrow(
       expect.objectContaining({ code: SofabErrorCode.LimitExceeded }),
     );
-    expect(() => is.feed(Uint8Array.of(0x08, 0x01))).toThrow(
-      expect.objectContaining({ code: SofabErrorCode.LimitExceeded }),
-    );
+    expect(seen).toStrictEqual([]);
+    // Not INVALID: the bytes are well-formed and decode under a looser cap.
+    expect(is.status()).not.toBe(DecodeStatus.Invalid);
   });
 
   it.each(
@@ -291,7 +303,7 @@ describe("sequence-array growth (§7.2 item 8)", () => {
       c.element_type === "string"
         ? stringCollector(c, out as string[], loose)
         : structCollector(c, out as number[], loose);
-    expect(() => decode(bytes, visitor, { maxArrayCount: loose })).not.toThrow();
+    expect(() => decode(bytes, visitor)).not.toThrow();
     expect(out.length).toBeGreaterThan(c.expect.max_length!);
   });
 });

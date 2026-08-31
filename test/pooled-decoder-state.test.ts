@@ -32,13 +32,25 @@ import {
 } from "../src/index.js";
 
 /**
- * A visitor that reads the field kinds a receiver cap bounds. §6.2.1 caps only a
- * field that is actually read, so the cap-rejection cases below need one.
+ * A generated-layer stand-in that holds the receiver caps and compares them
+ * itself, at the header callbacks (§6.2.1 — the codec holds none). The
+ * cap-rejection cases below drive the pooled machine through a throw raised from
+ * inside a visitor callback, which is now the only way a cap rejection happens.
  */
-const READS: Visitor = {
-  arrayBegin: () => undefined,
-  fixlenBegin: () => undefined,
-};
+function capped(caps: { array?: number; fixlen?: number }): Visitor {
+  return {
+    arrayBegin(_id, _kind, count) {
+      if (caps.array !== undefined && count > caps.array) {
+        throw new SofabError(SofabErrorCode.LimitExceeded, `count ${count} over cap`);
+      }
+    },
+    fixlenBegin(_id, _sub, total) {
+      if (caps.fixlen !== undefined && total > caps.fixlen) {
+        throw new SofabError(SofabErrorCode.LimitExceeded, `length ${total} over cap`);
+      }
+    },
+  };
+}
 
 /** A reference message touching every construct the decoder keeps state for. */
 function reference(): Uint8Array {
@@ -104,8 +116,8 @@ const ABORTS: [string, () => string][] = [
     () => codeOf(() => decode(Uint8Array.of(0x07), {})),
   ],
   [
-    "a terminal receiver-cap rejection (LIMIT_EXCEEDED, which also latches)",
-    () => codeOf(() => decode(REFERENCE, READS, { maxArrayCount: 1 })),
+    "a receiver-cap rejection thrown from the visitor (LIMIT_EXCEEDED)",
+    () => codeOf(() => decode(REFERENCE, capped({ array: 1 }))),
   ],
   [
     "a visitor that throws mid-message",
@@ -164,13 +176,16 @@ describe("a pooled decoder carries nothing from the decode before it", () => {
     expect(codeOf(() => decode(REFERENCE, {}))).toBe("none");
   });
 
-  it("does not leak a cap: tight limits on one decode do not bind the next", () => {
-    expect(codeOf(() => decode(REFERENCE, READS, { maxArrayCount: 1 }))).toBe(
+  it("does not leak a cap: a tight visitor on one decode does not bind the next", () => {
+    // The machine is pooled, so a cap rejection must leave nothing behind. With
+    // the numbers in the visitor there is nothing on the machine to leave — but
+    // the abort still has to unwind cleanly, which is what this pins.
+    expect(codeOf(() => decode(REFERENCE, capped({ array: 1 })))).toBe(
       SofabErrorCode.LimitExceeded,
     );
     expect(codeOf(() => decode(REFERENCE, {}))).toBe("none");
     // …and the reverse: a loose decode does not loosen a tight one after it.
-    expect(codeOf(() => decode(REFERENCE, READS, { maxStringLen: 1 }))).toBe(
+    expect(codeOf(() => decode(REFERENCE, capped({ fixlen: 1 })))).toBe(
       SofabErrorCode.LimitExceeded,
     );
   });

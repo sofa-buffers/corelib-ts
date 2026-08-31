@@ -38,7 +38,8 @@ export const SofabErrorCode = {
   /**
    * A receiver-configured decode limit was exceeded — a dynamic array, string or
    * blob on the wire claims more elements / bytes than the caller's
-   * {@link DecodeLimits} (`maxArrayCount` / `maxStringLen` / `maxBlobLen`)
+   * receiver cap (`max_dyn_array_count` / `max_dyn_string_len` /
+   * `max_dyn_blob_len`, §6.2.1 — stated by generated code, never by this codec)
    * allows. Deliberately distinct from {@link SofabErrorCode.InvalidMsg}:
    * exceeding a limit is *policy*, not wire malformation — the identical bytes
    * decode fine under a looser limit — so differential fuzzing must not read it
@@ -90,7 +91,7 @@ export function incompleteError(message: string): SofabError {
 }
 
 /**
- * @internal A receiver-configured decode limit ({@link DecodeLimits}) was
+ * @internal A receiver-configured decode limit (CORELIB_PLAN §6.2.1) was
  * exceeded. Carries {@link SofabErrorCode.LimitExceeded}, never `InvalidMsg`:
  * it is a policy rejection, not a statement that the bytes are malformed.
  */

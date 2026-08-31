@@ -30,14 +30,13 @@ export type { FlushSink } from "./encode/sink.js";
 // There is no pull parser, iterator or cursor to export beside it.
 export { IStream, decode } from "./decode/istream.js";
 export type { Visitor } from "./decode/istream.js";
-export type { DecodeLimits } from "./decode/limits.js";
 
 // The generated layer's support (ARCHITECTURE §8): schema-free helpers that a
 // generated message class would otherwise carry its own copy of. Nothing here
 // knows a schema — a capacity, a maxlen or a payload length is an argument.
 export { decodeUtf8 } from "./decode/text.js";
 export { PayloadAcc } from "./decode/acc.js";
-export { BlobSeq, ElementSeq, StringSeq } from "./decode/seq.js";
+export { BlobSeq, ElementSeq, StringSeq, UNBOUNDED } from "./decode/seq.js";
 export { elementsEqual } from "./encode/equal.js";
 
 export { getKernel, setKernel } from "./backend/kernel.js";

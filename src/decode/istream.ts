@@ -35,7 +35,6 @@
 import { DecodeStatus } from "../constants.js";
 import type { ArrayKind, FixlenSubtype, WireType } from "../constants.js";
 import { incompleteError } from "../errors.js";
-import type { DecodeLimits } from "./limits.js";
 import { DecoderState } from "./state.js";
 
 /**
@@ -208,11 +207,12 @@ export interface Visitor {
    *
    * A declined subtree is still *parsed* — a sequence is framed by markers, not by
    * a length, so its end has to be found — but nothing in it is decoded into
-   * existence: no piece is reported, no value is built, and the receiver caps of
-   * {@link DecodeLimits} do not fire, since they bound what this reader is handed
-   * and a declined scope hands it nothing. Format ceilings (`ARRAY_MAX`,
-   * `FIXLEN_MAX`, `MAX_DEPTH`, the varint bound) still apply everywhere: they
-   * bound what the wire may express.
+   * existence: no piece is reported and no value is built. No receiver cap fires
+   * inside one either (§6.2.1's "a skipped field is never capped"), and that falls
+   * out of the structure rather than needing a rule: a cap is compared by the
+   * handler this stream would have called, and a declined scope calls none. Format
+   * ceilings (`ARRAY_MAX`, `FIXLEN_MAX`, `MAX_DEPTH`, the varint bound) still apply
+   * everywhere: they bound what the wire may express.
    */
   sequenceBegin?(id: number, depth: number): boolean | void;
   /** End of the nested sequence opened by field `id` at `depth`. */
@@ -223,11 +223,24 @@ export interface Visitor {
  * Push parser for the SofaBuffers wire format, and the library's only decode
  * surface (§5.3.1).
  *
- * Bind a {@link Visitor} and, optionally, the receiver-side {@link DecodeLimits}
- * at construction, then feed bytes in chunks of any size with {@link feed}: it
- * calls one visitor method per decoded field and resumes cleanly across chunk
- * boundaries. Every `feed` returns the decode outcome for the bytes so far, so no
- * end / finalize call is needed; {@link status} re-reads that same outcome.
+ * Bind a {@link Visitor} at construction, then feed bytes in chunks of any size
+ * with {@link feed}: it calls one visitor method per decoded field and resumes
+ * cleanly across chunk boundaries. Every `feed` returns the decode outcome for the
+ * bytes so far, so no end / finalize call is needed; {@link status} re-reads that
+ * same outcome.
+ *
+ * **No receiver limit is configured here, because this codec holds none**
+ * (§6.2.1). A `max_dyn_*` cap is the receiving *application's* number, stated by
+ * generated code, which knows the schema and the target; it is compared inside the
+ * visitor's own `arrayBegin` / `fixlenBegin` — raised by this stream at the count
+ * or length header, before any payload is delivered and only for a field the
+ * visitor reads — and, for a wrapper array's `string` / `blob` elements, inside
+ * the `StringSeq` / `BlobSeq` collector those bounds were passed to.
+ * This class used to take a `DecodeLimits` and default every absent cap to the
+ * format ceiling, which §6.2.1 forbids twice over: a codec must not supply a
+ * default for a limit it was not given, and a format ceiling reached because no
+ * cap was stated is the format's bound and must not be presented as a receiver
+ * cap.
  *
  * Constructing one is the only allocating step (§6.6): `feed` itself allocates
  * nothing at all. The one-shot {@link decode} is exactly this class fed once.
@@ -236,18 +249,11 @@ export class IStream {
   private readonly state: DecoderState;
 
   /**
-   * @param visitor The field handler this stream drives, for its whole life.
-   * @param limits Receiver-side caps (§6.2.1). Every cap is finite: an omitted
-   * one takes the format ceiling it bounds rather than meaning "no limit" — there
-   * is no unset state and no unlimited mode, and §6.2.1 puts the *numbers* in
-   * generated code, so the codec falls back to a bound the format already
-   * enforces instead of inventing one. An over-limit array count or
-   * string / blob length throws {@link SofabError} (`LIMIT_EXCEEDED`) from
-   * {@link feed}, at the offending field's header and before any of its payload
-   * reaches the visitor.
+   * @param visitor The field handler this stream drives, for its whole life — and
+   * the layer that holds the receiver caps, if any (§6.2.1; see the class doc).
    */
-  constructor(visitor: Visitor, limits?: DecodeLimits) {
-    this.state = new DecoderState(visitor, limits);
+  constructor(visitor: Visitor) {
+    this.state = new DecoderState(visitor);
   }
 
   /**
@@ -275,9 +281,9 @@ export class IStream {
    * invoked — and {@link status} answers {@link DecodeStatus.Invalid} from then
    * on.
    *
-   * A receiver-limit rejection (`LIMIT_EXCEEDED`, {@link DecodeLimits}) travels
-   * the same channel and latches the same way — every later call re-throws it —
-   * but it is **not** the `INVALID` outcome and never becomes one: the bytes are
+   * A receiver-limit rejection (`LIMIT_EXCEEDED`, §6.2.1) travels the same
+   * channel — thrown out of the visitor callback that compared the cap — but it
+   * is **not** the `INVALID` outcome and never becomes one: the bytes are
    * well-formed and the same message decodes under a looser cap, so it is a
    * policy rejection (§6.2.1, §6.3). The two stay distinguishable by their code,
    * which is what §6.3 requires; §6.3 leaves the surfacing open between "a fourth
@@ -309,10 +315,8 @@ export class IStream {
    * would `Complete`, so a stream stopped by a cap keeps reporting the structural
    * answer for the bytes it consumed — `Incomplete`, since a cap fires at a count
    * or length word, i.e. inside a field. Read the cap rejection where it is
-   * raised: {@link feed} throws {@link SofabError} with
-   * {@link SofabErrorCode.LimitExceeded}, and every later {@link feed} re-throws
-   * it, so a caller polling this instead can only feed bytes that cannot be
-   * consumed.
+   * raised: it propagates out of {@link feed} as a {@link SofabError} carrying
+   * {@link SofabErrorCode.LimitExceeded}, from the visitor that holds the number.
    */
   status(): DecodeStatus {
     return this.state.finish();
@@ -334,16 +338,10 @@ export class IStream {
  * input throws `INVALID_MSG`, while input that ends inside a field — truncation or
  * an unclosed sequence — throws `INCOMPLETE`. A complete message returns normally.
  *
- * Pass `limits` ({@link DecodeLimits}) to bound the fields the schema leaves open;
- * an omitted cap takes the format ceiling, so a decode with none rejects nothing
- * the format accepts. An over-limit field throws `LIMIT_EXCEEDED` at its header,
- * before it is materialized.
+ * The receiver caps of §6.2.1 are the `visitor`'s, not this function's: it takes
+ * no limits argument because this codec holds none. See {@link IStream}.
  */
-export function decode(
-  bytes: Uint8Array,
-  visitor: Visitor,
-  limits?: DecodeLimits,
-): void {
+export function decode(bytes: Uint8Array, visitor: Visitor): void {
   // One machine, re-bound per call. Constructing a decoder is the only allocating
   // step there is (§6.6) — and on a small message it is most of the cost — so the
   // one-shot path keeps one and rebinds it. A decode started *inside* a visitor
@@ -352,7 +350,7 @@ export function decode(
   const state = pooled ?? new DecoderState();
   pooled = null;
   try {
-    state.begin(visitor, limits);
+    state.begin(visitor);
     state.push(bytes);
     // A malformed message has already thrown `INVALID_MSG`; what is left to report
     // is truncation, which streaming leaves to the caller's framing (§5.2.4) and

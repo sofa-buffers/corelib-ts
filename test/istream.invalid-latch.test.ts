@@ -173,8 +173,13 @@ describe("INVALID is terminal: a poisoned IStream never answers COMPLETE (§5.2)
     // The bytes are well-formed — the same message decodes under a looser
     // limit — so hitting a configured cap must not poison the stream into the
     // INVALID outcome.
-    // A handler for the array, because §6.2.1 caps only a field that is read.
-    const is = new IStream({ arrayBegin: () => undefined }, { maxArrayCount: 1 });
+    // The cap is the generated layer's — the codec holds none (§6.2.1) — so it is
+    // this visitor that compares it, at the header `arrayBegin` is raised from.
+    const is = new IStream({
+      arrayBegin(_id, _kind, count) {
+        if (count > 1) throw new SofabError(SofabErrorCode.LimitExceeded, "over cap");
+      },
+    });
     expect(() => is.feed(Uint8Array.of(0x03, 0x02, 0x01, 0x02))).toThrow(
       expect.objectContaining({ code: SofabErrorCode.LimitExceeded }),
     );

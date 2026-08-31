@@ -15,7 +15,14 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { DecodeStatus, IStream, SofabErrorCode, decode, type Visitor } from "../src/index.js";
+import {
+  DecodeStatus,
+  IStream,
+  SofabError,
+  SofabErrorCode,
+  decode,
+  type Visitor,
+} from "../src/index.js";
 
 // `0x3b` is an unsigned-array header at id 7: wire type 3 (ArrayUnsigned), id 7.
 // Its value is skipped, which is all the decoder has to do to trip the bug.
@@ -78,8 +85,15 @@ describe("array count with bit 63 set", () => {
   });
 
   it("a receiver cap cannot be slipped either", () => {
-    // maxArrayCount is compared with the same `>` — a negative count would pass
-    // this guard just as it passed the ARRAY_MAX one.
-    expect(() => decode(BIT63, {}, { maxArrayCount: 4 })).toThrow();
+    // A receiver cap is compared with the same `>` (§6.2.1, in the layer that
+    // holds the number) — a negative count would pass that guard just as it
+    // passed the ARRAY_MAX one. It never gets the chance: the format ceiling is
+    // decided first, in the codec, and rejects the header outright.
+    const capped: Visitor = {
+      arrayBegin(_id, _kind, count) {
+        if (count > 4) throw new SofabError(SofabErrorCode.LimitExceeded, "over cap");
+      },
+    };
+    expect(() => decode(BIT63, capped)).toThrow();
   });
 });
