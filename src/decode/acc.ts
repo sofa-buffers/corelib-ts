@@ -41,7 +41,7 @@
  *
  * Sizing follows the declared `total`, so a hostile length word is bounded by
  * whatever bound the caller already applied to it — the schema `maxlen` its
- * generated guard checks, or the receiver's {@link DecodeLimits}, both of which
+ * generated guard checks, or the receiver caps of §6.2.1, both of which
  * are enforced at the length word before a piece is ever delivered. This class
  * enforces neither: it is handed a payload the caller has already accepted.
  */

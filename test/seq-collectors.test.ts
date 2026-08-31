@@ -40,6 +40,18 @@ const ARRAY_ID = 7;
 /** Unbounded, the value a schema without `count` / `maxlen` supplies (§7.2). */
 const NONE = -1;
 
+/**
+ * The receiver caps a test that is not about caps states anyway.
+ *
+ * §6.2.1 makes both required arguments with no default — "a codec MUST NOT supply
+ * a default for [a limit] it was not given" — so every construction has to name
+ * them. Naming the format ceiling here is the *caller* choosing the widest number
+ * that is still a limit, which is a choice a caller is entitled to make; what
+ * §6.2.1 forbids is the collector reaching for it on its own.
+ */
+const WIDE_INDEX = ARRAY_MAX;
+const WIDE_LEN = FIXLEN_MAX;
+
 /** Wrap `body` — the elements — in the array's wrapper sequence. */
 function wrapper(body: (os: OStream) => void): Uint8Array {
   const os = growingOStream();
@@ -94,7 +106,7 @@ function router(
 /** Decode `wire` with a {@link StringSeq} bound to the wrapper, returning the elements. */
 function strings(wire: Uint8Array, cap = NONE, elemMax = NONE): string[] {
   const out: string[] = [];
-  const seq = new StringSeq(out, new PayloadAcc(), cap, elemMax, "tags");
+  const seq = new StringSeq(out, new PayloadAcc(), cap, elemMax, "tags", WIDE_INDEX, WIDE_LEN);
   decode(wire, router(seq, FixlenSubtype.String));
   return out;
 }
@@ -102,7 +114,7 @@ function strings(wire: Uint8Array, cap = NONE, elemMax = NONE): string[] {
 /** The {@link BlobSeq} twin of {@link strings}. */
 function blobs(wire: Uint8Array, cap = NONE, elemMax = NONE): Uint8Array[] {
   const out: Uint8Array[] = [];
-  const seq = new BlobSeq(out, new PayloadAcc(), cap, elemMax, "chunks");
+  const seq = new BlobSeq(out, new PayloadAcc(), cap, elemMax, "chunks", WIDE_INDEX, WIDE_LEN);
   decode(wire, router(seq, FixlenSubtype.Blob));
   return out;
 }
@@ -161,7 +173,7 @@ describe("StringSeq places elements the way §5.1 requires", () => {
       os.writeString(1, "short");
     });
     const out: string[] = [];
-    const seq = new StringSeq(out, new PayloadAcc(), NONE, NONE, "tags");
+    const seq = new StringSeq(out, new PayloadAcc(), NONE, NONE, "tags", WIDE_INDEX, WIDE_LEN);
     const is = new IStream(router(seq, FixlenSubtype.String));
     let st: DecodeStatus = DecodeStatus.Complete;
     for (let i = 0; i < wire.length; i++) st = is.feed(wire.subarray(i, i + 1));
@@ -192,7 +204,7 @@ describe("BlobSeq places elements the same way, and copies them", () => {
       os.writeBlob(1, Uint8Array.of(0xff));
     });
     const out: Uint8Array[] = [];
-    const seq = new BlobSeq(out, new PayloadAcc(), NONE, NONE, "chunks");
+    const seq = new BlobSeq(out, new PayloadAcc(), NONE, NONE, "chunks", WIDE_INDEX, WIDE_LEN);
     const is = new IStream(router(seq, FixlenSubtype.Blob));
     let st: DecodeStatus = DecodeStatus.Complete;
     for (let i = 0; i < wire.length; i++) st = is.feed(wire.subarray(i, i + 1));
@@ -207,7 +219,7 @@ describe("BlobSeq places elements the same way, and copies them", () => {
     const wire = wrapper((os) => os.writeBlob(0, Uint8Array.of(9, 8, 7)));
     const scratch = wire.slice();
     const out: Uint8Array[] = [];
-    const seq = new BlobSeq(out, new PayloadAcc(), NONE, NONE, "chunks");
+    const seq = new BlobSeq(out, new PayloadAcc(), NONE, NONE, "chunks", WIDE_INDEX, WIDE_LEN);
     const is = new IStream(router(seq, FixlenSubtype.Blob));
     is.feed(scratch);
     scratch.fill(0xee);
@@ -246,7 +258,7 @@ describe("the schema bounds bind, and bind early (§7.1, §5.2)", () => {
     const wire = wrapper((os) => os.writeString(0, "far too long"));
     const truncated = wire.subarray(0, wire.length - 12);
     const out: string[] = [];
-    const seq = new StringSeq(out, new PayloadAcc(), NONE, 4, "tags");
+    const seq = new StringSeq(out, new PayloadAcc(), NONE, 4, "tags", WIDE_INDEX, WIDE_LEN);
     const is = new IStream(router(seq, FixlenSubtype.String));
     expectInvalid(() => is.feed(truncated));
     expect(out).toStrictEqual([]);
@@ -262,7 +274,7 @@ describe("the schema bounds bind, and bind early (§7.1, §5.2)", () => {
     // so the capacity check has to come first. Called directly — no encoder will
     // produce this, and the point is exactly that the guard runs before the work.
     const out: string[] = [];
-    const seq = new StringSeq(out, new PayloadAcc(), 4, NONE, "tags");
+    const seq = new StringSeq(out, new PayloadAcc(), 4, NONE, "tags", WIDE_INDEX, WIDE_LEN);
     expectInvalid(() => seq.element(2 ** 31 - 1, 1, 0, Uint8Array.of(0x41), 0, 1));
     expectInvalid(() => seq.begin(2 ** 31 - 1, FixlenSubtype.String, 1));
     expect(out).toStrictEqual([]);
@@ -287,7 +299,7 @@ describe("a wrapper array the schema left unbounded is bounded by the receiver (
   /** `strings` / `blobs`, with the schema bound left off and a receiver cap set. */
   function underCap(wire: Uint8Array): string[] {
     const out: string[] = [];
-    const seq = new StringSeq(out, new PayloadAcc(), NONE, NONE, "tags", cap);
+    const seq = new StringSeq(out, new PayloadAcc(), NONE, NONE, "tags", cap, WIDE_LEN);
     decode(wire, router(seq, FixlenSubtype.String));
     return out;
   }
@@ -309,7 +321,7 @@ describe("a wrapper array the schema left unbounded is bounded by the receiver (
 
   it("extends nothing when it rejects, so a later lower index still lands", () => {
     const out: string[] = [];
-    const seq = new StringSeq(out, new PayloadAcc(), NONE, NONE, "tags", cap);
+    const seq = new StringSeq(out, new PayloadAcc(), NONE, NONE, "tags", cap, WIDE_LEN);
     expect(() => seq.element(cap, 1, 0, Uint8Array.of(0x41), 0, 1)).toThrow(SofabError);
     expect(out).toStrictEqual([]);
     seq.element(1, 1, 0, Uint8Array.of(0x42), 0, 1);
@@ -318,7 +330,7 @@ describe("a wrapper array the schema left unbounded is bounded by the receiver (
 
   it("bounds a blob array the same way", () => {
     const out: Uint8Array[] = [];
-    const seq = new BlobSeq(out, new PayloadAcc(), NONE, NONE, "chunks", cap);
+    const seq = new BlobSeq(out, new PayloadAcc(), NONE, NONE, "chunks", cap, WIDE_LEN);
     const over = wrapper((os) => os.writeBlob(cap, Uint8Array.of(1)));
     try {
       decode(over, router(seq, FixlenSubtype.Blob));
@@ -333,7 +345,7 @@ describe("a wrapper array the schema left unbounded is bounded by the receiver (
     // A schema `count` is a statement about validity and outranks capacity: with
     // one present the receiver cap is out of the picture for this field entirely.
     const out: string[] = [];
-    const seq = new StringSeq(out, new PayloadAcc(), 2, NONE, "tags", cap);
+    const seq = new StringSeq(out, new PayloadAcc(), 2, NONE, "tags", cap, WIDE_LEN);
     const over = wrapper((os) => os.writeString(2, "out"));
     try {
       decode(over, router(seq, FixlenSubtype.String));
@@ -424,19 +436,27 @@ describe("an element the schema left unbounded is bounded by the receiver too (�
     expect(out).toStrictEqual([]);
   });
 
-  it("defaults to the format ceiling: finite, and not a number invented here (§6.2.1)", () => {
-    // A2-0161. Finite, so there is no unset state and no unlimited mode; equal to
-    // the format ceiling, so the helper invented no policy — §6.2.1 puts the
-    // numbers in generated code, which passes them here.
-    const s = new StringSeq([], new PayloadAcc());
-    const b = new BlobSeq([], new PayloadAcc());
-    expect(Number.isFinite(s.receiverElemMax)).toBe(true);
-    expect(Number.isFinite(b.receiverElemMax)).toBe(true);
-    expect(s.receiverElemMax).toBe(FIXLEN_MAX);
-    expect(b.receiverElemMax).toBe(FIXLEN_MAX);
-    expect(s.receiverCap).toBe(ARRAY_MAX);
-    expect(b.receiverCap).toBe(ARRAY_MAX);
-    expect(new ElementSeq<number>([], 0).receiverCap).toBe(ARRAY_MAX);
+  it("has no default for either cap — both are required arguments (§6.2.1)", () => {
+    // The defect this replaced: `receiverCap` defaulted to ARRAY_MAX and
+    // `receiverElemMax` to FIXLEN_MAX, so a collector built without them reported
+    // LIMIT_EXCEEDED against a ceiling nobody configured. §6.2.1: a codec "MUST
+    // NOT supply a default for [a limit] it was not given", and a format ceiling
+    // reached because no cap was stated "is the FORMAT's bound, not a receiver
+    // cap, and a port MUST NOT present it as one".
+    //
+    // TypeScript refuses the short call at compile time; this pins the arity, so
+    // the defaults cannot creep back in without the assertion noticing.
+    expect(StringSeq.length).toBe(7);
+    expect(BlobSeq.length).toBe(7);
+    expect(ElementSeq.length).toBe(5);
+
+    // And what a stated cap does: it is the caller's number, held for this
+    // collector only, and readable back exactly as passed.
+    const s = new StringSeq([], new PayloadAcc(), NONE, NONE, "tags", 16, 32);
+    const b = new BlobSeq([], new PayloadAcc(), NONE, NONE, "chunks", 16, 32);
+    expect([s.receiverCap, s.receiverElemMax]).toStrictEqual([16, 32]);
+    expect([b.receiverCap, b.receiverElemMax]).toStrictEqual([16, 32]);
+    expect(new ElementSeq<number>([], 0, NONE, "es", 16).receiverCap).toBe(16);
   });
 });
 

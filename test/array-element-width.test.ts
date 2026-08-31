@@ -133,11 +133,10 @@ describe("array element width bound", () => {
       // corelib-ts#38's protection, restated as the property it needs: a declared
       // count of ~16 million against five bytes of input must allocate nothing at
       // all — which is now the general rule (§6.6), not an array special case.
-      // 0x80 0x80 0x80 0x08 = 16,777,216 elements — above the port's default
-      // receiver cap, so the caps are opened to the format ceiling here: what is
-      // on trial is that nothing is *sized* from the count, not that a cap fires.
+      // 0x80 0x80 0x80 0x08 = 16,777,216 elements. No receiver cap is in play —
+      // the codec holds none (§6.2.1) and this visitor states none — so what is
+      // on trial is that nothing is *sized* from the count, unaided by a cap.
       const hostile = Uint8Array.from([(1 << 3) | 4, 0x80, 0x80, 0x80, 0x08]);
-      const wideOpen = { maxArrayCount: 0x7fff_ffff };
       let biggest = 0;
       const saved = globalThis.Array;
       const spy = new Proxy(saved, {
@@ -149,7 +148,7 @@ describe("array element width bound", () => {
       (globalThis as { Array: unknown }).Array = spy;
       let err: unknown;
       try {
-        decode(hostile, {}, wideOpen);
+        decode(hostile, {});
       } catch (e) {
         err = e;
       } finally {

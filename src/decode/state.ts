@@ -41,15 +41,9 @@ import {
   VARINT_MAX_BYTES,
   WireType,
 } from "../constants.js";
-import { invalidMsgError, limitExceededError } from "../errors.js";
+import { invalidMsgError } from "../errors.js";
 import { joinI64, joinU64 } from "../varint/bits64.js";
 import { fp32FromBits, fp64FromBits } from "../varint/num64.js";
-import {
-  capArrayCount,
-  capBlobLen,
-  capStringLen,
-  type DecodeLimits,
-} from "./limits.js";
 import { SKIP } from "./skip.js";
 import type { Visitor } from "./istream.js";
 
@@ -87,10 +81,31 @@ export class DecoderState {
    */
   private skipFrom = -1;
 
-  /** Receiver-side caps (§6.2.1) — always finite, never unset. */
-  private maxArrayCount = 0;
-  private maxStringLen = 0;
-  private maxBlobLen = 0;
+  /**
+   * **No receiver cap lives here** (§6.2.1). This decoder used to hold
+   * `maxArrayCount` / `maxStringLen` / `maxBlobLen`, defaulted to the format
+   * ceilings when the caller supplied none — which is precisely the shape §6.2.1
+   * forbids: "a codec **MUST NOT** hold a limit of its own, **MUST NOT** supply a
+   * default for one it was not given, **MUST NOT** read an omitted argument as
+   * *unlimited*, and **MUST NOT** clamp to one", and "a format ceiling (§6.2)
+   * reached because no cap was stated is the **format's** bound, not a receiver
+   * cap, and a port **MUST NOT** present it as one". Reporting `LimitExceeded`
+   * against `ARRAY_MAX`/`FIXLEN_MAX` did exactly that.
+   *
+   * The caps now have **one implementation** and it is not here: generated code
+   * compares them in its own flat visitor, at `arrayBegin` / `fixlenBegin` — both
+   * of which this decoder raises at the count / length header, before a byte of
+   * payload is emitted and behind the MESSAGE_SPEC §7.3 tag test — and a wrapper
+   * array's elements, which reach no visitor callback, are capped by the
+   * `StringSeq` / `BlobSeq` collectors from bounds passed to their
+   * constructors. §6.2.1: "A port whose codec offers the check **MUST NOT** also
+   * emit it into the generated layer, and a port that enforces it in generated
+   * code **MUST NOT** ask the codec to enforce it too."
+   *
+   * The format ceilings below (`ARRAY_MAX`, `FIXLEN_MAX`, `MAX_DEPTH`, the varint
+   * bound) are *not* receiver caps and stay here: they bound what the wire may
+   * express, and exceeding one is `INVALID` (§6.2).
+   */
 
   /**
    * The id of every open sequence, indexed by the depth it was opened at, so a
@@ -120,28 +135,14 @@ export class DecoderState {
    * {@link push} and keeps feeding must not be able to talk the machine back into
    * `COMPLETE`. Every malformed-input throw goes through {@link fail}.
    *
-   * Deliberately *not* set for {@link limitExceededError}: a receiver-side limit
-   * is a policy rejection of well-formed bytes (§6.2.1) — the same message decodes
-   * under a looser limit — and folding it into `INVALID` would misreport it.
+   * A receiver-cap rejection is deliberately *not* latched here: it is a policy
+   * rejection of well-formed bytes (§6.2.1) — the same message decodes under a
+   * looser limit — and folding it into `INVALID` would misreport it. It is raised
+   * by the layer that holds the number (generated code, or a collector it built),
+   * and it propagates out of {@link push} through the visitor callback that threw
+   * it.
    */
   private invalidReason: string | null = null;
-  /**
-   * Terminal receiver-cap latch (§6.2.1/§6.3): the reason a cap rejected this
-   * stream, or `null`.
-   *
-   * A cap rejection is **terminal** — "a terminal, receiver-local policy
-   * rejection" — but it is *not* `INVALID`, so it gets its own latch rather than
-   * sharing {@link invalidReason}: the bytes are well-formed, and {@link finish}
-   * must keep saying so. What the latch buys is that a caller which catches the
-   * throw and feeds on gets the same rejection again instead of a decode resumed
-   * in the middle of the field the throw abandoned.
-   *
-   * A cap the *visitor* enforces — a wrapper array's element index, which has no
-   * count word for this machine to check (MESSAGE_SPEC §5.1) — throws from inside
-   * a callback, where this machine cannot tell the category from any other throw.
-   * That one is terminal by the caller's own hand: it stops feeding.
-   */
-  private limitReason: string | null = null;
 
   /**
    * A `DataView` over the chunk currently being fed, and the chunk it addresses —
@@ -194,15 +195,15 @@ export class DecoderState {
   private arrCount = 0;
   private arrIndex = 0;
 
-  constructor(visitor: Visitor = SKIP, limits?: DecodeLimits) {
+  constructor(visitor: Visitor = SKIP) {
     this.root = visitor;
     this.cur = visitor;
-    this.begin(visitor, limits);
+    this.begin(visitor);
   }
 
   /**
-   * (Re)bind this machine to a visitor and a set of caps, clearing every trace of
-   * whatever it decoded before.
+   * (Re)bind this machine to a visitor, clearing every trace of whatever it
+   * decoded before.
    *
    * Constructing a decoder is the one allocating step (§6.6), and the one-shot
    * {@link decode} would otherwise pay it per message — which on a 37-byte message
@@ -231,17 +232,13 @@ export class DecoderState {
    * invariant is held by `pooled-decoder-state.test.ts`, which aborts a decode in
    * every construct and then reuses the machine.
    */
-  begin(visitor: Visitor, limits?: DecodeLimits): void {
+  begin(visitor: Visitor): void {
     this.root = visitor;
     this.cur = visitor;
-    this.maxArrayCount = capArrayCount(limits);
-    this.maxStringLen = capStringLen(limits);
-    this.maxBlobLen = capBlobLen(limits);
     this.skipFrom = -1;
     this.depth = 0;
     this.state = S.Header;
     this.invalidReason = null;
-    this.limitReason = null;
     this.vBytes = 0;
     this.have = 0;
   }
@@ -263,8 +260,6 @@ export class DecoderState {
     // stream consumes nothing further and drives no visitor callbacks — it just
     // re-reports the original defect. One perfectly-predicted branch per chunk.
     if (this.invalidReason !== null) throw invalidMsgError(this.invalidReason);
-    // A cap rejection is terminal too, and re-reported the same way (§6.3).
-    if (this.limitReason !== null) throw limitExceededError(this.limitReason);
 
     const n = input.length;
     let i = 0;
@@ -460,14 +455,13 @@ export class DecoderState {
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
           const count = this.vNum();
+          // `ARRAY_MAX` is the FORMAT's ceiling (§6.2), not a receiver cap: it
+          // bounds what the wire may express, so exceeding it is `INVALID` for
+          // every receiver however it is configured. A receiver cap on this count
+          // is generated code's, compared inside the `arrayBegin` raised below —
+          // still at the count word, still before any element is delivered, and
+          // only for a field this visitor actually reads (§6.2.1).
           if (count > ARRAY_MAX) this.fail("array count out of range");
-          // §6.2.1: a receiver cap bounds what this reader is handed, and a
-          // field it skips — a declined scope, or one whose callback this
-          // visitor does not declare — hands it nothing. The format ceiling
-          // above binds either way: it bounds what the wire may express.
-          if (count > this.maxArrayCount && this.arrayIsRead()) {
-            this.failLimit(`array count ${count} exceeds maxArrayCount ${this.maxArrayCount}`);
-          }
           this.arrCount = count;
           this.arrIndex = 0;
           if (this.arrIsFixlen) {
@@ -645,11 +639,12 @@ export class DecoderState {
    * {@link DecodeStatus.Invalid} for good, so a caller that swallowed the throw
    * and kept feeding cannot read back `Complete`.
    *
-   * {@link limitReason} is deliberately **not** consulted. A cap rejection is
-   * terminal too and {@link push} re-throws it, but it is not the `INVALID`
-   * outcome and §6.3 forbids reporting it as one — and there is no value in the
-   * three-valued outcome that would be true of it. So a stream stopped by a cap
-   * keeps reporting the structural answer for the bytes it consumed, which is
+   * A receiver-cap rejection (§6.2.1) never reaches here at all: no cap lives in
+   * this machine, and the one generated code or a collector raises is thrown
+   * straight out of the visitor callback. Nor could it be reported here — §6.3
+   * forbids folding a policy rejection into `INVALID`, and no value of the
+   * three-valued outcome is true of it. A stream stopped by a cap therefore keeps
+   * reporting the structural answer for the bytes it consumed, which is
    * `Incomplete` (a cap fires at a count or length word, inside a field). The
    * rejection is the error channel's, per §6.3's second option, and
    * `IStream.status`'s doc says so to the caller.
@@ -673,60 +668,6 @@ export class DecoderState {
   private fail(message: string): never {
     this.invalidReason = message;
     throw invalidMsgError(message);
-  }
-
-  /**
-   * Reject the field on a receiver cap: latch the terminal verdict
-   * ({@link limitReason}) and throw `LIMIT_EXCEEDED`. Deliberately not
-   * {@link fail} — the bytes are well-formed, and folding a policy rejection into
-   * `INVALID` would misreport it (§6.2.1).
-   */
-  private failLimit(message: string): never {
-    this.limitReason = message;
-    throw limitExceededError(message);
-  }
-
-  /**
-   * Does the current handler take this array at all?
-   *
-   * §6.2.1: *"a field the handler skips allocates nothing — it is walked, not
-   * materialized (§6.7.2). A `max_dyn_*` limit **MUST NOT** be applied to it, so
-   * a decode that steps over an over-cap field it was never going to read stays
-   * `COMPLETE`. The check belongs at the count/length header of a field that is
-   * actually **read**."*
-   *
-   * On a flat visitor (§6.0) the per-field intent is spelled by which callbacks
-   * exist: a missing one means the bytes are consumed and nothing is delivered,
-   * so there is no destination for a cap to bound. `arrayBegin` alone counts as
-   * read — it carries the announced count, which is the number a generated
-   * handler sizes its destination from, and that allocation is exactly what the
-   * cap is for.
-   *
-   * Asked **only once a count has already exceeded the cap**, so a conforming
-   * decode never pays for it. It subsumes the older `cur !== SKIP` test:
-   * {@link SKIP} declares no callback, so every probe here is `undefined` on it.
-   */
-  private arrayIsRead(): boolean {
-    const v = this.cur;
-    if (v.arrayBegin !== undefined) return true;
-    // A fixlen array's element kind is not known until its element-length word,
-    // which is one state later, so either float callback keeps it read.
-    if (this.arrIsFixlen) return v.arrayFp32 !== undefined || v.arrayFp64 !== undefined;
-    return this.arrKind === ArrayKind.Unsigned
-      ? v.arrayUnsigned !== undefined
-      : v.arraySigned !== undefined;
-  }
-
-  /**
-   * The same question for a `string` / `blob` field — see {@link arrayIsRead}.
-   * `fixlenBegin` counts on its own, for the same reason `arrayBegin` does: it
-   * carries the declared total before any payload, which is what a handler sizes
-   * a destination from.
-   */
-  private fixlenIsRead(sub: number): boolean {
-    const v = this.cur;
-    if (v.fixlenBegin !== undefined) return true;
-    return sub === FixlenSubtype.String ? v.string !== undefined : v.blob !== undefined;
   }
 
   /**
@@ -769,21 +710,17 @@ export class DecoderState {
       return i;
     }
 
-    // §6.2.1: the receiver cap is decided by this word, before any payload is
-    // accepted — and only for a field someone is reading.
-    if (sub === FixlenSubtype.String && len > this.maxStringLen && this.fixlenIsRead(sub)) {
-      this.failLimit(`string length ${len} exceeds maxStringLen ${this.maxStringLen}`);
-    }
-    if (sub === FixlenSubtype.Blob && len > this.maxBlobLen && this.fixlenIsRead(sub)) {
-      this.failLimit(`blob length ${len} exceeds maxBlobLen ${this.maxBlobLen}`);
-    }
     this.fixSub = sub as FixlenSubtype;
     this.fixLen = len;
     this.fixOff = 0;
     // Announce the field at its LENGTH WORD, before any payload — the counterpart
-    // of arrayBegin at the count word. A receiver-side bound on the declared
-    // length is decidable here, and only here for a message that ends right after
-    // it (§5.2.3: INVALID over INCOMPLETE).
+    // of arrayBegin at the count word. This is the enforcement point §6.2.1 names
+    // for a receiver cap on the declared length, and generated code compares its
+    // cap inside this very callback: nothing below has run yet, so a rejection
+    // costs no allocation, and only a field the visitor declares a callback for
+    // is reached at all (a skipped field is never capped). It is decidable here,
+    // and only here for a message that ends right after the word (§5.2.3: INVALID
+    // over INCOMPLETE).
     this.cur.fixlenBegin?.(this.id, this.fixSub, len);
     if (len === 0) {
       // Still one delivery, so a zero-length payload is announced exactly like

@@ -44,9 +44,23 @@
  * `LIMIT_EXCEEDED`, a policy rejection on well-formed bytes. "They **MUST NOT** be
  * applied to a field the schema already bounds", so the caps are exclusive with
  * the bounds and never additive.
+ *
+ * **Every bound is a required argument, and none of them has a default** (§6.2.1).
+ * The comparison runs here; the *number* never originates here. A corelib "**MUST
+ * NOT** hold a limit of its own, **MUST NOT** supply a default for one it was not
+ * given, **MUST NOT** read an omitted argument as *unlimited*, and **MUST NOT**
+ * clamp to one", and a format ceiling (§6.2) reached because no cap was stated "is
+ * the **format's** bound, not a receiver cap, and a port **MUST NOT** present it as
+ * one". These constructors used to default `receiverCap` to `ARRAY_MAX` and
+ * `receiverElemMax` to `FIXLEN_MAX`, which did exactly that: they reported
+ * `LIMIT_EXCEEDED` against a ceiling nobody configured. The defaults are gone and
+ * the arguments are required — §6.2.1's "strictest form, and the recommended one".
+ * The *schema* bounds beside them (`cap`, `elemMax`) are required too, with
+ * {@link UNBOUNDED} as the explicit "the schema declared none" spelling: an absent
+ * schema bound is a fact about the schema, which only the caller knows.
  */
 
-import { ARRAY_MAX, FIXLEN_MAX, FixlenSubtype } from "../constants.js";
+import { FixlenSubtype } from "../constants.js";
 import { invalidMsgError, limitExceededError } from "../errors.js";
 import type { PayloadAcc } from "./acc.js";
 import { decodeUtf8 } from "./text.js";
@@ -54,8 +68,16 @@ import { decodeUtf8 } from "./text.js";
 /** Shared placeholder for a gap in a {@link BlobSeq}; zero-length, so sharing one is safe. */
 const NO_BYTES = new Uint8Array(0);
 
-/** No *schema* bound — what `cap` / `elemMax` take for an array or element the schema left open (§7.2). */
-const UNBOUNDED = -1;
+/**
+ * No *schema* bound — what `cap` / `elemMax` take for an array or element the
+ * schema left open (§7.2), so the receiver cap beside them governs instead.
+ *
+ * Exported because the schema bounds are required arguments with no default: an
+ * absent one is a fact about the **schema**, which only generated code knows, and
+ * §6.2.1's ban on a codec defaulting a bound is easiest to keep honest when every
+ * bound has to be spelled. This is the spelling for "there is none".
+ */
+export const UNBOUNDED = -1;
 
 /**
  * The slots of a wrapper-sequence array: the index rules of MESSAGE_SPEC §5.1 and
@@ -70,24 +92,23 @@ const UNBOUNDED = -1;
  * @param out The destination array; grown to `id + 1` as elements arrive.
  * @param def The element default, written into a gap and into a reserved slot.
  * @param cap The schema `count` as an index capacity: `id >= cap` is `INVALID`
- * (§7.1) — a statement about validity. `-1` for an array the schema left open,
- * where `receiverCap` governs instead.
+ * (§7.1) — a statement about validity. Pass {@link UNBOUNDED} (`-1`) for an array
+ * the schema left open, where `receiverCap` governs instead.
  * @param name The schema field name, used only in a rejection message.
  * @param receiverCap The receiver-side index cap for a schema-unbounded array
  * (§6.2.1): `id >= receiverCap` is `LIMIT_EXCEEDED`, a policy rejection. There is
  * no unlimited setting — a wrapper array announces no count, so the index is the
- * only place a receiver can bound it. It defaults to {@link ARRAY_MAX}, the
- * format ceiling: §6.2.1 puts the *number* in generated code, so a helper
- * constructed without one falls back to the widest value that is still a limit
- * rather than to one this port invented.
+ * only place a receiver can bound it. **Required, with no default**: the number is
+ * generated code's, and falling back to `ARRAY_MAX` would report a policy
+ * rejection against a format ceiling nobody configured (§6.2.1).
  */
 export class ElementSeq<T> {
   constructor(
     readonly out: T[],
     readonly def: T,
-    readonly cap: number = UNBOUNDED,
-    readonly name: string = "array",
-    readonly receiverCap: number = ARRAY_MAX,
+    readonly cap: number,
+    readonly name: string,
+    readonly receiverCap: number,
   ) {}
 
   /**
@@ -144,21 +165,24 @@ export class ElementSeq<T> {
  * @param acc The decoder's shared {@link PayloadAcc} — one per decode, since only
  * one payload is ever in flight.
  * @param cap The schema `count`, an index **capacity**: an element id at or above
- * it is `INVALID` (§7.1/§5.1) — a statement about validity. Leave it at `-1` for
- * an array the schema left unbounded, where `receiverCap` governs instead.
- * @param elemMax The element `maxlen` in bytes, or `-1` for an element the schema
- * left open, where `receiverElemMax` governs instead.
+ * it is `INVALID` (§7.1/§5.1) — a statement about validity. Pass
+ * {@link UNBOUNDED} (`-1`) for an array the schema left unbounded, where
+ * `receiverCap` governs instead.
+ * @param elemMax The element `maxlen` in bytes, or {@link UNBOUNDED} (`-1`) for an
+ * element the schema left open, where `receiverElemMax` governs instead.
  * @param name The schema field name, used only in the rejection message.
  * @param receiverCap The receiver-side index cap that applies **only** when the
  * schema left the array unbounded (§6.2.1): exceeding it is `LIMIT_EXCEEDED`, a
  * policy rejection, not `INVALID`. There is no unlimited setting — a wrapper array
  * announces no count, so the index is the only place a receiver can bound it.
+ * **Required, with no default** (§6.2.1).
  * @param receiverElemMax The receiver-side `max_dyn_string_len` for an element the
  * schema left unbounded (§6.2.1), checked at the length word and answered with
  * `LIMIT_EXCEEDED`. A wrapper array's `string` elements never reach the generated
- * visitor — their length words come here — so this is where that cap belongs
- * (corelib-ts#164). Defaults to {@link FIXLEN_MAX}, the format ceiling — finite,
- * as §6.2.1 admits no unset state, and not a number this port invented.
+ * visitor — their length words come here — so this is where that cap belongs, and
+ * it is why the decoder needs no module-wide limit object at all. **Required, with
+ * no default**: `FIXLEN_MAX` is the format's bound, not a receiver cap, and §6.2.1
+ * forbids presenting it as one.
  */
 export class StringSeq {
   /** The index rules and both index bounds, shared with every other element kind. */
@@ -167,11 +191,11 @@ export class StringSeq {
   constructor(
     readonly out: string[],
     readonly acc: PayloadAcc,
-    readonly cap: number = UNBOUNDED,
-    readonly elemMax: number = UNBOUNDED,
-    readonly name: string = "array",
-    readonly receiverCap: number = ARRAY_MAX,
-    readonly receiverElemMax: number = FIXLEN_MAX,
+    readonly cap: number,
+    readonly elemMax: number,
+    readonly name: string,
+    readonly receiverCap: number,
+    readonly receiverElemMax: number,
   ) {
     this.slots = new ElementSeq(out, "", cap, name, receiverCap);
   }
@@ -246,14 +270,15 @@ export class StringSeq {
  *
  * @param out The destination, placed at `out[id]`.
  * @param acc The decoder's shared {@link PayloadAcc}.
- * @param cap The schema `count` as an index capacity, or `-1` for unbounded.
- * @param elemMax The element `maxlen` in bytes, or `-1` for an element the schema
- * left open, where `receiverElemMax` governs instead.
+ * @param cap The schema `count` as an index capacity, or {@link UNBOUNDED} (`-1`)
+ * for unbounded.
+ * @param elemMax The element `maxlen` in bytes, or {@link UNBOUNDED} (`-1`) for an
+ * element the schema left open, where `receiverElemMax` governs instead.
  * @param name The schema field name, used only in the rejection message.
  * @param receiverCap The receiver-side index cap for a schema-unbounded array
- * (§6.2.1) — see {@link StringSeq}.
+ * (§6.2.1) — see {@link StringSeq}. Required, with no default.
  * @param receiverElemMax The receiver-side `max_dyn_blob_len` for a schema-unbounded
- * element (§6.2.1) — see {@link StringSeq}.
+ * element (§6.2.1) — see {@link StringSeq}. Required, with no default.
  */
 export class BlobSeq {
   /** The index rules and both index bounds, shared with every other element kind. */
@@ -262,11 +287,11 @@ export class BlobSeq {
   constructor(
     readonly out: Uint8Array[],
     readonly acc: PayloadAcc,
-    readonly cap: number = UNBOUNDED,
-    readonly elemMax: number = UNBOUNDED,
-    readonly name: string = "array",
-    readonly receiverCap: number = ARRAY_MAX,
-    readonly receiverElemMax: number = FIXLEN_MAX,
+    readonly cap: number,
+    readonly elemMax: number,
+    readonly name: string,
+    readonly receiverCap: number,
+    readonly receiverElemMax: number,
   ) {
     this.slots = new ElementSeq(out, NO_BYTES, cap, name, receiverCap);
   }

@@ -31,7 +31,6 @@ import {
   SofabError,
   SofabErrorCode,
   decode,
-  type DecodeLimits,
   type Visitor,
 } from "../src/index.js";
 
@@ -51,17 +50,29 @@ const HDR = 0x05;
 
 /**
  * A generated-layer stand-in for `array<fp32, count=N>`: it applies the schema
- * bound where the corelib hands it the count — which is the whole point of the
- * test, since for a fixlen array that is after the element word.
+ * bound — and, for a schema-unbounded array, the receiver cap (§6.2.1; the codec
+ * holds neither) — where the corelib hands it the count, which is the whole point
+ * of the test, since for a fixlen array that is after the element word.
  */
-function boundedFp32(schemaCount?: number): Visitor {
+function boundedFp32(schemaCount?: number, receiverCap?: number): Visitor {
   return {
     arrayBegin(_id, kind, count) {
       if (kind !== ArrayKind.Fp32) return; // §7.3: a contradicting element type is skipped
-      if (schemaCount !== undefined && count > schemaCount) {
+      if (schemaCount !== undefined) {
+        // A schema bound and a receiver cap are exclusive (§6.2.1): where the
+        // schema declares one, it governs and its violation is INVALID.
+        if (count > schemaCount) {
+          throw new SofabError(
+            SofabErrorCode.InvalidMsg,
+            `element count ${count} above schema count ${schemaCount}`,
+          );
+        }
+        return;
+      }
+      if (receiverCap !== undefined && count > receiverCap) {
         throw new SofabError(
-          SofabErrorCode.InvalidMsg,
-          `element count ${count} above schema count ${schemaCount}`,
+          SofabErrorCode.LimitExceeded,
+          `element count ${count} above the receiver cap ${receiverCap}`,
         );
       }
     },
@@ -69,8 +80,8 @@ function boundedFp32(schemaCount?: number): Visitor {
 }
 
 /** One-shot decode of `buf` against a schema-bounded fp32 array. */
-function oneShot(buf: Uint8Array, schemaCount?: number, limits?: DecodeLimits): SofabErrorCode {
-  return codeOf(() => decode(buf, boundedFp32(schemaCount), limits));
+function oneShot(buf: Uint8Array, schemaCount?: number, receiverCap?: number): SofabErrorCode {
+  return codeOf(() => decode(buf, boundedFp32(schemaCount, receiverCap)));
 }
 
 /**
@@ -139,26 +150,42 @@ describe("fixlen array: the schema count is applied after the element word (§4.
     expect(oneShot(Uint8Array.of(HDR, 0x05, 0x22), 2)).toBe(SofabErrorCode.InvalidMsg);
   });
 
-  // The *format* ceiling and the *receiver* cap keep firing at the count word,
-  // before any allocation — §4.8.1 ("whatever the subtype turns out to be") and
-  // §6.2.1. Both are asserted on input truncated inside the element word, which is
-  // exactly where the schema bound must no longer fire.
+  // The *format* ceiling still fires at the count word, before any allocation —
+  // §4.8.1's "whatever the subtype turns out to be" — and is asserted on input
+  // truncated inside the element word, which is exactly where the schema bound
+  // must no longer fire. The *receiver* cap now sits beside the schema bound, in
+  // the visitor, so it moves with it: §6.2.1 requires it "before the allocation it
+  // is meant to prevent", and `arrayBegin` is still before the first element.
   it("still enforces ARRAY_MAX at the count word", () => {
     // 0x80808080 0x08 → 2^31, one past ARRAY_MAX; element word cut.
     const buf = Uint8Array.of(HDR, 0x80, 0x80, 0x80, 0x80, 0x08, 0x80);
     expect(oneShot(buf, 2)).toBe(SofabErrorCode.InvalidMsg);
   });
 
-  it("still enforces maxArrayCount at the count word (unbounded field)", () => {
+  it("enforces a receiver cap on an unbounded field, before any element", () => {
     // The receiver cap applies to a schema-UNBOUNDED array (§6.2.1), so this reads
-    // without a schema count. It still fires at the count word, before the element
-    // word arrives.
-    const buf = Uint8Array.of(HDR, 0x05, 0x80);
-    expect(oneShot(buf, undefined, { maxArrayCount: 2 })).toBe(SofabErrorCode.LimitExceeded);
+    // without a schema count. A whole fixlen array header: count 5, fp32 element
+    // word, and no element bytes at all.
+    const buf = Uint8Array.of(HDR, 0x05, 0x20); // (4 << 3) | 0 -> fp32, 4 bytes
+    expect(oneShot(buf, undefined, 2)).toBe(SofabErrorCode.LimitExceeded);
     // With a schema bound in play the cap is out of the picture for this field:
-    // the count is within the schema bound, so the verdict is decided by the
-    // bytes — here the truncated element word, INCOMPLETE.
-    expect(oneShot(buf, 8, { maxArrayCount: 8 })).toBe(SofabErrorCode.Incomplete);
+    // the two are exclusive, and the count is within the bound.
+    expect(oneShot(buf, 8, 2)).toBe(SofabErrorCode.Incomplete);
+  });
+
+  it("a cap on a fixlen array waits for the element word, and that is in order", () => {
+    // A fixlen array's element kind is unknown until the element word (§4.8), so
+    // `arrayBegin` — the callback that holds the cap — cannot be raised at the
+    // count word. Truncating inside the element word therefore yields INCOMPLETE
+    // rather than a cap rejection, and that is conformant: §6.2.1 requires the
+    // check "before the allocation it is meant to prevent", and no element has
+    // been delivered. Only INVALID has precedence over INCOMPLETE (§5.2.3); a cap
+    // rejection is a policy answer on well-formed bytes and has none.
+    const cut = Uint8Array.of(HDR, 0x05, 0x80); // count 5, element word truncated
+    expect(oneShot(cut, undefined, 2)).toBe(SofabErrorCode.Incomplete);
+    // The format ceiling, which the codec does own, still fires one word earlier.
+    const overMax = Uint8Array.of(HDR, 0x80, 0x80, 0x80, 0x80, 0x08, 0x80);
+    expect(oneShot(overMax, undefined, 2)).toBe(SofabErrorCode.InvalidMsg);
   });
 
   it("holds for an fp64 array as well", () => {

@@ -84,7 +84,7 @@ like an unknown id, the destination is left untouched and the decode stays
 `INCOMPLETE` means the bytes merely ended *inside* a field, and is reported by
 what `feed()` returns rather than thrown — there is no finish/finalize step.
 `LIMIT_EXCEEDED` is neither: it is a receiver-local *policy* rejection, a field
-larger than a cap **you** configured (see [Decode limits](#decode-limits)).
+larger than a cap **you** configured (see [Receiver limits](#receiver-limits)).
 
 ### Serialize
 
@@ -265,9 +265,9 @@ any kind fires inside it, a scope opened within it is never offered either, and 
 
 A declined subtree is still parsed — a sequence is framed by markers rather than by
 a length, so its end has to be found — but nothing is decoded into existence for
-it, and the caps in `DecodeLimits` do not fire. Format ceilings (`ARRAY_MAX`,
-`FIXLEN_MAX`, `MAX_DEPTH`, the varint bound) apply inside a declined subtree exactly
-as outside it.
+it, and no receiver cap fires inside it: the callback that would have compared one
+is never called. Format ceilings (`ARRAY_MAX`, `FIXLEN_MAX`, `MAX_DEPTH`, the varint
+bound) apply inside a declined subtree exactly as outside it.
 
 ### Deserialize stream
 
@@ -326,11 +326,11 @@ try {
 is.status(); // INVALID — never COMPLETE, never INCOMPLETE
 ```
 
-A receiver-side cap (`LIMIT_EXCEEDED`, see [Decode limits](#decode-limits)) is
-terminal in the same way — every further `feed` re-throws it — but it is **not** the
-`INVALID` outcome: the bytes are well-formed and decode under a looser cap, so
-`status()` never answers `INVALID` for it. It is read off the error channel, not
-from `status()`.
+A receiver-side cap (`LIMIT_EXCEEDED`, see [Receiver limits](#receiver-limits)) is
+**not** the `INVALID` outcome and never latches as one: the bytes are well-formed and
+decode under a looser cap, so `status()` never answers `INVALID` for it. It is read
+off the error channel — it is thrown out of `feed` by the handler that compared the
+cap — not from `status()`.
 
 ### 64-bit values without `bigint`
 
@@ -616,66 +616,81 @@ Who owns the bytes:
   (index bound, gap fill, last-write-wins); `elementsEqual` is the array form of the
   omit-if-default test an encoder applies before writing a field.
 
-### Decode limits
+### Receiver limits
 
-Every decoder carries receiver-side caps, and there is no unset state and no
-unlimited mode (§6.2.1): a field the schema leaves unbounded is still bounded by the
-receiver. An omitted option takes the format ceiling it bounds rather than switching
-the cap off, and `Infinity`, a negative value, a fractional one and anything above
-the ceiling are refused with `ARGUMENT`.
+**This corelib holds none, by design.** A field the schema leaves unbounded is still
+bounded by the receiver — CORELIB_PLAN §6.2.1 admits no unset state and no unlimited
+mode — but the *numbers* belong to generated code, which knows the schema and the
+deployment, and §6.2.1 is explicit that a codec
 
-| cap | default | bounds |
+> **MUST NOT** hold a limit of its own, **MUST NOT** supply a default for one it was
+> not given, **MUST NOT** read an omitted argument as *unlimited*, and **MUST NOT**
+> clamp to one
+
+and that a format ceiling reached because no cap was stated
+
+> is the **format's** bound, not a receiver cap, and a port **MUST NOT** present it
+> as one.
+
+So `decode(bytes, visitor)` and `new IStream(visitor)` take no limits argument. Up to
+v0.10.0 they took a `DecodeLimits` whose absent members fell back to `ARRAY_MAX` /
+`FIXLEN_MAX`; that object is gone, along with the `LIMIT_EXCEEDED` rejections it
+raised against ceilings nobody had configured.
+
+| the cap | who states it | who compares it |
 |---|---|---|
-| `maxArrayCount` | `ARRAY_MAX` = 2,147,483,647 | elements in a schema-unbounded array |
-| `maxStringLen` | `FIXLEN_MAX` = 2,147,483,647 | bytes of a schema-unbounded `string` |
-| `maxBlobLen` | `FIXLEN_MAX` = 2,147,483,647 | bytes of a schema-unbounded `blob` |
+| `max_dyn_array_count` on an array field | generated code | its own `arrayBegin` |
+| `max_dyn_string_len` / `max_dyn_blob_len` on a `string` / `blob` field | generated code | its own `fixlenBegin` |
+| the element **index** of a wrapper array | generated code | `StringSeq` / `BlobSeq` / `ElementSeq`, from `receiverCap` |
+| the element **byte length** of a wrapper array | generated code | `StringSeq` / `BlobSeq`, from `receiverElemMax` |
 
-The numbers belong to generated code, which knows the schema and the deployment;
-§6.2.1 says the codec "never invents a limit of its own". So the fallback is the
-widest value that is still a limit — the ceiling above which the count or length is
-already `INVALID` — and not a number chosen here. A decoder built without limits is
-bounded exactly where the format bounds it; pass your own to bound it tighter.
+§6.2.1 permits the comparison to run inside the corelib — "A corelib **MAY** take a
+limit as an argument and perform the check itself" — and the collectors do exactly
+that, for the one shape a visitor cannot see: a wrapper array's element length words
+go to the collector, never to the generated visitor. Every one of their bounds is a
+**required** constructor argument with no default, the schema halves included
+(`UNBOUNDED`, `-1`, is the explicit "the schema declared none"):
 
 ```ts
-const limits = { maxArrayCount: 65536, maxStringLen: 1 << 20, maxBlobLen: 1 << 20 };
-decode(bytes, visitor, limits);       // one-shot
-new IStream(visitor, limits);         // streaming
+//              out, acc,          count, maxlen, name,   receiverCap, receiverElemMax
+new StringSeq(  out, new PayloadAcc(), UNBOUNDED, UNBOUNDED, "tags", 65_536, 1 << 20);
+new BlobSeq(    out, new PayloadAcc(), 8,         4096,      "parts", 65_536, 1 << 20);
+new ElementSeq( out, defaultElem,      UNBOUNDED, "rows",   65_536);
 ```
 
-An over-limit array count or string / blob length is rejected at the field's count /
-length header — **before** the array is announced or any payload piece reaches the
-visitor — by throwing `SofabError` with code `SofabErrorCode.LimitExceeded`. The
-decoder rejects, never clamps. A rejection at a count or length word is terminal:
-the stream re-reports it from every later `feed` rather than resuming inside the
-abandoned field. It is **not** the `INVALID` outcome — the same bytes decode under a
-looser cap — so `status()` never reports `INVALID` for it; nor does it report
-anything else about it, since the three-valued outcome has no value for "valid, but
-more than I am configured to accept". Read a cap rejection where it is raised, off
-the error channel, not by polling `status()`.
+Each pair is **exclusive**, never additive (§6.2.1: a cap "**MUST NOT** be applied to
+a field the schema already bounds"): where the schema declared `count` / `maxlen`
+that bound governs and its violation is `INVALID_MSG`, a statement about *validity*;
+where it declared none the receiver cap governs and its violation is
+`LIMIT_EXCEEDED`, a *policy* rejection on well-formed bytes.
 
-A cap applies **only to a field you read**. A limit bounds an allocation, and a
-field the visitor steps over allocates nothing — so a decode that walks past an
-over-cap field it was never going to read stays `COMPLETE` (§6.2.1). On this flat
-visitor that intent is spelled by which callbacks you declare: a `string` field is
-read if you declare `string` or `fixlenBegin`, an array if you declare `arrayBegin`
-or the element callback for its kind, and a whole subtree is skipped by answering
-`false` from `sequenceBegin`. Declare none of them and the bytes are consumed
-uncapped, because nothing was ever handed to you. The **format ceilings** are not
-yours to waive this way: a count above `ARRAY_MAX` or a length above `FIXLEN_MAX`
-stays `INVALID` whether anyone reads the field.
+**What this decoder still owes the layer that holds the numbers** is the enforcement
+point §6.2.1 requires — the count / length header, before the allocation the cap
+exists to prevent, and behind the MESSAGE_SPEC §7.3 tag test:
 
-A cap applies **only to a field the schema leaves unbounded**. Where the schema
-declares a `count` / `maxlen`, that bound governs and an over-bound value is
-`INVALID_MSG`, never `LimitExceeded`. This decoder is driven by wire type and never
-learns a schema, so the split is made where the schema is known: generated code takes
-the declared size from `fixlenBegin` / `arrayBegin` — which carry it before any
-payload or element arrives — and configures caps that do not cut across its own
-declarations. `StringSeq` / `BlobSeq` / `ElementSeq` take both, on both axes: the
-schema `count` and a receiver index cap, and the element `maxlen` and a receiver
-element-length cap (`receiverElemMax`) — a wrapper array's `string` / `blob` length
-words go to the collector, never to the generated visitor, so that is where the
-element's cap belongs. Each pair is exclusive: the schema half where the schema
-declared one, the receiver half where it did not.
+* `arrayBegin(id, kind, count)` is raised at the **count word**, before any element
+  is delivered (for a fixlen array, at its element-length word — the element kind is
+  unknown until then, and still before any element);
+* `fixlenBegin(id, subtype, total)` is raised at the **length word**, before any
+  payload piece;
+* both carry the number a destination gets sized from, so a rejection there costs no
+  allocation at all. Reject, never clamp: materialising `limit` elements where the
+  wire said more is data corruption wearing a safety jacket.
+
+A cap therefore applies **only to a field you read**, and that falls out of the
+structure rather than needing a rule: a field the visitor steps over never reaches
+the callback that holds the number, so a decode that walks past an over-cap field it
+was never going to read stays `COMPLETE` (§6.2.1's "a skipped field is never
+capped"). The **format ceilings** are not yours to waive this way: a count above
+`ARRAY_MAX` or a length above `FIXLEN_MAX` stays `INVALID` whether anyone reads the
+field, because it bounds what the *wire* may express.
+
+A cap rejection is raised by throwing `SofabError` with code
+`SofabErrorCode.LimitExceeded`, which propagates out of `feed` / `decode`. It is
+**not** the `INVALID` outcome and is never folded into one — the same bytes decode
+under a looser cap — so `status()` never reports `INVALID` for it; nor anything else
+about it, since the three-valued outcome has no value for "valid, but more than I am
+configured to accept". Read it off the error channel, not by polling `status()`.
 
 ## Build & test
 

@@ -22,6 +22,7 @@ import { describe, expect, it } from "vitest";
 import {
   ArrayKind,
   DecodeStatus,
+  FixlenSubtype,
   IStream,
   MAX_DEPTH,
   OStream,
@@ -71,8 +72,8 @@ function message(): Uint8Array {
 }
 
 /** Feed in `size`-byte chunks (0 = one feed), returning the outcome. */
-function feed(bytes: Uint8Array, size: number, v: Visitor, limits?: ConstructorParameters<typeof IStream>[1]): DecodeStatus {
-  const is = new IStream(v, limits);
+function feed(bytes: Uint8Array, size: number, v: Visitor): DecodeStatus {
+  const is = new IStream(v);
   try {
     if (size <= 0) is.feed(bytes);
     else for (let i = 0; i < bytes.length; i += size) is.feed(bytes.subarray(i, i + size));
@@ -145,24 +146,32 @@ describe("a skipped subtree and the two kinds of bound", () => {
   // The reader's own policy: it bounds what this reader is handed, and a
   // skipped scope hands it nothing. corelib-dart takes the same position —
   // its cap sits inside `if (read)`, and `_decideRead` is false while skipping.
-  const CAPS = { maxStringLen: 4, maxBlobLen: 2, maxArrayCount: 1 };
-  // It declines *sequences*, and reads every field kind a cap bounds. Both
-  // halves matter: §6.2.1 caps only a field that is read, so without the
-  // handlers the tests below would pass for the wrong reason — nothing is
-  // capped anywhere — and the declined-scope rule would go unexercised.
+  //
+  // The caps are the reader's own, held and compared by the reader — the codec
+  // holds none (§6.2.1). It declines *sequences* and caps every field kind it is
+  // handed. Both halves matter: without the capping callbacks the tests below
+  // would pass for the wrong reason — nothing is capped anywhere — and the
+  // declined-scope rule would go unexercised.
+  const CAPS = { string: 4, blob: 2, array: 1 };
   const skipper: Visitor = {
     sequenceBegin: () => false,
-    fixlenBegin: () => undefined,
-    arrayBegin: () => undefined,
+    fixlenBegin(_id, sub, total) {
+      if (sub !== FixlenSubtype.String && sub !== FixlenSubtype.Blob) return;
+      const cap = sub === FixlenSubtype.String ? CAPS.string : CAPS.blob;
+      if (total > cap) throw new SofabError(SofabErrorCode.LimitExceeded, "over cap");
+    },
+    arrayBegin(_id, _kind, count) {
+      if (count > CAPS.array) throw new SofabError(SofabErrorCode.LimitExceeded, "over cap");
+    },
   };
 
   it("does not apply the receiver caps inside it (contiguous)", () => {
-    expect(() => decode(message(), skipper, CAPS)).not.toThrow();
+    expect(() => decode(message(), skipper)).not.toThrow();
   });
 
   for (const size of CHUNKINGS) {
     it(`does not apply the receiver caps inside it at ${size}-byte chunks`, () => {
-      expect(feed(message(), size, skipper, CAPS)).toBe(DecodeStatus.Complete);
+      expect(feed(message(), size, skipper)).toBe(DecodeStatus.Complete);
     });
   }
 
@@ -170,7 +179,7 @@ describe("a skipped subtree and the two kinds of bound", () => {
     const os = growingOStream();
     os.writeString(1, "far too long");
     try {
-      decode(os.bytes().slice(), skipper, CAPS);
+      decode(os.bytes().slice(), skipper);
       expect.unreachable("the cap should have fired on a field nobody skipped");
     } catch (e) {
       expect((e as SofabError).code).toBe(SofabErrorCode.LimitExceeded);

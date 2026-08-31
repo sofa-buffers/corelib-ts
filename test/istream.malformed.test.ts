@@ -34,19 +34,12 @@ function bytes(...n: number[]): Uint8Array {
   return Uint8Array.from(n);
 }
 
-/**
- * Receiver caps raised to the format ceilings.
- *
- * §6.2.1 makes the caps mandatory and finite, so a `FIXLEN_MAX`-sized length word
- * is a *capacity* rejection under the port's defaults. These tests are about the
- * FORMAT ceiling and about truncation, so they run with the caps opened to the
- * largest the wire can express — where the only thing left to reject is the bytes.
- */
-const WIDE_OPEN = {
-  maxArrayCount: 0x7fff_ffff,
-  maxStringLen: 0x7fff_ffff,
-  maxBlobLen: 0x7fff_ffff,
-};
+// No receiver cap appears anywhere in this file, and none is needed: the codec
+// holds none (§6.2.1) and these visitors state none, so the only thing left to
+// reject is the bytes — which is what a file about the FORMAT ceiling and about
+// truncation wants. Before §6.2.1 was honoured, every decode here had to pass a
+// limits object raised to the format ceilings, to stop the codec's own defaulted
+// caps from answering a capacity rejection to a malformed-input question.
 
 /** Run `fn` and return the `SofabError` code it throws, or `"COMPLETE"`. */
 function codeOf(fn: () => void): string {
@@ -61,7 +54,7 @@ function codeOf(fn: () => void): string {
 
 /** Feed `msg` to a fresh `IStream` in `size`-byte chunks; report the outcome. */
 function feedInChunks(msg: Uint8Array, size: number, visitor: Visitor = {}): string {
-  const is = new IStream(visitor, WIDE_OPEN);
+  const is = new IStream(visitor);
   try {
     for (let i = 0; i < msg.length; i += size) {
       is.feed(msg.subarray(i, Math.min(i + size, msg.length)));
@@ -94,7 +87,7 @@ describe("array<fixlen> element word must be fp32/4 or fp64/8 (§4.8)", () => {
 
   it.each(cases)("%s is INVALID on the whole-buffer paths too", (_name, count, word) => {
     const msg = bytes(0x0d, count, word, 0, 0, 0, 0, 0, 0, 0, 0);
-    expect(codeOf(() => decode(msg, {}, WIDE_OPEN))).toBe(SofabErrorCode.InvalidMsg);
+    expect(codeOf(() => decode(msg, {}))).toBe(SofabErrorCode.InvalidMsg);
   });
 
   it("accepts the two legal element words as the control", () => {
@@ -136,7 +129,7 @@ describe("a fixlen length word above FIXLEN_MAX is INVALID, not INCOMPLETE (§4.
     ["blob", 3],
   ])("%s: the over-range word is INVALID on every surface", (_name, sub) => {
     const msg = fixlenHeader(TOO_BIG, sub);
-    expect(codeOf(() => decode(msg, {}, WIDE_OPEN))).toBe(SofabErrorCode.InvalidMsg);
+    expect(codeOf(() => decode(msg, {}))).toBe(SofabErrorCode.InvalidMsg);
     expect(feedInChunks(msg, msg.length)).toBe(SofabErrorCode.InvalidMsg);
     expect(feedInChunks(msg, 1)).toBe(SofabErrorCode.InvalidMsg);
   });
@@ -148,7 +141,7 @@ describe("a fixlen length word above FIXLEN_MAX is INVALID, not INCOMPLETE (§4.
     // The control that makes the case above mean something: the same shape one
     // count lower is a representable field whose payload merely has not arrived.
     const msg = fixlenHeader(AT_MAX, sub);
-    expect(codeOf(() => decode(msg, {}, WIDE_OPEN))).toBe(SofabErrorCode.Incomplete);
+    expect(codeOf(() => decode(msg, {}))).toBe(SofabErrorCode.Incomplete);
     expect(feedInChunks(msg, 1)).toBe(DecodeStatus.Incomplete);
   });
 });
@@ -164,7 +157,7 @@ describe("a varint past the 64-bit bound is INVALID wherever the chunks fall (§
     for (let size = 1; size <= msg.length; size++) {
       expect(feedInChunks(msg, size)).toBe(SofabErrorCode.InvalidMsg);
     }
-    expect(codeOf(() => decode(msg, {}, WIDE_OPEN))).toBe(SofabErrorCode.InvalidMsg);
+    expect(codeOf(() => decode(msg, {}))).toBe(SofabErrorCode.InvalidMsg);
   });
 
   it("same verdict at every single split point of the 11-byte varint", () => {
@@ -208,7 +201,7 @@ describe("a sequence still open at the end of the input is INCOMPLETE (§4.9/§7
   ];
 
   it.each(cases)("%s", (_name, msg) => {
-    expect(codeOf(() => decode(msg, {}, WIDE_OPEN))).toBe(SofabErrorCode.Incomplete);
+    expect(codeOf(() => decode(msg, {}))).toBe(SofabErrorCode.Incomplete);
     expect(feedInChunks(msg, msg.length)).toBe(DecodeStatus.Incomplete);
     expect(feedInChunks(msg, 1)).toBe(DecodeStatus.Incomplete);
   });
