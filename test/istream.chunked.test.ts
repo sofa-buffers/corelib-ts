@@ -14,9 +14,11 @@ import {
   SofabErrorCode, growingOStream } from "../src/index.js";
 import { bytesToHex, hexToBytes } from "./helpers/hex.js";
 import { TranscodeVisitor } from "./helpers/recording-visitor.js";
-import { loadVectors } from "./helpers/vectors.js";
+import { reportingTally } from "./helpers/vector-tally.js";
+import { loadVectors, missingCapabilities } from "./helpers/vectors.js";
 
 const vectors = loadVectors();
+const tally = reportingTally("chunked");
 
 function feedInChunks(bytes: Uint8Array, chunkSize: number): string {
   const out = growingOStream();
@@ -35,29 +37,42 @@ function feedInChunks(bytes: Uint8Array, chunkSize: number): string {
 
 describe("chunked feeding", () => {
   describe.each(vectors.map((v) => [v.name, v] as const))("%s", (_name, vector) => {
-    const bytes = hexToBytes(vector.serialized.hex);
+    const missing = missingCapabilities(vector);
+    if (missing.length > 0) tally.gatedOut(vector.name, missing);
 
-    it("decodes one byte at a time", () => {
-      expect(feedInChunks(bytes, 1)).toBe(vector.serialized.hex);
-    });
+    // A vector needing a feature this build cannot represent is *reported* as
+    // gated out, never dropped silently (`requires`, test_vectors_README.md).
+    // This port ships one full-featured profile, so nothing is ever gated.
+    describe.skipIf(missing.length > 0)("runs", () => {
+      const bytes = hexToBytes(vector.serialized.hex);
 
-    it("decodes in 7-byte chunks", () => {
-      expect(feedInChunks(bytes, 7)).toBe(vector.serialized.hex);
-    });
+      it("decodes one byte at a time", () => {
+        tally.vector(vector.name);
+        expect(feedInChunks(bytes, 1)).toBe(vector.serialized.hex);
+        tally.check();
+      });
 
-    // A chunk wider than the longest varint lets the decoder take its bulk
-    // path — whole varints read straight out of the chunk with no resume
-    // bookkeeping, and array elements drained without re-entering the state
-    // switch. The 1- and 7-byte sizes above can never reach it (both are
-    // narrower than VARINT_MAX_BYTES), so without this the fast route through
-    // the state machine would go unexercised while the slow one is covered
-    // twice.
-    it("decodes as a single whole-buffer chunk", () => {
-      expect(feedInChunks(bytes, Math.max(bytes.length, 1))).toBe(vector.serialized.hex);
-    });
+      it("decodes in 7-byte chunks", () => {
+        expect(feedInChunks(bytes, 7)).toBe(vector.serialized.hex);
+        tally.check();
+      });
 
-    it("decodes in 16-byte chunks", () => {
-      expect(feedInChunks(bytes, 16)).toBe(vector.serialized.hex);
+      // A chunk wider than the longest varint lets the decoder take its bulk
+      // path — whole varints read straight out of the chunk with no resume
+      // bookkeeping, and array elements drained without re-entering the state
+      // switch. The 1- and 7-byte sizes above can never reach it (both are
+      // narrower than VARINT_MAX_BYTES), so without this the fast route through
+      // the state machine would go unexercised while the slow one is covered
+      // twice.
+      it("decodes as a single whole-buffer chunk", () => {
+        expect(feedInChunks(bytes, Math.max(bytes.length, 1))).toBe(vector.serialized.hex);
+        tally.check();
+      });
+
+      it("decodes in 16-byte chunks", () => {
+        expect(feedInChunks(bytes, 16)).toBe(vector.serialized.hex);
+        tally.check();
+      });
     });
   });
 
@@ -88,6 +103,7 @@ describe("chunked feeding", () => {
         }
         is.status();
         expect(bytesToHex(out.bytes())).toBe(vector.serialized.hex);
+        tally.check();
       }
     });
   });
