@@ -30,7 +30,11 @@ export interface Vector {
   offset?: number;
   /** Optional capability tags; a full-featured build ignores them and runs all. */
   requires?: string[];
-  /** Optional field ids a receiver is expected to auto-skip while decoding. */
+  /**
+   * Optional field ids a receiver is expected to auto-skip while decoding — at
+   * **every** nesting level, and for any wire type, a whole nested sequence
+   * included. Fields are skipped only when this key is present.
+   */
   skip_ids?: number[];
   fields: Field[];
   serialized: { length: number; hex: string };
@@ -58,13 +62,131 @@ export interface Vector {
  * `serialized_sparse` test here is therefore not a coverage gap; a test for it
  * could only be written by re-implementing the message layer in the test.
  * `Vector` above intentionally does not declare the field.
+ *
+ * Every vector is normalized on the way out ({@link normalizeVector}): the
+ * index-like numbers — field ids, `skip_ids`, offsets, the serialized length —
+ * become `number`, values keep their exact 64-bit `bigint` fidelity, and
+ * anything that cannot be represented or that contradicts the vector's own
+ * columns throws instead of being quietly rounded or dropped.
  */
 export function loadVectors(): Vector[] {
+  const doc = readVectorFile() as unknown as { vectors: Vector[] };
+  return doc.vectors.map(normalizeVector);
+}
+
+/**
+ * Parse the shared file once per call.
+ *
+ * **No fixed-size limit anywhere in this loader.** JSON arrays become JS arrays
+ * and grow as long as the file says — a `skip_ids` list of any length, an array
+ * field of any element count, a payload of any size. Truncating one silently
+ * would leave the suite green while testing less than the vector claims (the
+ * `MAXSKIP` bug corelib-c-cpp#160 fixed), so the only bounds here are the
+ * *loud* ones in {@link asIndex} and {@link normalizeVector}: a value this
+ * runtime cannot represent exactly, or a vector whose own columns contradict
+ * each other, throws and fails the suite.
+ */
+function readVectorFile(): unknown {
   const path = fileURLToPath(new URL("../../assets/test_vectors.json", import.meta.url));
-  const doc = parseJsonWithBigInt(readFileSync(path, "utf8")) as unknown as {
-    vectors: Vector[];
+  return parseJsonWithBigInt(readFileSync(path, "utf8"));
+}
+
+/**
+ * Narrow one *index-like* JSON number — a field id, a count, a length, an
+ * offset — to a `number`.
+ *
+ * {@link parseJsonWithBigInt} is right for a vector's **values** (the file
+ * carries exact 64-bit literals) and wrong for everything that indexes: a
+ * `bigint` id never equals the `number` id the decoder reports, so a `Set` of
+ * ids built straight from the file silently matches nothing. That is precisely
+ * how the skip scenario can pass while skipping nothing, so the conversion
+ * happens here, once, at the loader boundary — and refuses loudly rather than
+ * rounding anything it cannot represent exactly.
+ */
+function asIndex(what: string, x: unknown): number {
+  if (typeof x === "bigint") {
+    if (x < 0n || x > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new Error(`${what}: ${x} is outside the exactly representable range`);
+    }
+    return Number(x);
+  }
+  if (typeof x === "number" && Number.isSafeInteger(x)) return x;
+  throw new Error(`${what}: expected an integer index, got ${String(x)}`);
+}
+
+/**
+ * Convert one raw vector into the shape the tests declare, checking on the way
+ * that nothing was dropped or rounded.
+ *
+ * Ids, offsets, lengths and `skip_ids` are narrowed to `number`; `value` /
+ * `values` are left exactly as the bigint-fidelity parser produced them. The
+ * `serialized` column is cross-checked against its own hex, so a payload that
+ * lost bytes anywhere between the generator and here fails the load instead of
+ * quietly shortening a vector.
+ */
+function normalizeVector(v: Vector, i: number): Vector {
+  const where = `vector ${v.name ?? `#${i}`}`;
+  const out: Vector = {
+    ...v,
+    fields: v.fields.map((f, k) =>
+      f.id === undefined ? f : { ...f, id: asIndex(`${where}.fields[${k}].id`, f.id) },
+    ),
+    serialized: {
+      length: asIndex(`${where}.serialized.length`, v.serialized.length),
+      hex: v.serialized.hex,
+    },
   };
-  return doc.vectors;
+  if (out.serialized.hex.length !== 2 * out.serialized.length) {
+    throw new Error(
+      `${where}: serialized.length ${out.serialized.length} does not match ` +
+        `${out.serialized.hex.length / 2} hex bytes`,
+    );
+  }
+  if (v.offset !== undefined) out.offset = asIndex(`${where}.offset`, v.offset);
+  if (v.skip_ids !== undefined) {
+    const ids = v.skip_ids.map((id, k) => asIndex(`${where}.skip_ids[${k}]`, id));
+    if (ids.length === 0) throw new Error(`${where}: skip_ids is present but empty`);
+    if (new Set(ids).size !== ids.length) throw new Error(`${where}: skip_ids has duplicates`);
+    out.skip_ids = ids;
+  }
+  return out;
+}
+
+/**
+ * The capability tags (`requires`, see `test_vectors_README.md`) this port can
+ * represent — **all of them**.
+ *
+ * The tags exist for harnesses that compile features out (`SOFAB_DISABLE_*`), so
+ * that a feature-reduced build runs the part of the matrix it can represent
+ * instead of dropping it whole. This library ships **one** profile with the whole
+ * wire format in it: there is no build flag that removes fixlen, arrays,
+ * sequences, fp64 or 64-bit values, so every vector is in scope and nothing is
+ * ever gated out. The set is still consulted per vector rather than assumed, so
+ * the day a reduced profile appears the gating is already in place — and an
+ * unknown tag is reported as unsupported rather than silently satisfied
+ * ({@link unknownCapabilityTags} turns that into a failing test).
+ */
+export const PORT_CAPABILITIES: ReadonlySet<string> = new Set([
+  "fixlen",
+  "array",
+  "sequence",
+  "fp64",
+  "int64",
+]);
+
+/** The `requires` tags of `v` this build cannot represent — empty here, by design. */
+export function missingCapabilities(v: { requires?: string[] }): string[] {
+  return (v.requires ?? []).filter((tag) => !PORT_CAPABILITIES.has(tag));
+}
+
+/**
+ * Every distinct `requires` tag used anywhere in `vectors` that this port does
+ * not know — empty for a file this port fully understands.
+ */
+export function unknownCapabilityTags(vectors: { requires?: string[] }[]): string[] {
+  const seen = new Set<string>();
+  for (const v of vectors) for (const tag of v.requires ?? []) seen.add(tag);
+  return [...seen].filter((tag) => !PORT_CAPABILITIES.has(tag)).sort();
 }
 
 /**
@@ -86,11 +208,11 @@ export interface InvalidUtf8Vector {
 }
 
 export function loadInvalidUtf8(): InvalidUtf8Vector[] {
-  const path = fileURLToPath(new URL("../../assets/test_vectors.json", import.meta.url));
-  const doc = parseJsonWithBigInt(readFileSync(path, "utf8")) as unknown as {
-    invalid_utf8?: InvalidUtf8Vector[];
-  };
-  return doc.invalid_utf8 ?? [];
+  const doc = readVectorFile() as unknown as { invalid_utf8?: InvalidUtf8Vector[] };
+  return (doc.invalid_utf8 ?? []).map((v, i) => ({
+    ...v,
+    id: asIndex(`invalid_utf8 ${v.name ?? `#${i}`}.id`, v.id),
+  }));
 }
 
 /**
@@ -133,10 +255,7 @@ export interface GrowthCase {
  * skips it and says so instead).
  */
 export function loadGrowthCases(): GrowthCase[] {
-  const path = fileURLToPath(new URL("../../assets/test_vectors.json", import.meta.url));
-  const doc = parseJsonWithBigInt(readFileSync(path, "utf8")) as unknown as {
-    sequence_growth?: GrowthCase[];
-  };
+  const doc = readVectorFile() as unknown as { sequence_growth?: GrowthCase[] };
   // The bigint-fidelity parser is right for a vector's *values* and wrong for its
   // ids, lengths and offsets: those index things, and index arithmetic on a
   // `bigint` throws the moment it meets a `number`. Narrow them here, once, and

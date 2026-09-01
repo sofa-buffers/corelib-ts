@@ -716,10 +716,18 @@ npm run smoke          # cross-runtime smoke test of the built bundle
 
 Tests live in `test/` as focused vitest suites, including `vectors.test.ts` (encode
 + decode every shared conformance vector), `istream.chunked.test.ts` (every vector
-fed one byte at a time), `heap-free-codec.test.ts` (no allocation primitive on a
-codec path, a flat heap over encode and decode, no view into a fed or one-shot
-buffer) and `pooled-decoder-state.test.ts` (a decode aborted at every cut point
+fed one byte at a time), `skip-ids.test.ts` (every vector that carries
+`skip_ids`, decoded by a receiver that ignores those ids at every nesting level —
+contiguous, one byte at a time, and split in two at every byte boundary),
+`heap-free-codec.test.ts` (no allocation primitive on a codec path, a flat heap
+over encode and decode, no view into a fed or one-shot buffer) and `pooled-decoder-state.test.ts` (a decode aborted at every cut point
 leaves nothing behind for the next one).
+
+The three vector-driven suites each print one summary line — `[vectors] 131
+vectors, none gated out by requires, 524 checks` — so a run says how much of the
+shared suite it actually executed, and a file that arrived truncated or a group
+gated out by `requires` shows up as a smaller number rather than as silence. This
+port compiles no feature out, so nothing is ever gated.
 
 `assets/test_vectors.json` carries three blocks and this port runs all three:
 `vectors`, `invalid_utf8`, and `sequence_growth` — the wrapper-array growth cases of
