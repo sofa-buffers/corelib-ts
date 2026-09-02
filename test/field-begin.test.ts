@@ -73,17 +73,19 @@ function statusOf(e: unknown): DecodeStatus {
 /** Feed `bytes` in `size`-byte chunks (0 = one feed), returning the outcome. */
 function feed(bytes: Uint8Array, size: number, visitor: Visitor): DecodeStatus {
   const is = new IStream(visitor);
+  // The outcome is what the last `feed` returned; a refusal arrives as a throw.
+  let st: DecodeStatus = DecodeStatus.Complete;
   try {
-    if (size <= 0) is.feed(bytes);
+    if (size <= 0) st = is.feed(bytes);
     else {
       for (let i = 0; i < bytes.length; i += size) {
-        is.feed(bytes.subarray(i, i + size));
+        st = is.feed(bytes.subarray(i, i + size));
       }
     }
   } catch (e) {
     return statusOf(e);
   }
-  return is.status();
+  return st;
 }
 
 /** One-shot push decode, reported as the three-valued outcome. */

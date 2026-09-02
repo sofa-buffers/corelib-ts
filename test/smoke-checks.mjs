@@ -142,9 +142,10 @@ export function runChecks(api, label) {
     const is = new IStream({});
     let last;
     for (let i = 0; i < bytes.length; i++) last = is.feed(bytes.subarray(i, i + 1));
-    // No end step: the status feed() returns *is* the answer (CORELIB_PLAN
-    // §5.2.4); status() re-reads the same value.
-    return last === "COMPLETE" && is.status() === "COMPLETE";
+    // No end step and no accessor: the status feed() returns *is* the answer
+    // (CORELIB_PLAN §5.2.4). An empty feed consumes nothing, so it hands back
+    // the same value — the only way to see it twice.
+    return last === "COMPLETE" && is.feed(new Uint8Array(0)) === "COMPLETE";
   })());
 
   return failures;

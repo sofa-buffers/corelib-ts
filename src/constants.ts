@@ -154,13 +154,17 @@ export const MAX_DEPTH = 255;
  * - `Invalid` — the bytes are malformed regardless of what follows. **Terminal**
  *   (CORELIB_PLAN §5.2): no later bytes can undo it.
  *
- * {@link IStream.feed} *returns* `Complete` or `Incomplete` while the stream is
- * healthy — the caller needs no end step (CORELIB_PLAN §6) — and
- * {@link IStream.status} re-reads that same value at any point. An `Invalid`
- * message throws from `feed` *and* latches there, so `status()` reports
- * `Invalid` from then on and every further `feed` re-throws without consuming
- * input. The one-shot {@link decode} — the same stream, fed once — signals
- * `Incomplete` and `Invalid` by throwing a {@link SofabError} whose `code` is
+ * **Each of the three leaves by exactly one channel.** {@link IStream.feed}
+ * *returns* `Complete` or `Incomplete` — that is the {@link FeedStatus} pair, and
+ * the caller needs no end step (CORELIB_PLAN §6). `Invalid` is never returned by
+ * anything: it is the name of the outcome the throw carries, a {@link SofabError}
+ * whose `code` is {@link SofabErrorCode.InvalidMsg}, and the verdict latches, so
+ * every further `feed` re-throws without consuming input. There is no accessor
+ * that re-reports any of the three, because a fact with two ways to learn it is a
+ * fact that can be learned two different ways.
+ *
+ * The one-shot {@link decode} — the same stream, fed once — signals `Incomplete`
+ * and `Invalid` by throwing a {@link SofabError} whose `code` is
  * {@link SofabErrorCode.Incomplete} or {@link SofabErrorCode.InvalidMsg}, and
  * `Complete` by returning normally.
  */
@@ -174,3 +178,17 @@ export const DecodeStatus = {
 } as const;
 /** A decode's terminal outcome: one of the {@link DecodeStatus} values. */
 export type DecodeStatus = (typeof DecodeStatus)[keyof typeof DecodeStatus];
+
+/**
+ * The two outcomes {@link IStream.feed} can *return* — `Complete` and
+ * `Incomplete`, the ones that leave a stream usable.
+ *
+ * `Invalid` is missing on purpose, and the type is the statement: this port puts
+ * a refusal on the error channel (CORELIB_PLAN §6.3's second option), so a
+ * malformed message throws rather than returning, and a caller switching on the
+ * return value has no unreachable arm to write. The refusal is not lost by being
+ * absent here — it arrives as a {@link SofabError} whose `code` says which
+ * refusal it was, which is more than the outcome triple can express: a
+ * `LimitExceeded` rejection has no value among the three at all.
+ */
+export type FeedStatus = typeof DecodeStatus.Complete | typeof DecodeStatus.Incomplete;

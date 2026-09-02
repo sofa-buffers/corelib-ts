@@ -402,8 +402,9 @@ describe("an element the schema left unbounded is bounded by the receiver too (Â
     const out: string[] = [];
     const is = new IStream(router(seq(out), FixlenSubtype.String));
     expect(codeOf(() => {
-      for (const b of cut) is.feed(Uint8Array.of(b));
-      return is.status();
+      let st = "";
+      for (const b of cut) st = is.feed(Uint8Array.of(b));
+      return st;
     })).toBe(SofabErrorCode.LimitExceeded);
   });
 

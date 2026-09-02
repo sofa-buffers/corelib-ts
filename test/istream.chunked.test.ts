@@ -25,11 +25,13 @@ function feedInChunks(bytes: Uint8Array, chunkSize: number): string {
   const is = new IStream(new TranscodeVisitor(out));
   // Every `feed` returns the outcome for the bytes consumed so far and needs no
   // end step (CORELIB_PLAN §6): on a whole vector the last one must say
-  // COMPLETE, at every chunk size, and the accessor must agree with it.
+  // COMPLETE, at every chunk size. An empty feed consumes nothing, so it must
+  // hand back the same value — the only way to re-read it, there being no
+  // accessor beside the call.
   let status: DecodeStatus = DecodeStatus.Complete;
   for (let i = 0; i < bytes.length; i += chunkSize) {
     status = is.feed(bytes.subarray(i, i + chunkSize));
-    expect(status).toBe(is.status());
+    expect(is.feed(new Uint8Array(0))).toBe(status);
   }
   expect(status).toBe(DecodeStatus.Complete);
   return bytesToHex(out.bytes());
@@ -101,7 +103,6 @@ describe("chunked feeding", () => {
           is.feed(bytes.subarray(i, i + take));
           i += take;
         }
-        is.status();
         expect(bytesToHex(out.bytes())).toBe(vector.serialized.hex);
         tally.check();
       }
@@ -130,7 +131,6 @@ describe("chunked feeding", () => {
             for (let i = 0; i < bytes.length; i += chunkSize) {
               is.feed(bytes.subarray(i, i + chunkSize));
             }
-            is.status();
           } catch (e) {
             if (!(e instanceof SofabError)) throw e;
             code = e.code;
@@ -146,10 +146,11 @@ describe("chunked feeding", () => {
       const bytes = Uint8Array.from([0x01, ...Array(9).fill(0x80)]);
       for (let chunkSize = 1; chunkSize <= bytes.length; chunkSize++) {
         const is = new IStream({});
+        let st: DecodeStatus = DecodeStatus.Complete;
         for (let i = 0; i < bytes.length; i += chunkSize) {
-          is.feed(bytes.subarray(i, i + chunkSize));
+          st = is.feed(bytes.subarray(i, i + chunkSize));
         }
-        expect(is.status(), `chunk size ${chunkSize}`).toBe(DecodeStatus.Incomplete);
+        expect(st, `chunk size ${chunkSize}`).toBe(DecodeStatus.Incomplete);
       }
     });
   });
@@ -161,7 +162,6 @@ describe("chunked feeding", () => {
     const is = new IStream(new TranscodeVisitor(out));
     is.feed(new Uint8Array(0));
     is.feed(os.bytes());
-    is.status();
     expect(bytesToHex(out.bytes())).toBe(bytesToHex(os.bytes()));
   });
 });

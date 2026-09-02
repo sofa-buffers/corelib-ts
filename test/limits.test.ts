@@ -97,7 +97,7 @@ function drainStream(buf: Uint8Array, visitor: Visitor): DecodeStatus {
 /** Feed a whole buffer to a streaming IStream one byte at a time. */
 function drainChunked(buf: Uint8Array, visitor: Visitor): DecodeStatus {
   const is = new IStream(visitor);
-  let last = is.status();
+  let last: DecodeStatus = DecodeStatus.Complete; // zero bytes end on a boundary
   for (let i = 0; i < buf.length; i++) last = is.feed(buf.subarray(i, i + 1));
   return last;
 }
@@ -235,13 +235,15 @@ describe("the enforcement point the codec owes generated code (§6.2.1)", () => 
     // §6.3: a cap rejection is a policy rejection of WELL-FORMED bytes and "MUST
     // NOT be reported as `InvalidMessage`". The stream must not latch INVALID
     // over it either — the same bytes decode under a looser cap.
+    // The code on the throw is the only carrier of the distinction, and it stays
+    // itself on every later call: a capped stream never starts saying INVALID.
     const is = new IStream(capping({ array: 4 }));
     expect(codeOf(() => is.feed(arrayOf(8)))).toBe(SofabErrorCode.LimitExceeded);
-    expect(is.status()).not.toBe(DecodeStatus.Invalid);
+    expect(codeOf(() => is.feed(new Uint8Array(0)))).toBe(SofabErrorCode.LimitExceeded);
     // The contrast that makes it a distinction rather than an accident.
     const bad = new IStream({});
     expect(codeOf(() => bad.feed(Uint8Array.of(0x02, 0x04)))).toBe(SofabErrorCode.InvalidMsg);
-    expect(bad.status()).toBe(DecodeStatus.Invalid);
+    expect(codeOf(() => bad.feed(new Uint8Array(0)))).toBe(SofabErrorCode.InvalidMsg);
   });
 
   it("a schema bound rejects as INVALID from the very same callback", () => {

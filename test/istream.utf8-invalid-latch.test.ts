@@ -13,11 +13,15 @@
  * This port validates UTF-8 outside the codec — legitimate under §6.4.5 — in the
  * `decodeUtf8` helper the caller calls from inside `Visitor.string`, which is the
  * port's own documented materialising pattern (`istream.ts` `Visitor.string`,
- * README "decode a string"). But that verdict is thrown *around*
- * `DecoderState.fail()` rather than through it, so `invalidReason` is never
- * latched: `status()` answers `COMPLETE`, a further `feed` re-enters header
- * parsing at a desynchronised position, and the refused payload's *own* bytes
- * are handed to the visitor as fields that were never on the wire.
+ * README "decode a string"). But that verdict was thrown *around*
+ * `DecoderState.fail()` rather than through it, so `invalidReason` was never
+ * latched: the decode read back as `COMPLETE`, a further `feed` re-entered
+ * header parsing at a desynchronised position, and the refused payload's *own*
+ * bytes were handed to the visitor as fields that were never on the wire.
+ *
+ * A refusal has exactly one channel — the throw — so "terminal" is asserted by
+ * re-raising: a refused stream can never *return* a status again, which is why
+ * no test below reads one back after the rejection.
  *
  * The same hole is the *shape* of the defect rather than a fact about UTF-8:
  * §6.3's other terminal rejection, `LimitExceeded`, is raised from a visitor
@@ -163,26 +167,38 @@ function feedRefused(
 ) {
   const is = new IStream(visitor);
   const codes: string[] = [];
+  // What the stream last said, from the one place it says anything: the value
+  // the last `feed` returned, or the code the last `feed` threw.
+  let verdict: string = DecodeStatus.Complete;
   for (let i = 0; i < REFUSED.length; i += chunkSize) {
     try {
-      is.feed(REFUSED.subarray(i, i + chunkSize));
+      verdict = is.feed(REFUSED.subarray(i, i + chunkSize));
     } catch (e) {
       expect(e).toBeInstanceOf(SofabError);
       codes.push((e as SofabError).code);
+      verdict = (e as SofabError).code;
     }
   }
-  return { is, visitor, codes };
+  return { is, visitor, codes, verdict };
+}
+
+/** Assert that `is` is refused terminally: it raises `code` instead of returning. */
+function expectTerminal(is: IStream, code: SofabErrorCode, chunk: Uint8Array): void {
+  expect(() => is.feed(chunk)).toThrow(expect.objectContaining({ code }));
 }
 
 describe("CORELIB_TS-01: a refused invalid-UTF-8 string is terminal (§5.2.1–§5.2.3)", () => {
   it.each(CHUNKS)(
-    "CORELIB_TS-01 (a): status() reports INVALID afterwards, at chunk size %i",
+    "CORELIB_TS-01 (a): the refusal is what the stream says afterwards, at chunk size %i",
     (chunkSize) => {
-      const { is, codes } = feedRefused(chunkSize);
+      const { is, codes, verdict } = feedRefused(chunkSize);
       expect(codes).toContain(SofabErrorCode.InvalidMsg);
       // §5.2.1: INVALID is terminal — not COMPLETE, and §5.2.3 forbids
-      // INCOMPLETE for input already determined malformed.
-      expect(is.status()).toBe(DecodeStatus.Invalid);
+      // INCOMPLETE for input already determined malformed. With the refusal on
+      // the error channel that is one statement, not two: an empty feed cannot
+      // return either of them, it raises INVALID_MSG again.
+      expect(verdict).toBe(SofabErrorCode.InvalidMsg);
+      expectTerminal(is, SofabErrorCode.InvalidMsg, new Uint8Array(0));
     },
   );
 
@@ -192,10 +208,8 @@ describe("CORELIB_TS-01: a refused invalid-UTF-8 string is terminal (§5.2.1–�
       const { is } = feedRefused(chunkSize);
       // The stream must not resume: no continuation can change a terminal
       // verdict (§5.2.1), so the well-formed field that follows is not decoded.
-      expect(() => is.feed(AFTER)).toThrow(
-        expect.objectContaining({ code: SofabErrorCode.InvalidMsg }),
-      );
-      expect(is.status()).toBe(DecodeStatus.Invalid);
+      expectTerminal(is, SofabErrorCode.InvalidMsg, AFTER);
+      expectTerminal(is, SofabErrorCode.InvalidMsg, AFTER);
     },
   );
 
@@ -224,13 +238,13 @@ describe("CORELIB_TS-01: a refused invalid-UTF-8 string is terminal (§5.2.1–�
 
   it("CORELIB_TS-01: whole and chunked feeds agree on verdict and fields", () => {
     const runs = CHUNKS.map((chunkSize) => {
-      const { is, visitor } = feedRefused(chunkSize);
-      return { chunkSize, status: is.status(), fields: visitor.fields };
+      const { verdict, visitor } = feedRefused(chunkSize);
+      return { chunkSize, verdict, fields: visitor.fields };
     });
     // Same bytes, same verdict and same field events, however they were split.
     for (const run of runs) {
-      expect({ status: run.status, fields: run.fields }).toEqual({
-        status: runs[0]!.status,
+      expect({ verdict: run.verdict, fields: run.fields }).toEqual({
+        verdict: runs[0]!.verdict,
         fields: runs[0]!.fields,
       });
     }
@@ -248,18 +262,19 @@ describe("CORELIB_TS-01: a refused over-cap string is terminal too, under its ow
     feedRefused(chunkSize, new CappingVisitor(2));
 
   it.each(CHUNKS)(
-    "CORELIB_TS-01 (a): the status stays terminal — and is not INVALID, at chunk size %i",
+    "CORELIB_TS-01 (a): the refusal stays terminal — and is not INVALID, at chunk size %i",
     (chunkSize) => {
-      const { is, codes } = feedCapped(chunkSize);
+      const { is, codes, verdict } = feedCapped(chunkSize);
       expect(codes).toContain(SofabErrorCode.LimitExceeded);
       // §6.3: "MUST NOT be reported as `InvalidMessage`" — the bytes are
       // well-formed and the same message decodes under a looser cap.
       expect(codes).not.toContain(SofabErrorCode.InvalidMsg);
-      expect(is.status()).not.toBe(DecodeStatus.Invalid);
-      // Nor COMPLETE: the message was refused inside a field that never
-      // finished, so the structural truth about the consumed bytes is
-      // Incomplete, and it is terminal — no later feed moves it.
-      expect(is.status()).toBe(DecodeStatus.Incomplete);
+      expect(verdict).toBe(SofabErrorCode.LimitExceeded);
+      // Nor COMPLETE, and this is the point of putting the rejection on the
+      // error channel alone: the three-valued outcome has no value for "valid,
+      // but more than I accept" (§6.3), so a refused stream returns nothing at
+      // all — it raises, terminally, under its own code.
+      expectTerminal(is, SofabErrorCode.LimitExceeded, new Uint8Array(0));
     },
   );
 
@@ -269,10 +284,8 @@ describe("CORELIB_TS-01: a refused over-cap string is terminal too, under its ow
       const { is } = feedCapped(chunkSize);
       // §6.3 calls the cap rejection terminal, so the well-formed field that
       // follows is not decoded — and the rejection re-reports under its own code.
-      expect(() => is.feed(AFTER)).toThrow(
-        expect.objectContaining({ code: SofabErrorCode.LimitExceeded }),
-      );
-      expect(is.status()).toBe(DecodeStatus.Incomplete);
+      expectTerminal(is, SofabErrorCode.LimitExceeded, AFTER);
+      expectTerminal(is, SofabErrorCode.LimitExceeded, AFTER);
     },
   );
 
@@ -300,8 +313,8 @@ describe("CORELIB_TS-01: a refused over-cap string is terminal too, under its ow
 
   it("CORELIB_TS-01: whole and chunked feeds agree on verdict and fields", () => {
     const runs = CHUNKS.map((chunkSize) => {
-      const { is, visitor } = feedCapped(chunkSize);
-      return { status: is.status(), fields: visitor.fields };
+      const { verdict, visitor } = feedCapped(chunkSize);
+      return { verdict, fields: visitor.fields };
     });
     for (const run of runs) {
       expect(run).toEqual(runs[0]);
@@ -323,7 +336,7 @@ describe("CORELIB_TS-01: a refused over-cap string is terminal too, under its ow
       },
     });
     expect(outer.feed(AFTER)).toBe(DecodeStatus.Complete);
-    expect(outer.status()).toBe(DecodeStatus.Complete);
+    expect(outer.feed(new Uint8Array(0))).toBe(DecodeStatus.Complete);
     expect(outer.feed(AFTER)).toBe(DecodeStatus.Complete);
     expect(seen).toEqual(["unsigned(1,99)", "unsigned(1,99)"]);
   });
@@ -333,7 +346,7 @@ describe("CORELIB_TS-01: a refused over-cap string is terminal too, under its ow
     // pooled machine, so a refusal latched on one call must be gone by the next —
     // and two IStreams share nothing at all.
     const { is } = feedCapped(REFUSED.length);
-    expect(is.status()).toBe(DecodeStatus.Incomplete);
+    expectTerminal(is, SofabErrorCode.LimitExceeded, new Uint8Array(0));
 
     const fresh = new MaterializingVisitor();
     const other = new IStream(fresh);

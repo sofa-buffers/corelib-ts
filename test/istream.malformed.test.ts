@@ -55,15 +55,16 @@ function codeOf(fn: () => void): string {
 /** Feed `msg` to a fresh `IStream` in `size`-byte chunks; report the outcome. */
 function feedInChunks(msg: Uint8Array, size: number, visitor: Visitor = {}): string {
   const is = new IStream(visitor);
+  let st: string = DecodeStatus.Complete;
   try {
     for (let i = 0; i < msg.length; i += size) {
-      is.feed(msg.subarray(i, Math.min(i + size, msg.length)));
+      st = is.feed(msg.subarray(i, Math.min(i + size, msg.length)));
     }
   } catch (e) {
     if (e instanceof SofabError) return e.code;
     throw e;
   }
-  return is.status();
+  return st;
 }
 
 describe("array<fixlen> element word must be fp32/4 or fp64/8 (§4.8)", () => {
@@ -100,11 +101,15 @@ describe("array<fixlen> element word must be fp32/4 or fp64/8 (§4.8)", () => {
   it("latches the verdict: a caught rejection cannot be decoded past", () => {
     const is = new IStream({});
     const msg = bytes(0x0d, 0x02, (4 << 3) | 2);
-    expect(() => is.feed(msg)).toThrow(SofabError);
-    expect(is.status()).toBe(DecodeStatus.Invalid);
+    expect(() => is.feed(msg)).toThrow(
+      expect.objectContaining({ code: SofabErrorCode.InvalidMsg }),
+    );
     // A well-formed continuation must not resurrect the stream (§5.2: terminal).
-    expect(() => is.feed(bytes(0x08, 0x01))).toThrow(SofabError);
-    expect(is.status()).toBe(DecodeStatus.Invalid);
+    // The rejection is re-raised rather than re-read: the throw is its only
+    // channel, so no later call can hand back a status that forgot it.
+    expect(() => is.feed(bytes(0x08, 0x01))).toThrow(
+      expect.objectContaining({ code: SofabErrorCode.InvalidMsg }),
+    );
   });
 });
 
@@ -171,7 +176,10 @@ describe("a varint past the 64-bit bound is INVALID wherever the chunks fall (§
         is.feed(ELEVEN.subarray(cut));
       });
       expect(code, `cut at ${cut}`).toBe(SofabErrorCode.InvalidMsg);
-      expect(is.status()).toBe(DecodeStatus.Invalid);
+      // Terminal at every cut: the next feed raises the same code again.
+      expect(() => is.feed(new Uint8Array(0))).toThrow(
+        expect.objectContaining({ code: SofabErrorCode.InvalidMsg }),
+      );
     }
   });
 

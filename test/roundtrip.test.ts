@@ -169,7 +169,6 @@ describe("nested sequences", () => {
     const outer = new Outer();
     const is = new IStream(outer);
     is.feed(os.bytes());
-    is.status();
 
     expect(outer.value).toBe(11);
     expect(outer.innerValue).toBe(99);

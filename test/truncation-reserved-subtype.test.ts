@@ -67,13 +67,14 @@ function oneShot(buf: Uint8Array): SofabErrorCode | undefined {
 /** The same bytes through `IStream`, one byte per `feed`. */
 function streamed(buf: Uint8Array): DecodeStatus {
   const is = new IStream(greedy);
+  let st: DecodeStatus = DecodeStatus.Complete;
   try {
-    for (const b of buf) is.feed(Uint8Array.of(b));
+    for (const b of buf) st = is.feed(Uint8Array.of(b));
   } catch (e) {
     if (e instanceof SofabError) return DecodeStatus.Invalid;
     throw e;
   }
-  return is.status();
+  return st;
 }
 
 /** Field header for id 0: `(0 << 3) | wireType`. */

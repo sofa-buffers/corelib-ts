@@ -137,7 +137,9 @@ function feedInChunks(bytes: Uint8Array, visitor: SkipVisitor, chunk: number): v
   // needed (§6): a message whose skips landed correctly ends COMPLETE, and a
   // skip that consumed too much or too little leaves the decoder mid-field.
   expect(status).toBe(DecodeStatus.Complete);
-  expect(is.status()).toBe(DecodeStatus.Complete);
+  // And an empty feed re-reads that same value: there is no accessor beside the
+  // call, so re-reading is a feed that consumes nothing.
+  expect(is.feed(new Uint8Array(0))).toBe(DecodeStatus.Complete);
 }
 
 describe("skip-ids scenario", () => {

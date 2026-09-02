@@ -125,7 +125,9 @@ describe("the documented example does what the section claims", () => {
       DecodeStatus.Incomplete,
       DecodeStatus.Complete,
     ]);
-    expect(dec.status()).toBe(DecodeStatus.Complete);
+    // The generated handle offers no accessor beside `feed`, so re-reading the
+    // outcome is a feed that consumes nothing.
+    expect(dec.feed(new Uint8Array(0))).toBe(DecodeStatus.Complete);
     expect([dec.message.x, dec.message.y]).toStrictEqual([3, 4]);
   });
 });

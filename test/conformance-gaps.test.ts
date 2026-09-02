@@ -38,7 +38,6 @@ function codeOf(fn: () => void): string {
 function decodeChunked(bytes: Uint8Array, visitor: Visitor): void {
   const is = new IStream(visitor);
   for (let i = 0; i < bytes.length; i++) is.feed(bytes.subarray(i, i + 1));
-  is.status();
 }
 
 describe("zero-count arrays encode to the canonical empty form", () => {

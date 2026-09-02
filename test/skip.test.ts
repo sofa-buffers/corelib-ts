@@ -6,7 +6,14 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { IStream, OStream, decode, type Visitor, growingOStream } from "../src/index.js";
+import {
+  DecodeStatus,
+  IStream,
+  OStream,
+  decode,
+  type Visitor,
+  growingOStream,
+} from "../src/index.js";
 
 /** A message with fields surrounding a nested sub-sequence (itself nested). */
 function build(os: OStream): void {
@@ -57,7 +64,6 @@ describe("skipping", () => {
 
     const is = new IStream(visitor);
     for (let i = 0; i < bytes.length; i++) is.feed(bytes.subarray(i, i + 1));
-    is.status();
 
     expect(tail).toBe(999);
   });
@@ -66,7 +72,6 @@ describe("skipping", () => {
     const os = growingOStream();
     build(os);
     const is = new IStream({});
-    is.feed(os.bytes());
-    expect(() => is.status()).not.toThrow();
+    expect(is.feed(os.bytes())).toBe(DecodeStatus.Complete);
   });
 });

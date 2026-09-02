@@ -40,7 +40,6 @@ function decodeWhole(bytes: Uint8Array, visitor: Visitor): void {
 function decodeChunked(bytes: Uint8Array, visitor: Visitor): void {
   const is = new IStream(visitor);
   for (let i = 0; i < bytes.length; i++) is.feed(bytes.subarray(i, i + 1));
-  is.status();
 }
 
 const DRIVERS: [string, (b: Uint8Array, v: Visitor) => void][] = [

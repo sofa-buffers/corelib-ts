@@ -23,17 +23,25 @@
  * answers `false` to decline a subtree whole, and a field whose callback the
  * visitor does not implement is skipped.
  *
- * There is no finish / finalize step (§5.2.4): {@link IStream.feed} *returns* the
- * three-valued decode outcome for the bytes consumed so far, and
- * {@link IStream.status} re-reads it at any time. A message that merely ends
- * inside a field is reported — never thrown — as {@link DecodeStatus.Incomplete};
- * only a *malformed* message throws ({@link SofabErrorCode.InvalidMsg}), which is
- * this port's channel for {@link DecodeStatus.Invalid}. The caller owns
- * end-of-input and decides whether a trailing `Incomplete` is a truncation error.
+ * There is no finish / finalize step (§5.2.4) and no status accessor beside the
+ * call: {@link IStream.feed} *returns* the outcome for the bytes consumed so far,
+ * and that return value is the whole answer. A message that merely ends inside a
+ * field is reported — never thrown — as {@link DecodeStatus.Incomplete}; only a
+ * *malformed* message throws ({@link SofabErrorCode.InvalidMsg}), which is this
+ * port's channel for {@link DecodeStatus.Invalid}. The caller owns end-of-input
+ * and decides whether a trailing `Incomplete` is a truncation error.
+ *
+ * **One fact, one channel.** Each outcome leaves by exactly one route — two of
+ * the three by the return value, the refusals by the throw — because a second way
+ * to ask the same question is a second thing to keep in step, and this family
+ * shipped the drift: a `status()` accessor answered `COMPLETE` for a message
+ * `feed` had already refused. §5.3.1 makes the general form of the argument for
+ * decode surfaces ("every additional surface is a second implementation of every
+ * rule in this document"); the accessor was the same mistake one size down.
  */
 
 import { DecodeStatus } from "../constants.js";
-import type { ArrayKind, FixlenSubtype, WireType } from "../constants.js";
+import type { ArrayKind, FeedStatus, FixlenSubtype, WireType } from "../constants.js";
 import { incompleteError } from "../errors.js";
 import { DecoderState } from "./state.js";
 
@@ -226,8 +234,9 @@ export interface Visitor {
  * Bind a {@link Visitor} at construction, then feed bytes in chunks of any size
  * with {@link feed}: it calls one visitor method per decoded field and resumes
  * cleanly across chunk boundaries. Every `feed` returns the decode outcome for the
- * bytes so far, so no end / finalize call is needed; {@link status} re-reads that
- * same outcome.
+ * bytes so far, so no end / finalize call is needed — and there is nothing else to
+ * ask: `feed` is the only way to learn where a stream stands, by what it returns
+ * or by what it throws.
  *
  * **No receiver limit is configured here, because this codec holds none**
  * (§6.2.1). A `max_dyn_*` cap is the receiving *application's* number, stated by
@@ -258,28 +267,31 @@ export class IStream {
 
   /**
    * Feed a chunk of bytes, dispatching decoded fields to the bound visitor, and
-   * **return** the decode outcome for the bytes consumed so far (§5.2.1):
+   * **return** where the decode stands after them (§5.2.1):
    * {@link DecodeStatus.Complete} when they end exactly at a field boundary,
    * {@link DecodeStatus.Incomplete} when they end *inside* a field (a partial
    * varint, an unfinished payload / array, or a still-open nested sequence).
    * Running out of bytes mid-field is not an error — the decode merely suspends
    * until the next chunk, and the caller owns end-of-input.
    *
+   * **This call is the only place the answer is.** There is no finish / finalize
+   * step (§5.2.4) and no status accessor: what this returns, or throws, is the
+   * whole of what the stream has to say, so a caller is never one question short
+   * after it and never has two answers to reconcile. Feeding an empty chunk
+   * re-reads the same value without consuming anything, for a caller that wants
+   * the outcome again without holding on to it.
+   *
    * The chunk is borrowed **only for the duration of this call** (§6.0): once it
    * returns, the caller may reuse, overwrite or free that memory, and the decoded
    * message is unaffected — the decoder retains nothing that points into it.
    *
-   * There is no finish / finalize step (§5.2.4): the status returned here *is* the
-   * answer at that byte boundary, and {@link status} re-reads the same value
-   * without consuming anything.
-   *
    * `INVALID` travels on the error channel — this port's idiomatic surfacing of
    * it: *malformed* bytes throw {@link SofabError} (`INVALID_MSG`) instead of
-   * returning a status. That verdict is **terminal** (§5.2.1): the stream latches
-   * it, so a caller that catches the throw and feeds on gets the same error again
-   * from every later call — no further byte is consumed and no visitor method is
-   * invoked — and {@link status} answers {@link DecodeStatus.Invalid} from then
-   * on.
+   * returning a status, which is why the return type names only the other two.
+   * That verdict is **terminal** (§5.2.1): the stream latches it, so a caller that
+   * catches the throw and feeds on gets the same error again from every later
+   * call — no further byte is consumed and no visitor method is invoked. A caller
+   * that caught it already holds the verdict, in the code on the error it caught.
    *
    * A receiver-limit rejection (`LIMIT_EXCEEDED`, §6.2.1) travels the same
    * channel — thrown out of the visitor callback that compared the cap — but it
@@ -291,40 +303,14 @@ export class IStream {
    * the error channel", and this port takes the second. **Terminal** is the other
    * half of that sentence and holds exactly as it does for `INVALID`: the stream
    * latches the rejection, so every later call re-throws it under the same code,
-   * consumes no byte and drives no visitor method. The three-valued
-   * {@link status} has no value for it — see there.
+   * consumes no byte and drives no visitor method. It is *only* on the error
+   * channel — the three-valued outcome has no value for "valid, but more than I am
+   * configured to accept", so there is nothing about it to read back as a status,
+   * and nothing that has to be kept in step with the throw.
    */
-  feed(chunk: Uint8Array): DecodeStatus {
+  feed(chunk: Uint8Array): FeedStatus {
     this.state.push(chunk);
-    return this.state.finish();
-  }
-
-  /**
-   * Re-read the outcome for the bytes fed so far — the same value the last
-   * {@link feed} returned: {@link DecodeStatus.Complete} at a clean field
-   * boundary, {@link DecodeStatus.Incomplete} if the input ends inside a field, or
-   * {@link DecodeStatus.Invalid} once it has been proved malformed — permanently,
-   * since `INVALID` is terminal and outranks `INCOMPLETE` (§5.2.3). `Invalid` is
-   * the one outcome {@link feed} never returns (it throws it), so this is how a
-   * caller that caught the `INVALID_MSG` reads the verdict as a status.
-   *
-   * A convenience, never an obligation: the finish-less spec (§5.2.4) requires no
-   * end step, and this is a pure accessor — it never throws, consumes nothing, and
-   * never promotes an incomplete decode to an error.
-   *
-   * **This is not the limit channel.** A `LIMIT_EXCEEDED` rejection has no value
-   * in the three-valued outcome: `Invalid` would be wrong (the bytes are
-   * well-formed and §6.3 forbids folding a limit rejection into `INVALID`) and so
-   * would `Complete` (the message was refused). A stream stopped by a cap
-   * therefore answers `Incomplete` — the refused field's payload is still on the
-   * wire, so the bytes consumed are not a whole message — and, the rejection being
-   * terminal (§6.3), it answers that permanently: no later {@link feed} moves it.
-   * Read the cap rejection where it is raised: it propagates out of {@link feed}
-   * as a {@link SofabError} carrying {@link SofabErrorCode.LimitExceeded}, from
-   * the visitor that holds the number.
-   */
-  status(): DecodeStatus {
-    return this.state.finish();
+    return this.state.outcome();
   }
 }
 
@@ -361,7 +347,7 @@ export function decode(bytes: Uint8Array, visitor: Visitor): void {
     // is truncation, which streaming leaves to the caller's framing (§5.2.4) and
     // which a one-shot caller has, by construction, already decided is an error —
     // the whole buffer *is* the end of input.
-    if (state.finish() !== DecodeStatus.Complete) {
+    if (state.outcome() !== DecodeStatus.Complete) {
       throw incompleteError("truncated message: input ends inside a field");
     }
   } finally {
