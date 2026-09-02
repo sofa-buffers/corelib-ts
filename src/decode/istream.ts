@@ -288,8 +288,11 @@ export class IStream {
    * policy rejection (§6.2.1, §6.3). The two stay distinguishable by their code,
    * which is what §6.3 requires; §6.3 leaves the surfacing open between "a fourth
    * decode outcome" and "a terminal failure carrying the `LimitExceeded` code on
-   * the error channel", and this port takes the second. The three-valued
-   * {@link status} therefore has no value for it — see there.
+   * the error channel", and this port takes the second. **Terminal** is the other
+   * half of that sentence and holds exactly as it does for `INVALID`: the stream
+   * latches the rejection, so every later call re-throws it under the same code,
+   * consumes no byte and drives no visitor method. The three-valued
+   * {@link status} has no value for it — see there.
    */
   feed(chunk: Uint8Array): DecodeStatus {
     this.state.push(chunk);
@@ -312,11 +315,13 @@ export class IStream {
    * **This is not the limit channel.** A `LIMIT_EXCEEDED` rejection has no value
    * in the three-valued outcome: `Invalid` would be wrong (the bytes are
    * well-formed and §6.3 forbids folding a limit rejection into `INVALID`) and so
-   * would `Complete`, so a stream stopped by a cap keeps reporting the structural
-   * answer for the bytes it consumed — `Incomplete`, since a cap fires at a count
-   * or length word, i.e. inside a field. Read the cap rejection where it is
-   * raised: it propagates out of {@link feed} as a {@link SofabError} carrying
-   * {@link SofabErrorCode.LimitExceeded}, from the visitor that holds the number.
+   * would `Complete` (the message was refused). A stream stopped by a cap
+   * therefore answers `Incomplete` — the refused field's payload is still on the
+   * wire, so the bytes consumed are not a whole message — and, the rejection being
+   * terminal (§6.3), it answers that permanently: no later {@link feed} moves it.
+   * Read the cap rejection where it is raised: it propagates out of {@link feed}
+   * as a {@link SofabError} carrying {@link SofabErrorCode.LimitExceeded}, from
+   * the visitor that holds the number.
    */
   status(): DecodeStatus {
     return this.state.finish();
