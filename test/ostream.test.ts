@@ -171,7 +171,6 @@ describe("OStream input flexibility", () => {
     const seen = new RecordingVisitor();
     const is = new IStream(seen);
     is.feed(bytes());
-    is.status();
     expect(seen.events.map((e) => e.kind)).toEqual([
       "unsigned",
       "string",

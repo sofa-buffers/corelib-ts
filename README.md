@@ -272,9 +272,10 @@ bound) apply inside a declined subtree exactly as outside it.
 ### Deserialize stream
 
 `IStream` resumes across chunk boundaries: feed it whatever the transport hands
-you and read the outcome from what `feed()` **returns**, the three-valued status
-for the bytes consumed so far. There is no end / finalize step. The visitor is bound
-at construction. String / blob payloads arrive in one or more pieces, each a range
+you and read the outcome from what `feed()` **returns** — `COMPLETE` or
+`INCOMPLETE` for the bytes consumed so far, the third outcome being thrown rather
+than returned (below). There is no end / finalize step and no second way to ask.
+The visitor is bound at construction. String / blob payloads arrive in one or more pieces, each a range
 `[start, end)` of the chunk **you** fed, tagged with the field's `total` length and
 the piece's `offset` within it:
 
@@ -305,14 +306,19 @@ you may reuse, overwrite or free it, and what you decoded is unaffected — the
 decoder retains nothing that points into it. Copy what you want to keep, during the
 call; `PayloadAcc` and `decodeUtf8` are the ready-made way.
 
-`status()` returns exactly what the last `feed()` returned; it is a pure accessor
-and never changes the verdict.
+**`feed()` is the only way to ask.** There is no `status()` accessor and no end
+step: what a `feed` returns, or what it throws, is the whole answer, so you are
+never one call short of knowing where you stand and never holding two answers that
+could disagree. (This library shipped that disagreement once — a `status()` that
+answered `COMPLETE` for a message `feed` had already refused — which is why the
+second way to ask is gone rather than repaired.) If you want the outcome again
+without keeping it, feed an empty chunk: it consumes nothing and returns the same
+value.
 
-`INVALID` is **terminal**, and is the one outcome `feed()` does not return: it
-travels on the error channel, as a thrown `INVALID_MSG`. A stream that has thrown
-it is poisoned for good — every further `feed` re-throws it without consuming a
-byte or calling the visitor, and `status()` answers `INVALID` however many
-well-formed chunks follow:
+`INVALID` is **terminal**, and is the outcome `feed()` never returns: it travels on
+the error channel, as a thrown `INVALID_MSG`. A stream that has thrown it is
+poisoned for good — every further `feed` re-throws it without consuming a byte or
+calling the visitor, so a refused stream can never hand back a status at all:
 
 ```ts
 import { SofabError, SofabErrorCode } from "@sofa-buffers/corelib";
@@ -322,15 +328,15 @@ try {
   for await (const chunk of source) is.feed(chunk);
 } catch (e) {
   if ((e as SofabError).code !== SofabErrorCode.InvalidMsg) throw e;
+  // The verdict is in hand: `code` says INVALID_MSG, and nothing further needs
+  // asking. Feeding on would only raise the same error again.
 }
-is.status(); // INVALID — never COMPLETE, never INCOMPLETE
 ```
 
 A receiver-side cap (`LIMIT_EXCEEDED`, see [Receiver limits](#receiver-limits)) is
-**not** the `INVALID` outcome and never latches as one: the bytes are well-formed and
-decode under a looser cap, so `status()` never answers `INVALID` for it. It is read
-off the error channel — it is thrown out of `feed` by the handler that compared the
-cap — not from `status()`.
+**not** the `INVALID` outcome and is never folded into one: the bytes are well-formed
+and decode under a looser cap. It travels the same error channel under its own code,
+and is terminal in the same way — the code you catch is what tells the two apart.
 
 ### 64-bit values without `bigint`
 
@@ -387,6 +393,7 @@ import {
   IStream,
   DecodeStatus,
   decode,
+  type FeedStatus,
   type FlushSink,
   type Visitor,
 } from "@sofa-buffers/corelib";
@@ -444,8 +451,11 @@ class PointDecoder {
   readonly message = new Point();
   private readonly is = new IStream(new PointVisitor(this.message));
 
-  feed(chunk: Uint8Array): DecodeStatus { return this.is.feed(chunk); }
-  status(): DecodeStatus { return this.is.status(); }
+  // The one place the answer is: what feed() returns, or what it throws. A
+  // status() accessor here would be a second way to learn the same fact, which
+  // is the second way it can be learned wrong — so the generated handle does not
+  // grow one either.
+  feed(chunk: Uint8Array): FeedStatus { return this.is.feed(chunk); }
 }
 
 const p = new Point(); p.x = 3; p.y = 4;
@@ -465,7 +475,7 @@ p.serialize(so); so.flush();               // the same bytes, in pieces
 
 // streaming in: feed those pieces — or any other chunking — to the decoder
 const dec = Point.decoder();
-let st: DecodeStatus = DecodeStatus.Complete;   // zero bytes end on a boundary
+let st: FeedStatus = DecodeStatus.Complete;     // zero bytes end on a boundary
 for (const part of parts) st = dec.feed(part);
 
 // COMPLETE says the bytes so far ended on a field boundary, not that the
@@ -699,9 +709,10 @@ field, because it bounds what the *wire* may express.
 A cap rejection is raised by throwing `SofabError` with code
 `SofabErrorCode.LimitExceeded`, which propagates out of `feed` / `decode`. It is
 **not** the `INVALID` outcome and is never folded into one — the same bytes decode
-under a looser cap — so `status()` never reports `INVALID` for it; nor anything else
-about it, since the three-valued outcome has no value for "valid, but more than I am
-configured to accept". Read it off the error channel, not by polling `status()`.
+under a looser cap. The error channel is the only place it appears, and that is not
+a gap: the three-valued outcome has no value for "valid, but more than I am
+configured to accept", so there is nothing about it a returned status could have
+said. Catch it and read its `code`.
 
 ## Build & test
 

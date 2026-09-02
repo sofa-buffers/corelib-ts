@@ -18,6 +18,7 @@ export {
   I64_MIN,
   I64_MAX,
 } from "./constants.js";
+export type { FeedStatus } from "./constants.js";
 
 export { SofabError, SofabErrorCode } from "./errors.js";
 

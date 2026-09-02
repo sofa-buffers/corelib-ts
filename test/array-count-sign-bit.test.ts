@@ -48,8 +48,11 @@ function viaFast(bytes: Uint8Array): string {
 function viaIStream(bytes: Uint8Array): string {
   try {
     const is = new IStream({} as Visitor);
-    for (let i = 0; i < bytes.length; i++) is.feed(bytes.subarray(i, i + 1));
-    return is.status();
+    // The verdict is what the last `feed` returned — there is no accessor to ask
+    // afterwards, and a stream that got no bytes at all sits on a boundary.
+    let st: string = DecodeStatus.Complete;
+    for (let i = 0; i < bytes.length; i++) st = is.feed(bytes.subarray(i, i + 1));
+    return st;
   } catch (e) {
     return (e as { code: string }).code === SofabErrorCode.InvalidMsg
       ? DecodeStatus.Invalid

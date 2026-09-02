@@ -392,7 +392,7 @@ describe("the lo/hi halves alongside every integer value", () => {
         return e instanceof SofabError ? e.code : String(e);
       }
     };
-    /** The verdict `IStream` reaches at `chunkSize`, incl. its `status()`. */
+    /** The verdict `IStream` reaches at `chunkSize`, from what `feed` returns or throws. */
     const chunked = (b: Uint8Array, v: Visitor, chunkSize: number): string => {
       const is = new IStream(v);
       let status: DecodeStatus = DecodeStatus.Complete;
@@ -421,7 +421,7 @@ describe("the lo/hi halves alongside every integer value", () => {
 
     for (const [what, b] of Object.entries(truncated)) {
       // The one-shot entry point throws INCOMPLETE where the resumable one merely
-      // suspends and reports it from status() — the documented difference between
+      // suspends and returns it from `feed` — the documented difference between
       // the two *entry points* (§7), not between two decoders.
       expect(whole(b, longs), `${what} (longs)`).toBe(whole(b, plain));
       expect(whole(b, plain), what).toBe(SofabErrorCode.Incomplete);

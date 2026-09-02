@@ -7,7 +7,11 @@
  * `IStream` reports `INVALID` by throwing `INVALID_MSG` from `feed`, so the
  * verdict has to survive a caller that catches that throw and keeps feeding:
  * once poisoned, the stream decodes nothing further, drives no visitor
- * callbacks, and `end()` answers `Invalid` for good (corelib-ts#103).
+ * callbacks, and every later `feed` raises the same refusal again
+ * (corelib-ts#103). The throw is the *only* channel it travels on — there is no
+ * accessor to poll — so "the verdict survives" is tested by re-raising, and a
+ * caller that wants the three-valued vocabulary derives it from the code it
+ * caught, which is what {@link outcomeOf} does here.
  *
  * Every case is fed both one byte at a time and as a single whole buffer, so
  * the verdict cannot depend on where the chunk boundaries fell.
@@ -54,9 +58,20 @@ class RecordingVisitor implements Visitor {
   }
 }
 
+/** The three-valued outcome a caught refusal stands for (§6.3: INVALID ↔ InvalidMsg). */
+function outcomeOf(e: unknown): DecodeStatus {
+  if (e instanceof SofabError && e.code === SofabErrorCode.InvalidMsg) {
+    return DecodeStatus.Invalid;
+  }
+  throw e;
+}
+
 /**
  * Feed `bytes` in `chunkSize`-byte pieces, swallowing the `INVALID_MSG` throw
- * the way a lenient caller would, and report what the stream said afterwards.
+ * the way a lenient caller would, and report what the stream said afterwards:
+ * the value the last `feed` returned, or — once it starts throwing — the outcome
+ * the code it threw stands for. Either way the answer comes from the `feed` call
+ * itself; there is nothing else to ask.
  */
 function feedCatching(
   bytes: Uint8Array,
@@ -65,15 +80,17 @@ function feedCatching(
   const visitor = new RecordingVisitor();
   const is = new IStream(visitor);
   const codes: string[] = [];
+  let status: DecodeStatus = DecodeStatus.Complete; // zero bytes end on a boundary
   for (let i = 0; i < bytes.length; i += chunkSize) {
     try {
-      is.feed(bytes.subarray(i, i + chunkSize));
+      status = is.feed(bytes.subarray(i, i + chunkSize));
     } catch (e) {
       expect(e).toBeInstanceOf(SofabError);
       codes.push((e as SofabError).code);
+      status = outcomeOf(e);
     }
   }
-  return { status: is.status(), codes, calls: visitor.calls };
+  return { status, codes, calls: visitor.calls };
 }
 
 /** Malformed byte in the middle, valid field on either side. */
@@ -110,7 +127,6 @@ describe("INVALID is terminal: a poisoned IStream never answers COMPLETE (§5.2)
     expect(() => is.feed(Uint8Array.of(0x00, 0x01))).toThrow(
       expect.objectContaining({ code: SofabErrorCode.InvalidMsg }),
     );
-    expect(is.status()).toBe(DecodeStatus.Invalid);
     expect(visitor.calls).toEqual([]);
   });
 
@@ -130,24 +146,32 @@ describe("INVALID is terminal: a poisoned IStream never answers COMPLETE (§5.2)
         expect.objectContaining({ code: SofabErrorCode.InvalidMsg }),
       );
     }
-    expect(is.status()).toBe(DecodeStatus.Invalid);
     expect(visitor.calls).toEqual([]);
   });
 
-  it("end() is a pure accessor and stays INVALID when called repeatedly", () => {
+  it("the verdict is re-raised, not re-read: repeated calls all carry the same code", () => {
     const is = new IStream({});
     expect(() => is.feed(Uint8Array.of(0x07))).toThrow(SofabError);
-    expect(is.status()).toBe(DecodeStatus.Invalid);
-    expect(is.status()).toBe(DecodeStatus.Invalid);
+    for (let k = 0; k < 3; k++) {
+      // A poisoned stream has exactly one thing to say and says it every time.
+      // It can never *return* a value, so no caller can read COMPLETE off it.
+      expect(() => is.feed(new Uint8Array(0))).toThrow(
+        expect.objectContaining({ code: SofabErrorCode.InvalidMsg }),
+      );
+    }
   });
 
   it("an empty feed on a poisoned stream still reports INVALID", () => {
     const is = new IStream({});
     expect(() => is.feed(Uint8Array.of(0x07))).toThrow(SofabError);
-    expect(() => is.feed(new Uint8Array(0))).toThrow(
-      expect.objectContaining({ code: SofabErrorCode.InvalidMsg }),
-    );
-    expect(is.status()).toBe(DecodeStatus.Invalid);
+    let caught: unknown;
+    try {
+      is.feed(new Uint8Array(0));
+    } catch (e) {
+      caught = e;
+    }
+    expect((caught as SofabError).code).toBe(SofabErrorCode.InvalidMsg);
+    expect(outcomeOf(caught)).toBe(DecodeStatus.Invalid);
   });
 
   it("INVALID beats INCOMPLETE: a malformed field then a truncated tail is INVALID", () => {
@@ -183,6 +207,12 @@ describe("INVALID is terminal: a poisoned IStream never answers COMPLETE (§5.2)
     expect(() => is.feed(Uint8Array.of(0x03, 0x02, 0x01, 0x02))).toThrow(
       expect.objectContaining({ code: SofabErrorCode.LimitExceeded }),
     );
-    expect(is.status()).not.toBe(DecodeStatus.Invalid);
+    // The distinction lives in the code, which is the only place it *can* live:
+    // §6.3 gives the outcome triple no value for a cap rejection, so re-raising
+    // `LIMIT_EXCEEDED` — never `INVALID_MSG` — is the whole of keeping the two
+    // apart. It is terminal like INVALID, so the later feed raises it again.
+    expect(() => is.feed(Uint8Array.of(0x00, 0x01))).toThrow(
+      expect.objectContaining({ code: SofabErrorCode.LimitExceeded }),
+    );
   });
 });

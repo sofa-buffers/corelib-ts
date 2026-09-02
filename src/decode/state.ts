@@ -41,7 +41,8 @@ import {
   VARINT_MAX_BYTES,
   WireType,
 } from "../constants.js";
-import { invalidMsgError } from "../errors.js";
+import type { FeedStatus } from "../constants.js";
+import { SofabError, SofabErrorCode, invalidMsgError } from "../errors.js";
 import { joinI64, joinU64 } from "../varint/bits64.js";
 import { fp32FromBits, fp64FromBits } from "../varint/num64.js";
 import { SKIP } from "./skip.js";
@@ -128,21 +129,33 @@ export class DecoderState {
   private state = S.Header;
 
   /**
-   * Terminal-`INVALID` latch (§5.2.3): the reason the input was found malformed,
-   * or `null` while the stream is still healthy. `INVALID` is terminal — no later
-   * bytes can make already-malformed input valid — so the verdict outlives the
-   * throw that reported it: a caller that catches the `INVALID_MSG` from one
-   * {@link push} and keeps feeding must not be able to talk the machine back into
-   * `COMPLETE`. Every malformed-input throw goes through {@link fail}.
+   * The terminal-refusal latch: the rejection this stream was stopped by, or
+   * `null` while it is still healthy. **One latch, two codes** — §5.3.1 gives the
+   * rule one implementation, and §6.3 makes both of these rejections terminal:
    *
-   * A receiver-cap rejection is deliberately *not* latched here: it is a policy
-   * rejection of well-formed bytes (§6.2.1) — the same message decodes under a
-   * looser limit — and folding it into `INVALID` would misreport it. It is raised
-   * by the layer that holds the number (generated code, or a collector it built),
-   * and it propagates out of {@link push} through the visitor callback that threw
-   * it.
+   * - `INVALID_MSG` (§5.2.1: "malformed **regardless of what follows** … no —
+   *   terminal") — no later bytes can make malformed input valid;
+   * - `LIMIT_EXCEEDED` (§6.3: "A **terminal**, receiver-local **policy**
+   *   rejection") — well-formed bytes the receiver's cap refuses.
+   *
+   * They are latched together and **kept apart by their code**, which is the
+   * distinction §6.3 requires: a limit rejection "**MUST NOT** be reported as
+   * `InvalidMessage`", so the code is re-raised as itself and each stays the
+   * refusal it was.
+   *
+   * Latching is not bookkeeping, it is the terminality: both rejections are
+   * raised *mid-field* — the UTF-8 check inside a payload piece, a cap inside the
+   * count or length callback — so the machine is left at a position the visitor
+   * never finished. Resume it and the refused field's own bytes are re-read as
+   * headers, delivering fields that were never on the wire.
+   *
+   * The rejection is written here by {@link latch} and nowhere else: this
+   * machine's own malformation findings arrive through {@link fail}, and the ones
+   * raised above it — the §6.4.5 UTF-8 verdict, and the receiver caps §6.2.1
+   * keeps out of this codec — arrive as a throw out of a visitor callback, caught
+   * once in {@link push}.
    */
-  private invalidReason: string | null = null;
+  private refusal: SofabError | null = null;
 
   /**
    * A `DataView` over the chunk currently being fed, and the chunk it addresses —
@@ -238,7 +251,7 @@ export class DecoderState {
     this.skipFrom = -1;
     this.depth = 0;
     this.state = S.Header;
-    this.invalidReason = null;
+    this.refusal = null;
     this.vBytes = 0;
     this.have = 0;
   }
@@ -256,11 +269,47 @@ export class DecoderState {
 
   /** Feed `input` to the machine, dispatching to the bound visitor. */
   push(input: Uint8Array): void {
-    // §5.2.3: `INVALID` is terminal. Once the input has been proved malformed the
+    // A latched refusal is terminal (§5.2.1, §6.3). Once one has been raised the
     // stream consumes nothing further and drives no visitor callbacks — it just
-    // re-reports the original defect. One perfectly-predicted branch per chunk.
-    if (this.invalidReason !== null) throw invalidMsgError(this.invalidReason);
+    // re-reports the original rejection, under its own code. One
+    // perfectly-predicted branch per chunk.
+    const latched = this.refusal;
+    if (latched !== null) throw new SofabError(latched.code, latched.message);
 
+    try {
+      this.run(input);
+    } catch (e) {
+      // Neither terminal rejection is necessarily raised *by* this machine. §6.4.5
+      // puts the strict UTF-8 check where a string is materialized and §6.2.1 puts
+      // the receiver caps in the layer that holds the numbers, so both are decided
+      // inside a visitor callback and arrive here as a throw out of the loop. They
+      // are the same two rejections this machine raises itself, and §5.3.1 allows
+      // a rule only one implementation, so they go through the one latch rather
+      // than beside it. Unlatched, the next chunk resumes parsing mid-field and
+      // hands the refused field's own bytes to the visitor as fields that were
+      // never on the wire.
+      //
+      // The two codes stay distinct through the latch — §6.3: a cap rejection
+      // "MUST NOT be reported as `InvalidMessage`", so it is re-raised as
+      // `LIMIT_EXCEEDED` and never becomes `INVALID`.
+      if (
+        this.refusal === null &&
+        e instanceof SofabError &&
+        (e.code === SofabErrorCode.InvalidMsg ||
+          e.code === SofabErrorCode.LimitExceeded)
+      ) {
+        this.latch(e);
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * The decode loop itself. {@link push} wraps it, so the terminal-refusal latch
+   * is applied in exactly one place — including to a rejection the visitor raised
+   * — and this stays the plain state machine.
+   */
+  private run(input: Uint8Array): void {
     const n = input.length;
     let i = 0;
 
@@ -626,31 +675,29 @@ export class DecoderState {
   }
 
   /**
-   * Report the decode outcome (§5.2.1) *without* promoting it to an error:
+   * Where the decode stands (§5.2.1), *without* promoting it to an error:
    * {@link DecodeStatus.Complete} when the stream ended exactly at a field
    * boundary, {@link DecodeStatus.Incomplete} when it ended inside a field (a
    * partial varint, an unfinished payload / array, or a still-open nested
-   * sequence). A pure accessor — the finish-less spec (§5.2.4) has no finalize
-   * step, and a trailing `Incomplete` is a truncation the caller decides how to
-   * treat, not an error this machine raises.
+   * sequence). A trailing `Incomplete` is a truncation the caller decides how to
+   * treat (§5.2.4), not an error this machine raises.
    *
-   * A malformed message has already thrown `INVALID_MSG` from {@link push}, and
-   * that verdict is terminal: once {@link fail} has latched it this returns
-   * {@link DecodeStatus.Invalid} for good, so a caller that swallowed the throw
-   * and kept feeding cannot read back `Complete`.
+   * **Only these two, and only on a healthy machine.** This is read in exactly
+   * one place — after a {@link push} that returned — and a push that met a
+   * terminal refusal does not return: it throws, this call is never reached, and
+   * the verdict travels out on the error it threw. So `Invalid` is not a value
+   * this can produce, and neither is the "refused by a cap" state the outcome
+   * triple cannot name (§6.3). Nothing here re-reports a latched refusal, because
+   * nothing needs to: the throw is the whole report, and a report with one
+   * carrier has nothing to drift out of step with.
    *
-   * A receiver-cap rejection (§6.2.1) never reaches here at all: no cap lives in
-   * this machine, and the one generated code or a collector raises is thrown
-   * straight out of the visitor callback. Nor could it be reported here — §6.3
-   * forbids folding a policy rejection into `INVALID`, and no value of the
-   * three-valued outcome is true of it. A stream stopped by a cap therefore keeps
-   * reporting the structural answer for the bytes it consumed, which is
-   * `Incomplete` (a cap fires at a count or length word, inside a field). The
-   * rejection is the error channel's, per §6.3's second option, and
-   * `IStream.status`'s doc says so to the caller.
+   * The cursor's own answer would be wrong for a refused stream, which is why the
+   * refusal must not fall through to it: a cap is compared in `arrayBegin` /
+   * `fixlenBegin`, raised with the header and the count / length word consumed and
+   * the payload not yet entered — a cursor that reads as a clean field boundary,
+   * and so as `Complete`. {@link push}'s latch is what keeps that unreachable.
    */
-  finish(): DecodeStatus {
-    if (this.invalidReason !== null) return DecodeStatus.Invalid;
+  outcome(): FeedStatus {
     const atBoundary =
       this.state === S.Header && this.vBytes === 0 && this.depth === 0;
     return atBoundary ? DecodeStatus.Complete : DecodeStatus.Incomplete;
@@ -659,15 +706,27 @@ export class DecoderState {
   // --- helpers ------------------------------------------------------------
 
   /**
-   * Reject the input as malformed: latch the terminal `INVALID` verdict
-   * ({@link invalidReason}) and throw `INVALID_MSG`. Every malformed-input
-   * rejection goes through here, so none of them can be caught and then decoded
-   * past — §5.2.1's "no — terminal". Declared `never` so a call ends control flow
-   * exactly like the `throw` it replaced.
+   * Reject the input as malformed: latch the terminal `INVALID` verdict and throw
+   * `INVALID_MSG`. Every malformation *this machine* finds goes through here, so
+   * none of them can be caught and then decoded past — §5.2.1's "no — terminal".
+   * Declared `never` so a call ends control flow exactly like the `throw` it
+   * replaced.
    */
   private fail(message: string): never {
-    this.invalidReason = message;
-    throw invalidMsgError(message);
+    throw this.latch(invalidMsgError(message));
+  }
+
+  /**
+   * Record `e` as the terminal refusal that stopped this stream, and hand it back
+   * to be thrown. The only writer of {@link refusal} — §5.3.1's one
+   * implementation of the rule — for a rejection raised here and for one raised
+   * above this machine and caught in {@link push} alike. The error is stored, not
+   * its text: the code travels with it, so `INVALID_MSG` and `LIMIT_EXCEEDED`
+   * each stay themselves (§6.3).
+   */
+  private latch<E extends SofabError>(e: E): E {
+    this.refusal = e;
+    return e;
   }
 
   /**
@@ -911,7 +970,7 @@ export class DecoderState {
     // filled it had its continuation flag set (a terminator returns above), so an
     // 11th byte is *required* — past the 10-byte / 64-bit maximum (§4.1.3). That
     // is decided by bytes already in hand, so it is INVALID now rather than a
-    // suspend that `finish()` would report as INCOMPLETE: §5.2.3 gives INVALID
+    // suspend that {@link outcome} would report as INCOMPLETE: §5.2.3 gives INVALID
     // precedence, and the verdict must not depend on where the chunk boundaries
     // fell.
     if (k >= VARINT_MAX_BYTES) this.fail("varint overflow");

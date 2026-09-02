@@ -62,12 +62,14 @@ function payload(write: (os: OStream) => void): number[] {
 /**
  * Feed `buf` to a resumable IStream one byte at a time, reporting the outcome the
  * way the one-shot entry point does: a code for INVALID (thrown) or INCOMPLETE
- * (the status the caller judges), "COMPLETE" otherwise.
+ * (the status the last `feed` returned, which the caller judges), "COMPLETE"
+ * otherwise.
  */
 const chunked = (buf: Uint8Array): void => {
   const is = new IStream({});
-  for (const b of buf) is.feed(Uint8Array.of(b));
-  if (is.status() === DecodeStatus.Incomplete) {
+  let st: DecodeStatus = DecodeStatus.Complete;
+  for (const b of buf) st = is.feed(Uint8Array.of(b));
+  if (st === DecodeStatus.Incomplete) {
     throw new SofabError(SofabErrorCode.Incomplete, "input ends inside a field");
   }
 };

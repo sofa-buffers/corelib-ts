@@ -74,9 +74,12 @@ function message(): Uint8Array {
 /** Feed in `size`-byte chunks (0 = one feed), returning the outcome. */
 function feed(bytes: Uint8Array, size: number, v: Visitor): DecodeStatus {
   const is = new IStream(v);
+  let st: DecodeStatus = DecodeStatus.Complete;
   try {
-    if (size <= 0) is.feed(bytes);
-    else for (let i = 0; i < bytes.length; i += size) is.feed(bytes.subarray(i, i + size));
+    if (size <= 0) st = is.feed(bytes);
+    else {
+      for (let i = 0; i < bytes.length; i += size) st = is.feed(bytes.subarray(i, i + size));
+    }
   } catch (e) {
     if (e instanceof SofabError) {
       if (e.code === SofabErrorCode.InvalidMsg) return DecodeStatus.Invalid;
@@ -84,7 +87,7 @@ function feed(bytes: Uint8Array, size: number, v: Visitor): DecodeStatus {
     }
     throw e;
   }
-  return is.status();
+  return st;
 }
 
 describe("sequenceBegin returning false", () => {

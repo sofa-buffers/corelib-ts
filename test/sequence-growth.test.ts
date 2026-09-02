@@ -30,7 +30,6 @@
 
 import { describe, expect, it } from "vitest";
 import {
-  DecodeStatus,
   ElementSeq,
   FIXLEN_MAX,
   IStream,
@@ -287,8 +286,12 @@ describe("sequence-array growth (§7.2 item 8)", () => {
       expect.objectContaining({ code: SofabErrorCode.LimitExceeded }),
     );
     expect(seen).toStrictEqual([]);
-    // Not INVALID: the bytes are well-formed and decode under a looser cap.
-    expect(is.status()).not.toBe(DecodeStatus.Invalid);
+    // Not INVALID: the bytes are well-formed and decode under a looser cap, and
+    // the code on the throw is where that distinction lives — the rejection has
+    // no second channel to be re-read on (§6.3).
+    expect(() => is.feed(os.bytes().slice())).toThrow(
+      expect.objectContaining({ code: SofabErrorCode.LimitExceeded }),
+    );
   });
 
   it.each(

@@ -82,7 +82,7 @@ describe("decoder rejects malformed input", () => {
 
 // The finish-less three-valued outcome (MESSAGE_SPEC §7): input that ends inside
 // a field is INCOMPLETE (more bytes could complete it), NOT the malformed
-// INVALID. end()/feed() never promote an incomplete decode to an error.
+// INVALID. `feed()` never promotes an incomplete decode to an error.
 describe("decoder distinguishes INCOMPLETE from INVALID", () => {
   it("one-shot decode of a lone dangling 0x80 is INCOMPLETE, not malformed", () => {
     // 0x80: a header varint with the continuation bit set and no terminator.
@@ -96,24 +96,23 @@ describe("decoder distinguishes INCOMPLETE from INVALID", () => {
     );
   });
 
-  it("streaming end() reports INCOMPLETE for a lone dangling 0x80 (no throw)", () => {
+  it("streaming feed() returns INCOMPLETE for a lone dangling 0x80 (no throw)", () => {
     const is = new IStream({});
-    is.feed(bytes(0x80)); // continuation bit set, no terminator
-    expect(is.status()).toBe(DecodeStatus.Incomplete);
+    // continuation bit set, no terminator
+    expect(is.feed(bytes(0x80))).toBe(DecodeStatus.Incomplete);
   });
 
-  it("streaming end() reports INCOMPLETE for an unbalanced open sequence", () => {
+  it("streaming feed() returns INCOMPLETE for an unbalanced open sequence", () => {
     const is = new IStream({});
-    is.feed(bytes(0x0e)); // id 1 sequence start, never closed
-    expect(is.status()).toBe(DecodeStatus.Incomplete);
+    // id 1 sequence start, never closed
+    expect(is.feed(bytes(0x0e))).toBe(DecodeStatus.Incomplete);
   });
 
-  it("streaming end() reports COMPLETE for a message that ends on a boundary", () => {
+  it("streaming feed() returns COMPLETE for a message that ends on a boundary", () => {
     const os = growingOStream();
     os.writeUnsigned(1, 7);
     const is = new IStream({});
-    is.feed(os.bytes());
-    expect(is.status()).toBe(DecodeStatus.Complete);
+    expect(is.feed(os.bytes())).toBe(DecodeStatus.Complete);
   });
 
   it("a >64-bit varint is INVALID even though it too runs off the end", () => {

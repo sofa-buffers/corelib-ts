@@ -87,17 +87,18 @@ function oneShot(buf: Uint8Array, schemaCount?: number, receiverCap?: number): S
 /**
  * The same bytes fed one byte at a time. `feed` signals INVALID by throwing, so a
  * throw is reported as {@link DecodeStatus.Invalid}; otherwise the verdict is
- * whatever `status()` says.
+ * what the last `feed` returned — the only place it is.
  */
 function streamStatus(buf: Uint8Array, schemaCount?: number): DecodeStatus {
   const is = new IStream(boundedFp32(schemaCount));
+  let st: DecodeStatus = DecodeStatus.Complete;
   try {
-    for (const b of buf) is.feed(Uint8Array.of(b));
+    for (const b of buf) st = is.feed(Uint8Array.of(b));
   } catch (e) {
     if (e instanceof SofabError) return DecodeStatus.Invalid;
     throw e;
   }
-  return is.status();
+  return st;
 }
 
 describe("fixlen array: the schema count is applied after the element word (§4.8.1)", () => {
@@ -238,13 +239,14 @@ describe("fixlen array: only fp32/fp64 are subtypes at all (§4.8.1 step 3, §5.
 
   function streamed(buf: Uint8Array): DecodeStatus {
     const is = new IStream(greedy);
+    let st: DecodeStatus = DecodeStatus.Complete;
     try {
-      for (const b of buf) is.feed(Uint8Array.of(b));
+      for (const b of buf) st = is.feed(Uint8Array.of(b));
     } catch (e) {
       if (e instanceof SofabError) return DecodeStatus.Invalid;
       throw e;
     }
-    return is.status();
+    return st;
   }
 
   it.each([

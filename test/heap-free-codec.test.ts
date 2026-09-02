@@ -306,12 +306,13 @@ describe("read: the itemised handles, and nothing else (§6.6.2 / §6.6.4)", () 
     const chunks = Array.from({ length: Math.ceil(bulk.length / 8) }, (_, i) =>
       bulk.subarray(i * 8, i * 8 + 8),
     );
+    let st: DecodeStatus = DecodeStatus.Complete;
     expect(
       allocationsDuring(() => {
-        for (const c of chunks) is.feed(c);
+        for (const c of chunks) st = is.feed(c);
       }),
     ).toStrictEqual({});
-    expect(is.status()).toBe(DecodeStatus.Complete);
+    expect(st).toBe(DecodeStatus.Complete);
     expect(piecemeal.acc).toBe(whole.acc); // same values, other route
   });
 
@@ -324,12 +325,13 @@ describe("read: the itemised handles, and nothing else (§6.6.2 / §6.6.4)", () 
     // The chunk views belong to the caller, so they are built outside the
     // measurement: what is on trial is what the decoder does with them.
     const chunks = Array.from({ length: WIRE.length }, (_, i) => WIRE.subarray(i, i + 1));
+    let st: DecodeStatus = DecodeStatus.Complete;
     expect(
       allocationsDuring(() => {
-        for (const c of chunks) is.feed(c);
+        for (const c of chunks) st = is.feed(c);
       }),
     ).toStrictEqual({});
-    expect(is.status()).toBe(DecodeStatus.Complete);
+    expect(st).toBe(DecodeStatus.Complete);
   });
 
   it("a decode with no float in the message allocates nothing", () => {
@@ -497,13 +499,14 @@ describe("no views: the caller's own chunk, and nothing that outlives the call (
       },
     });
     const scratch = new Uint8Array(3);
+    let st: DecodeStatus = DecodeStatus.Complete;
     for (let i = 0; i < WIRE.length; i += 3) {
       const n = Math.min(3, WIRE.length - i);
       scratch.set(WIRE.subarray(i, i + n));
-      is.feed(scratch.subarray(0, n));
+      st = is.feed(scratch.subarray(0, n));
       scratch.fill(0xee); // the caller reuses its buffer the moment feed returns
     }
-    expect(is.status()).toBe(DecodeStatus.Complete);
+    expect(st).toBe(DecodeStatus.Complete);
     expect(strings).toStrictEqual([
       "a payload that outgrows a small buffer, and then some",
       "nested",

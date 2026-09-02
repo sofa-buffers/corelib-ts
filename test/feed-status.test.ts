@@ -6,11 +6,17 @@
  * returns *is* the answer", computable at any byte boundary.
  *
  * So `IStream.feed` must hand the caller the outcome for the bytes consumed so
- * far, and reading it must not require a second, `end`-shaped call
- * (corelib-ts#112). `INVALID` keeps travelling on the error channel — the
- * throw is this port's idiomatic surfacing of it — but it stays readable as a
- * status afterwards, so the poisoned stream is not the one case where the
- * caller has no status to look at.
+ * far, and reading it must not require a second call of any shape
+ * (corelib-ts#112) — not an `end`-shaped one, and not a `status()` accessor
+ * either. `INVALID` travels on the error channel, which is this port's
+ * idiomatic surfacing of it, and there it stays: it is *not* also readable back
+ * as a status, because one fact reachable two ways is one fact that can drift,
+ * and this family shipped exactly that drift (a `status()` answering `COMPLETE`
+ * for a message `feed` had already refused).
+ *
+ * What every test below asserts, in one form or another: after any `feed` call
+ * the caller already knows where it stands — from the value returned, or from
+ * the code on the error thrown — and never needs to ask again.
  */
 
 import { describe, expect, it } from "vitest";
@@ -19,11 +25,21 @@ import {
   IStream,
   SofabError,
   SofabErrorCode,
-  type Visitor,
 } from "../src/index.js";
 
 /** `08 2a` — unsigned(id 1) = 42, a whole message ending on a field boundary. */
 const WHOLE = Uint8Array.of(0x08, 0x2a);
+
+/** The code `fn` threw — the only channel a refusal has (§6.3). */
+function codeOfThrow(fn: () => unknown): SofabErrorCode {
+  try {
+    fn();
+  } catch (e) {
+    if (e instanceof SofabError) return e.code;
+    throw e;
+  }
+  throw new Error("expected a SofabError, but nothing was thrown");
+}
 
 describe("feed returns the three-valued decode outcome (§6)", () => {
   it("returns COMPLETE at a field boundary", () => {
@@ -61,17 +77,19 @@ describe("feed returns the three-valued decode outcome (§6)", () => {
     expect(is.feed(Uint8Array.of(0x07))).toBe(DecodeStatus.Complete);
   });
 
-  it("the returned status agrees with the accessor at every boundary", () => {
-    // A nested sequence carrying a string, fed one byte at a time.
+  it("the returned status is the answer at every boundary, and re-reading it changes nothing", () => {
+    // A nested sequence carrying a string, fed one byte at a time. There is no
+    // accessor to agree with: the only way to see the same value again is an
+    // empty feed, which consumes nothing.
     const bytes = Uint8Array.of(0x0e, 0x0a, 0x12, 0x68, 0x69, 0x07, 0x08, 0x01);
     const is = new IStream({});
-    const visitor: Visitor = {};
+    let returned: DecodeStatus = DecodeStatus.Complete;
     for (const b of bytes) {
-      const returned = is.feed(Uint8Array.of(b));
-      expect(returned).toBe(is.status());
-      expect(returned).toBe(is.status());
+      returned = is.feed(Uint8Array.of(b));
+      expect(is.feed(new Uint8Array(0))).toBe(returned);
+      expect(is.feed(new Uint8Array(0))).toBe(returned);
     }
-    expect(is.status()).toBe(DecodeStatus.Complete);
+    expect(returned).toBe(DecodeStatus.Complete);
   });
 
   it("an empty feed reports the status without changing it", () => {
@@ -83,19 +101,19 @@ describe("feed returns the three-valued decode outcome (§6)", () => {
   });
 });
 
-describe("INVALID stays readable as a status (§5.2)", () => {
-  it("status() is INVALID after the throw, and every later feed re-throws", () => {
+describe("a refusal travels on the error channel, and only there (§6.3)", () => {
+  it("INVALID is thrown with its code, and every later feed re-throws it", () => {
     const is = new IStream({});
     // 07 = sequence end with no open sequence.
-    expect(() => is.feed(Uint8Array.of(0x07))).toThrow(
-      expect.objectContaining({ code: SofabErrorCode.InvalidMsg }),
-    );
-    expect(is.status()).toBe(DecodeStatus.Invalid);
-    expect(() => is.feed(WHOLE)).toThrow(SofabError);
-    expect(is.status()).toBe(DecodeStatus.Invalid);
+    const first = codeOfThrow(() => is.feed(Uint8Array.of(0x07)));
+    expect(first).toBe(SofabErrorCode.InvalidMsg);
+    // Terminal: the caller who caught it holds the verdict, and a caller who
+    // ignored it is told again rather than being handed a status that forgot.
+    expect(codeOfThrow(() => is.feed(WHOLE))).toBe(SofabErrorCode.InvalidMsg);
+    expect(codeOfThrow(() => is.feed(new Uint8Array(0)))).toBe(SofabErrorCode.InvalidMsg);
   });
 
-  it("a LIMIT_EXCEEDED rejection leaves a readable, non-INVALID status (§6.2.1)", () => {
+  it("a LIMIT_EXCEEDED rejection keeps its own code and is terminal too (§6.2.1)", () => {
     // The cap is the generated layer's — the codec holds none (§6.2.1) — so it is
     // this visitor that compares it, at the header `arrayBegin` is raised from.
     const is = new IStream({
@@ -103,30 +121,45 @@ describe("INVALID stays readable as a status (§5.2)", () => {
         if (count > 1) throw new SofabError(SofabErrorCode.LimitExceeded, "over cap");
       },
     });
-    expect(() => is.feed(Uint8Array.of(0x03, 0x02, 0x01, 0x02))).toThrow(
-      expect.objectContaining({ code: SofabErrorCode.LimitExceeded }),
+    expect(codeOfThrow(() => is.feed(Uint8Array.of(0x03, 0x02, 0x01, 0x02)))).toBe(
+      SofabErrorCode.LimitExceeded,
     );
-    expect(is.status()).not.toBe(DecodeStatus.Invalid);
+    // Never folded into INVALID — the bytes are well-formed (§6.3) — and never
+    // silently downgraded to a returned status by a later call.
+    expect(codeOfThrow(() => is.feed(WHOLE))).toBe(SofabErrorCode.LimitExceeded);
+  });
+
+  it("a refused stream never answers with a returned status again", () => {
+    const is = new IStream({});
+    expect(() => is.feed(Uint8Array.of(0x07))).toThrow(SofabError);
+    // The defect this API shape closes: after the refusal there is no second
+    // route that could answer COMPLETE. Every later call raises, so a returned
+    // value is not something a refused stream can produce at all.
+    for (const chunk of [WHOLE, new Uint8Array(0), Uint8Array.of(0x08)]) {
+      expect(() => is.feed(chunk)).toThrow(SofabError);
+    }
   });
 });
 
-describe("status() and the deprecated end() alias", () => {
-  it("end() returns exactly what status() returns", () => {
+describe("re-reading the outcome without a second surface", () => {
+  it("an empty feed returns exactly what the last real feed returned", () => {
     const is = new IStream({});
-    expect(is.status()).toBe(is.status());
-    is.feed(Uint8Array.of(0x08));
-    expect(is.status()).toBe(DecodeStatus.Incomplete);
-    expect(is.status()).toBe(is.status());
-    is.feed(Uint8Array.of(0x2a));
-    expect(is.status()).toBe(DecodeStatus.Complete);
-    expect(is.status()).toBe(is.status());
+    expect(is.feed(new Uint8Array(0))).toBe(DecodeStatus.Complete);
+    expect(is.feed(Uint8Array.of(0x08))).toBe(DecodeStatus.Incomplete);
+    expect(is.feed(new Uint8Array(0))).toBe(DecodeStatus.Incomplete);
+    expect(is.feed(Uint8Array.of(0x2a))).toBe(DecodeStatus.Complete);
+    expect(is.feed(new Uint8Array(0))).toBe(DecodeStatus.Complete);
   });
 
-  it("status() is a pure accessor: repeated calls never change the verdict", () => {
+  it("repeated empty feeds never change the verdict", () => {
     const is = new IStream({});
     is.feed(Uint8Array.of(0x0a, 0x12, 0x68));
-    for (let k = 0; k < 3; k++) expect(is.status()).toBe(DecodeStatus.Incomplete);
+    for (let k = 0; k < 3; k++) {
+      expect(is.feed(new Uint8Array(0))).toBe(DecodeStatus.Incomplete);
+    }
     is.feed(Uint8Array.of(0x69));
-    for (let k = 0; k < 3; k++) expect(is.status()).toBe(DecodeStatus.Complete);
+    for (let k = 0; k < 3; k++) {
+      expect(is.feed(new Uint8Array(0))).toBe(DecodeStatus.Complete);
+    }
   });
 });

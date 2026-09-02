@@ -20,6 +20,7 @@ import {
   IStream,
   DecodeStatus,
   decode,
+  type FeedStatus,
   type FlushSink,
   type Visitor,
 } from "../../src/index.js";
@@ -77,8 +78,11 @@ class PointDecoder {
   readonly message = new Point();
   private readonly is = new IStream(new PointVisitor(this.message));
 
-  feed(chunk: Uint8Array): DecodeStatus { return this.is.feed(chunk); }
-  status(): DecodeStatus { return this.is.status(); }
+  // The one place the answer is: what feed() returns, or what it throws. A
+  // status() accessor here would be a second way to learn the same fact, which
+  // is the second way it can be learned wrong — so the generated handle does not
+  // grow one either.
+  feed(chunk: Uint8Array): FeedStatus { return this.is.feed(chunk); }
 }
 
 const p = new Point(); p.x = 3; p.y = 4;
@@ -98,7 +102,7 @@ p.serialize(so); so.flush();               // the same bytes, in pieces
 
 // streaming in: feed those pieces — or any other chunking — to the decoder
 const dec = Point.decoder();
-let st: DecodeStatus = DecodeStatus.Complete;   // zero bytes end on a boundary
+let st: FeedStatus = DecodeStatus.Complete;     // zero bytes end on a boundary
 for (const part of parts) st = dec.feed(part);
 
 // COMPLETE says the bytes so far ended on a field boundary, not that the

@@ -175,10 +175,11 @@ describe("invalid UTF-8 whose payload starts at an offset >= its own length", ()
         },
       };
       const is = new IStream(sink);
-      for (const b of msg) is.feed(Uint8Array.of(b));
+      let st: DecodeStatus = DecodeStatus.Complete;
+      for (const b of msg) st = is.feed(Uint8Array.of(b));
       expect(offsets).toStrictEqual(Array.from(payload, (_b, i) => i));
       expect(seen).toStrictEqual([...payload]);
-      expect(is.status()).toBe(DecodeStatus.Complete);
+      expect(st).toBe(DecodeStatus.Complete);
     });
   });
 });
