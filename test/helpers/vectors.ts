@@ -283,6 +283,153 @@ export function loadGrowthCases(): GrowthCase[] {
 }
 
 /**
+ * A header-ceiling case (top-level `header_limits`) — CORELIB_PLAN §6.2.1, §6.3.
+ *
+ * Keyed by a **partial** byte string and carrying a required verdict: the bytes
+ * *declare* a length or an element count and then end, with not one payload byte
+ * behind them. The ceiling is decided at that word — before the payload is asked
+ * for — so the answer is the ceiling's and it is terminal. `INCOMPLETE` is
+ * exactly the outcome MESSAGE_SPEC §5.2.3's reason exists to prevent, since
+ * §5.2.1 defines it as the verdict more bytes *can* change and after a ceiling
+ * has fired nothing can.
+ *
+ * A case states **one** ceiling, never both (§6.2.1 keeps a receiver cap off a
+ * field the schema already bounds), and which one it states decides the category:
+ *
+ * | the case states | the ceiling | a breach is |
+ * |---|---|---|
+ * | `schema.maxlen` | the schema bound | `invalid` — a statement about validity (MESSAGE_SPEC §7.1) |
+ * | `limits.max_dyn_*` | the receiver cap | `limit_exceeded` — a policy rejection on well-formed bytes (§6.2.1) |
+ *
+ * Unlike {@link GrowthCase}, the numbers here are **absolute**: the declared
+ * length is baked into the varint of a fixed byte string, so the case tells the
+ * port which ceiling to configure for its run rather than naming an offset from
+ * the port's own. That configuration is the case's, for the case's run only — it
+ * is no claim about anyone's deployment.
+ */
+export interface HeaderLimitCase {
+  name: string;
+  group: string;
+  description: string;
+  requires?: string[];
+  /** The field's id in the top-level scope. */
+  field_id: number;
+  /** The length (`string`/`blob`) or element count (`array`) the header claims. */
+  declared: number;
+  /** The §6.2.1 receiver cap to configure for this case — exclusive with {@link schema}. */
+  limits?: {
+    max_dyn_string_len?: number;
+    max_dyn_blob_len?: number;
+    max_dyn_array_count?: number;
+  };
+  /** The schema bound to declare for this case — exclusive with {@link limits}. */
+  schema?: { maxlen?: number };
+  /** Lowercase hex of the header alone; the message ends there. */
+  serialized: string;
+  /** OPTIONAL: feed these chunks instead of `serialized` in one call. */
+  chunks?: string[];
+  expect: {
+    outcome: "limit_exceeded" | "invalid" | "incomplete";
+    /** The rejection is terminal — a further feed re-raises rather than consuming. */
+    terminal?: boolean;
+  };
+}
+
+/**
+ * Load the header-ceiling cases, or `[]` on a vector file that predates them.
+ *
+ * Every number in this block indexes or bounds something, so all of them are
+ * narrowed out of the bigint-fidelity parser here — a `bigint` cap compared
+ * against the `number` the decoder reports throws the moment the two meet.
+ */
+export function loadHeaderLimitCases(): HeaderLimitCase[] {
+  const doc = readVectorFile() as unknown as { header_limits?: HeaderLimitCase[] };
+  return (doc.header_limits ?? []).map((c, i) => {
+    const where = `header_limits ${c.name ?? `#${i}`}`;
+    const out: HeaderLimitCase = {
+      ...c,
+      field_id: asIndex(`${where}.field_id`, c.field_id),
+      declared: asIndex(`${where}.declared`, c.declared),
+    };
+    if (c.limits !== undefined) {
+      const limits: HeaderLimitCase["limits"] = {};
+      for (const key of ["max_dyn_string_len", "max_dyn_blob_len", "max_dyn_array_count"] as const) {
+        const v = c.limits[key];
+        if (v !== undefined) limits[key] = asIndex(`${where}.limits.${key}`, v);
+      }
+      // An unrecognised cap key would leave the case running with no ceiling at
+      // all and passing on the fallback outcome, so it is a load failure.
+      if (Object.keys(limits).length !== Object.keys(c.limits).length) {
+        throw new Error(`${where}: unknown receiver cap in limits (${Object.keys(c.limits).join(", ")})`);
+      }
+      out.limits = limits;
+    }
+    if (c.schema !== undefined) {
+      if (c.schema.maxlen === undefined) {
+        throw new Error(`${where}: schema states no maxlen`);
+      }
+      out.schema = { maxlen: asIndex(`${where}.schema.maxlen`, c.schema.maxlen) };
+    }
+    // "Never both" is §6.2.1's rule, and a case that broke it would quietly test
+    // whichever ceiling the reader happened to consult first.
+    if ((out.limits === undefined) === (out.schema === undefined)) {
+      throw new Error(`${where}: exactly one of limits / schema must be stated`);
+    }
+    return out;
+  });
+}
+
+/**
+ * The **profile** capability tags this port declares, beside the wire-construct
+ * tags in {@link PORT_CAPABILITIES}.
+ *
+ * A profile tag is not about what the wire format can express but about what the
+ * port's *generated layer* carries, so it is answered by this repo rather than by
+ * a build flag:
+ *
+ * - `receiver_caps` — generated code here carries §6.2.1 receiver caps that are
+ *   **distinct from** schema bounds: every collector in `src/decode/seq.ts` takes
+ *   the two as separate required arguments and answers a breach of the first with
+ *   `LIMIT_EXCEEDED` and of the second with `INVALID`, and a cap on a plain field
+ *   is compared in the visitor's own `fixlenBegin` / `arrayBegin`.
+ * - `dynamic_arrays` — wrapper-array containers are JS arrays that grow at decode
+ *   time, so the growth block applies.
+ *
+ * They are consulted, never assumed: a port whose profile refuses
+ * schema-unbounded fields at generate time drops the tag and its cases skip.
+ */
+export const PROFILE_CAPABILITIES: ReadonlySet<string> = new Set([
+  "receiver_caps",
+  "dynamic_arrays",
+]);
+
+/**
+ * The `requires` tags of a **block case** this port cannot satisfy — wire
+ * constructs and profile capabilities alike, and empty here by design.
+ *
+ * Separate from {@link missingCapabilities} because an unsatisfied tag means
+ * something different in a block than in a vector: a vector needing a construct a
+ * reduced build cannot represent becomes a *negative* case, while a block case
+ * that already asserts a rejection with a specific category must be **skipped** —
+ * a build that cannot represent the construct would reject it for an unrelated
+ * reason and appear to pass while testing nothing (test_vectors_README.md).
+ */
+export function missingBlockCapabilities(c: { requires?: string[] }): string[] {
+  return (c.requires ?? []).filter(
+    (tag) => !PORT_CAPABILITIES.has(tag) && !PROFILE_CAPABILITIES.has(tag),
+  );
+}
+
+/** Every distinct `requires` tag in `cases` this port does not know — see {@link unknownCapabilityTags}. */
+export function unknownBlockCapabilityTags(cases: { requires?: string[] }[]): string[] {
+  const seen = new Set<string>();
+  for (const c of cases) for (const tag of c.requires ?? []) seen.add(tag);
+  return [...seen]
+    .filter((tag) => !PORT_CAPABILITIES.has(tag) && !PROFILE_CAPABILITIES.has(tag))
+    .sort();
+}
+
+/**
  * Replay a vector's fields onto `os`, exercising the public writer surface.
  *
  * A vector's `serialized` form is the primitive-layer ground truth and always
