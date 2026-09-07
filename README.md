@@ -734,21 +734,36 @@ contiguous, one byte at a time, and split in two at every byte boundary),
 over encode and decode, no view into a fed or one-shot buffer) and `pooled-decoder-state.test.ts` (a decode aborted at every cut point
 leaves nothing behind for the next one).
 
-The three vector-driven suites each print one summary line — `[vectors] 131
+The vector-driven suites each print one summary line — `[vectors] 131
 vectors, none gated out by requires, 524 checks` — so a run says how much of the
 shared suite it actually executed, and a file that arrived truncated or a group
 gated out by `requires` shows up as a smaller number rather than as silence. This
 port compiles no feature out, so nothing is ever gated.
 
-`assets/test_vectors.json` carries three blocks and this port runs all three:
-`vectors`, `invalid_utf8`, and `sequence_growth` — the wrapper-array growth cases of
-§7.2 item 8, replayed by `sequence-growth.test.ts` for both element kinds at three
-chunkings. This port declares `dynamic_arrays`: its wrapper-array containers are JS
-arrays that grow at decode time, so the block applies. The cases are cap-relative and
-the run installs `max_dyn_array_count = 8`. Growth **geometry** splits in two: the
-backing store's reallocation strategy is the engine's amortised doubling, which is not
-this port's to pin, while the fill is, and is asserted as one write per slot in a
-single pass.
+`assets/test_vectors.json` carries four blocks and this port runs all four:
+`vectors`, `invalid_utf8`, `sequence_growth` and `header_limits`. The file is a
+**verbatim** copy of the one in `corelib-c-cpp`, which authors it. A daily CI job (`.github/workflows/shared-vectors.yml`) compares this copy's sha256 against that file on `corelib-c-cpp@main`, so a copy left behind by an upstream change is reported rather than going unnoticed.
+
+`sequence_growth` holds the wrapper-array growth cases of §7.2 item 8, replayed by
+`sequence-growth.test.ts` for both element kinds at three chunkings. This port
+declares `dynamic_arrays`: its wrapper-array containers are JS arrays that grow at
+decode time, so the block applies. The cases are cap-relative and the run installs
+`max_dyn_array_count = 8`. Growth **geometry** splits in two: the backing store's
+reallocation strategy is the engine's amortised doubling, which is not this port's to
+pin, while the fill is, and is asserted as one write per slot in a single pass.
+
+`header_limits` holds the truncated over-ceiling headers of §6.2.1 / §6.3 — bytes
+that declare a length or an element count and then end, with no payload behind them —
+replayed by `header-limits.test.ts`. The ceiling answers **at that word**, before the
+payload is asked for, so the verdict is terminal and never `INCOMPLETE`; which
+ceiling the case configures decides the category, `INVALID` for a schema `maxlen` and
+`LIMIT_EXCEEDED` for a §6.2.1 receiver cap. This port declares `receiver_caps`: its
+generated layer carries receiver caps distinct from schema bounds, compared inside the
+visitor's own `fixlenBegin` / `arrayBegin`, which this library raises at the header
+word. Every rejection case is paired with an in-cap control that must still answer
+`incomplete`, and the block is also run with the ceilings lifted — where all six
+rejections fall back to `incomplete`, since this port's `FIXLEN_MAX` (`INT32_MAX`)
+sits above even the amplification case's 1 GiB claim.
 
 CI type-checks, tests and builds on Node 20 / 22 / 24 / 26, smoke-tests the
 bundle on Node, Deno and Bun, and publishes coverage badges; a separate
