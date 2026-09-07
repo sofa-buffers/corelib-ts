@@ -742,7 +742,7 @@ port compiles no feature out, so nothing is ever gated.
 
 `assets/test_vectors.json` carries four blocks and this port runs all four:
 `vectors`, `invalid_utf8`, `sequence_growth` and `header_limits`. The file is a
-**verbatim** copy of the one in `corelib-c-cpp`, which authors it. A daily CI job (`.github/workflows/shared-vectors.yml`) compares the sha256 of this copy against that file on `corelib-c-cpp@main`, so a copy left behind by an upstream change shows up here rather than going unnoticed.
+**verbatim** copy of the one in `corelib-c-cpp`, which authors it. A daily CI job (`.github/workflows/shared-vectors.yml`) compares this copy's sha256 against that file on `corelib-c-cpp@main`, so a copy left behind by an upstream change is reported rather than going unnoticed.
 
 `sequence_growth` holds the wrapper-array growth cases of §7.2 item 8, replayed by
 `sequence-growth.test.ts` for both element kinds at three chunkings. This port
