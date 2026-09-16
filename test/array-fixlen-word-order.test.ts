@@ -224,8 +224,6 @@ describe("fixlen array: the schema count is applied after the element word (§4.
 describe("fixlen array: only fp32/fp64 are subtypes at all (§4.8.1 step 3, §5.2.2)", () => {
   const greedy: Visitor = {
     arrayBegin: () => true,
-    arrayFp32: () => undefined,
-    arrayFp64: () => undefined,
     fixlenBegin: () => undefined,
     string: () => undefined,
     blob: () => undefined,

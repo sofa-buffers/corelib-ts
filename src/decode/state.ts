@@ -42,11 +42,17 @@ import {
   WireType,
 } from "../constants.js";
 import type { FeedStatus } from "../constants.js";
-import { SofabError, SofabErrorCode, invalidMsgError } from "../errors.js";
+import { SofabError, SofabErrorCode, argumentError, invalidMsgError } from "../errors.js";
+import { Long } from "../long.js";
 import { joinI64, joinU64 } from "../varint/bits64.js";
 import { fp32FromBits, fp64FromBits } from "../varint/num64.js";
 import { SKIP } from "./skip.js";
-import type { Visitor } from "./istream.js";
+import type {
+  ArrayTarget,
+  FloatArrayTarget,
+  IntegerArrayTarget,
+  Visitor,
+} from "./istream.js";
 
 const enum S {
   Header,
@@ -56,13 +62,40 @@ const enum S {
   FixlenFp,
   FixlenBytes,
   ArrayCount,
-  ArrayUElem,
-  ArraySElem,
+  ArrayElem,
   ArrayElemWord,
   ArrayFp,
 }
 
 const TWO32 = 0x1_0000_0000; // 2^32, for combining the 32-bit halves
+
+/**
+ * Which destination an accepted {@link ArrayTarget} named — resolved once, at the
+ * hand-off, so the drains switch on a small integer instead of re-deciding per
+ * element which field of the target is set.
+ */
+const enum BM {
+  /** {@link IntegerArrayTarget.values} — number-first. */
+  Values,
+  /**
+   * {@link IntegerArrayTarget.values} for a bound that fits 32 bits — every
+   * `u8`..`u32` array, which is most of them. The element *is* its low half then:
+   * no halves to join, no `bigint` to consider, and the bound is two comparisons
+   * on a small integer. Worth its own arm at 22 Ir/element (`array<u16>`:
+   * 209 434 -> 181 866 Ir/op over 1000 elements).
+   */
+  Values32,
+  /** {@link IntegerArrayTarget.longs} — a {@link Long} per element, no `bigint`. */
+  Longs,
+  /** {@link IntegerArrayTarget.lo} / `hi` — raw halves, nothing allocated. */
+  Halves,
+  /** {@link FloatArrayTarget.f32} — values. */
+  F32,
+  /** {@link FloatArrayTarget.bits} — the wire words, so an fp32 sNaN survives. */
+  F32Bits,
+  /** {@link FloatArrayTarget.f64}. */
+  F64,
+}
 
 export class DecoderState {
   /** The caller's visitor — bound at construction, or re-bound by {@link begin}. */
@@ -207,6 +240,23 @@ export class DecoderState {
   private arrIsFixlen = false;
   private arrCount = 0;
   private arrIndex = 0;
+  /**
+   * The destination the visitor handed over for the array being decoded, or
+   * `null` while no hand-off is in force — which is every array the visitor
+   * declined, and every array at all for a visitor that declares no
+   * {@link Visitor.arrayBulk}.
+   *
+   * **The one reference this machine keeps into the caller's storage between
+   * `feed` calls.** Everything else it holds past a callback is its own (§6.6):
+   * a payload is reported as coordinates into the caller's chunk and never
+   * retained. An array that straddles chunks has to remember where its elements
+   * go, so this lives from the hand-off to `arrayEnd` — and is dropped there,
+   * by {@link endArray}, and by {@link release} for a machine going back to the
+   * pool.
+   */
+  private bulk: ArrayTarget | null = null;
+  /** Which destination {@link bulk} named; meaningless while it is `null`. */
+  private bulkMode: BM = BM.Values;
 
   constructor(visitor: Visitor = SKIP) {
     this.root = visitor;
@@ -230,7 +280,10 @@ export class DecoderState {
    * zero because `vBytes` is 0), `vComplete` by the `varintStep` whose result is
    * being tested, `fpLo`/`fpHi`/`need` by {@link fpBegin}, `fix*` by
    * {@link fixlenWord}, `arrKind`/`arrIsFixlen` by {@link dispatch} and
-   * `arrCount`/`arrIndex` by the count word, `seqIds[d]` when the scope at `d`
+   * `arrCount`/`arrIndex` by the count word and `bulkMode` by the hand-off the
+   * same word makes (`bulk` *is* cleared: it is the caller's storage, and a
+   * machine that starts a fresh decode must not still be pointing at the last
+   * one's), `seqIds[d]` when the scope at `d`
    * opens. `have` is the one exception and *is* cleared: the `S.ArrayFp` bulk loop
    * reads it to decide whether an element is half-arrived.
    *
@@ -254,6 +307,7 @@ export class DecoderState {
     this.refusal = null;
     this.vBytes = 0;
     this.have = 0;
+    this.bulk = null;
   }
 
   /**
@@ -265,6 +319,9 @@ export class DecoderState {
     this.cur = SKIP;
     this.view = null;
     this.viewOf = null;
+    // A decode aborted inside an array leaves the visitor's destination here;
+    // a pooled machine must not keep it alive (see {@link bulk}).
+    this.bulk = null;
   }
 
   /** Feed `input` to the machine, dispatching to the bound visitor. */
@@ -289,14 +346,25 @@ export class DecoderState {
       // hands the refused field's own bytes to the visitor as fields that were
       // never on the wire.
       //
-      // The two codes stay distinct through the latch — §6.3: a cap rejection
+      // `Argument` is latched for a third reason, and it is about this machine
+      // rather than about the message: a target the hand-off cannot fill is
+      // refused *after* the count word has been consumed and the element state
+      // entered, so the position `run` was holding dies with the stack. Left
+      // unlatched, the next chunk would resume mid-array at the wrong offset and
+      // hand the visitor fields that were never on the wire — exactly what this
+      // block exists to prevent. The caller's mistake does not become a verdict
+      // about the bytes: the code stays `ARGUMENT` through the latch, as the
+      // other two stay themselves.
+      //
+      // The two message codes stay distinct through it — §6.3: a cap rejection
       // "MUST NOT be reported as `InvalidMessage`", so it is re-raised as
       // `LIMIT_EXCEEDED` and never becomes `INVALID`.
       if (
         this.refusal === null &&
         e instanceof SofabError &&
         (e.code === SofabErrorCode.InvalidMsg ||
-          e.code === SofabErrorCode.LimitExceeded)
+          e.code === SofabErrorCode.LimitExceeded ||
+          e.code === SofabErrorCode.Argument)
       ) {
         this.latch(e);
       }
@@ -522,93 +590,59 @@ export class DecoderState {
           } else if (count === 0) {
             // §4.7: a zero-count integer array is empty — no payload follows and
             // no element-length word exists (element width is API-only).
-            this.state = S.Header;
+            //
+            // Offered all the same, and closed through {@link endArray} like any
+            // other array: a visitor holding one destination per field would
+            // otherwise read the *previous* array's elements out of it, having
+            // been told nothing. An empty array is a fact about this field, and
+            // the destination has to end up saying so.
             this.cur.arrayBegin?.(this.id, this.arrKind, 0);
-            this.cur.arrayEnd?.(this.id);
+            this.askBulk(this.arrKind, 0);
+            this.endArray();
           } else {
-            this.state = this.arrKind === ArrayKind.Unsigned ? S.ArrayUElem : S.ArraySElem;
+            this.state = S.ArrayElem;
             this.cur.arrayBegin?.(this.id, this.arrKind, count);
+            this.askBulk(this.arrKind, count);
           }
           break;
         }
 
-        case S.ArrayUElem: {
-          // Bulk drain: while a whole element varint is known to be present,
-          // decode elements back to back without re-entering the outer switch or
-          // the resumable accumulator once per element. The tail — where an
-          // element may straddle the chunk — falls through to the single-element
-          // path below, which is the one that suspends and resumes.
-          const cur = this.cur;
-          const id = this.id;
+        case S.ArrayElem: {
           const count = this.arrCount;
           const safeEnd = n - VARINT_MAX_BYTES;
+          // A destination was handed over: delivery is one call, out of line, and
+          // none of it is carried in this switch (see uBulkArm).
+          if (this.bulk !== null) {
+            i =
+              this.arrKind === ArrayKind.Unsigned
+                ? this.uBulkArm(input, i, n, count, safeEnd)
+                : this.sBulkArm(input, i, n, count, safeEnd);
+            break;
+          }
+          // No destination: the elements are walked over, not decoded into
+          // existence (§6.7.2's `skip` intent). Nothing distinguishes the two
+          // integer kinds here — the zig-zag only matters to a value nobody asked
+          // for — so one arm serves both, and the decode switch is one case
+          // smaller for it.
           let idx = this.arrIndex;
-          // Only enter the bulk path at a clean element boundary: a varint left
-          // half-read by the previous chunk lives in the accumulator, and
-          // `varintFull` would start a fresh one and drop it.
+          // Only scan ahead from a clean element boundary: a varint left half-read
+          // by the previous chunk lives in the accumulator, and `varintFull` would
+          // start a fresh one and drop it.
           if (this.vBytes === 0) {
             while (idx < count && i <= safeEnd) {
               i = this.varintFull(input, i);
-              cur.arrayUnsigned?.(id, idx, this.vUnsigned(), this.vLo >>> 0, this.vHi >>> 0);
-              this.arrIndex = ++idx;
+              idx++;
             }
+            this.arrIndex = idx;
           }
           if (idx === count) {
             this.state = S.Header;
-            cur.arrayEnd?.(id);
+            this.cur.arrayEnd?.(this.id);
             break;
           }
           if (i >= n) break;
           i = this.varintStep(input, i);
           if (!this.vComplete) return;
-          cur.arrayUnsigned?.(id, idx, this.vUnsigned(), this.vLo >>> 0, this.vHi >>> 0);
-          this.advanceArray();
-          break;
-        }
-
-        case S.ArraySElem: {
-          const cur = this.cur;
-          const id = this.id;
-          const count = this.arrCount;
-          const safeEnd = n - VARINT_MAX_BYTES;
-          let idx = this.arrIndex;
-          // See the unsigned arm: never bulk-decode over a pending partial varint.
-          if (this.vBytes === 0) {
-            while (idx < count && i <= safeEnd) {
-              i = this.varintFull(input, i);
-              const lo = this.vLo >>> 0;
-              const hi = this.vHi >>> 0;
-              const mask = -(lo & 1) >>> 0;
-              cur.arraySigned?.(
-                id,
-                idx,
-                this.vSigned(),
-                ((((lo >>> 1) | (hi << 31)) >>> 0) ^ mask) >>> 0,
-                ((hi >>> 1) ^ mask) >>> 0,
-              );
-              this.arrIndex = ++idx;
-            }
-          }
-          if (idx === count) {
-            this.state = S.Header;
-            cur.arrayEnd?.(id);
-            break;
-          }
-          if (i >= n) break;
-          i = this.varintStep(input, i);
-          if (!this.vComplete) return;
-          {
-            const lo = this.vLo >>> 0;
-            const hi = this.vHi >>> 0;
-            const mask = -(lo & 1) >>> 0;
-            cur.arraySigned?.(
-              id,
-              idx,
-              this.vSigned(),
-              ((((lo >>> 1) | (hi << 31)) >>> 0) ^ mask) >>> 0,
-              ((hi >>> 1) ^ mask) >>> 0,
-            );
-          }
           this.advanceArray();
           break;
         }
@@ -630,43 +664,43 @@ export class DecoderState {
           if (this.arrCount === 0) {
             // §4.8: an empty fixlen array is [ header ][ count = 0 ][ fixlen_word ]
             // with no payload — the word above yielded the true element kind.
-            this.state = S.Header;
             this.cur.arrayBegin?.(this.id, this.arrKind, 0);
-            this.cur.arrayEnd?.(this.id);
+            this.askBulk(this.arrKind, 0);
+            this.endArray();
           } else {
             this.state = S.ArrayFp;
             this.cur.arrayBegin?.(this.id, this.arrKind, this.arrCount);
+            this.askBulk(this.arrKind, this.arrCount);
           }
           break;
         }
 
         case S.ArrayFp: {
-          const cur = this.cur;
-          const id = this.id;
           const count = this.arrCount;
           const size = this.need;
-          const isFp32 = this.arrKind === ArrayKind.Fp32;
-          let idx = this.arrIndex;
-          // Bulk drain, as in the integer arms: an element wholly inside the
-          // chunk is read straight out of it, and only a straddling one goes
-          // through the byte-at-a-time accumulator below.
-          if (this.have === 0 && idx < count && n - i >= size) {
-            i = this.fpDrain(input, i, n, count, size, isFp32);
-            idx = this.arrIndex;
+          if (this.bulk !== null) {
+            const is32 = this.arrKind === ArrayKind.Fp32;
+            i = this.fpBulkArm(input, i, n, count, size, is32);
+            break;
           }
-          if (idx === count) {
+          // No destination: step over the elements. A float run is fixed-width,
+          // so skipping is arithmetic — no handle, no byte loads, nothing decoded
+          // (§6.7.2). Only an element straddling the chunk goes through the
+          // accumulator below, which is where the resume lives.
+          if (this.have === 0) {
+            const run = Math.min(count - this.arrIndex, ((n - i) / size) | 0);
+            i += run * size;
+            this.arrIndex += run;
+          }
+          if (this.arrIndex === count) {
             this.state = S.Header;
-            cur.arrayEnd?.(id);
+            this.cur.arrayEnd?.(this.id);
             break;
           }
           if (i >= n) break;
           i = this.fpStep(input, i, n);
           if (this.have < this.need) return;
-          const lo = this.fpLo;
-          const hi = this.fpHi;
           this.fpBegin(size); // next element starts from a clear accumulator
-          if (isFp32) cur.arrayFp32?.(id, idx, fp32FromBits(lo), lo >>> 0);
-          else cur.arrayFp64?.(id, idx, fp64FromBits(lo, hi));
           this.advanceArray();
           break;
         }
@@ -726,6 +760,10 @@ export class DecoderState {
    */
   private latch<E extends SofabError>(e: E): E {
     this.refusal = e;
+    // Nothing more will be decoded, so the visitor's destination is dropped here
+    // as it would have been at `arrayEnd`: a latched stream the caller keeps must
+    // not keep *their* storage alive with it (§6.6; see {@link bulk}).
+    this.bulk = null;
     return e;
   }
 
@@ -876,6 +914,541 @@ export class DecoderState {
       this.state = S.Header;
       this.cur.arrayEnd?.(this.id);
     }
+  }
+
+  /**
+   * Close an array delivered through the hand-off: back to the header state, drop
+   * the visitor's destination, announce the end. Every bulk array ends here, so
+   * the reference into the caller's storage cannot outlive the array it was made
+   * for (§6.6; see {@link bulk}).
+   *
+   * The per-element arms keep their own two lines instead of calling this: they
+   * can never hold a destination — the hand-off's arms have already taken over
+   * before they run — and the call showed up on `decode: typical`.
+   */
+  private endArray(): void {
+    this.state = S.Header;
+    const t = this.bulk;
+    if (t !== null) this.trimPlain(t, this.arrIndex);
+    this.bulk = null;
+    this.cur.arrayEnd?.(this.id);
+  }
+
+  /**
+   * Cut a plain-array destination to the `written` elements this array actually
+   * put in it, so a destination reused across arrays — the shape the hand-off
+   * exists for — can never hand back the previous array's tail, and its `length`
+   * always means "elements of *this* array".
+   *
+   * At the end rather than at the hand-off, and that is measured: clearing it up
+   * front turns every element write into a grow (`array<u16>` 181 583 -> 231 815
+   * Ir/op, worse than the per-element path it replaces), where one length store
+   * per array costs nothing. A pre-sized destination — the fast shape, every write
+   * in bounds — is left exactly as it was.
+   *
+   * The typed destinations are not trimmed and cannot be: their length is the
+   * caller's allocation, checked against `count` at the hand-off, and `count` is
+   * how far this fill wrote.
+   */
+  private trimPlain(t: ArrayTarget, written: number): void {
+    const mode = this.bulkMode;
+    if (mode !== BM.Values && mode !== BM.Values32 && mode !== BM.Longs) return;
+    const out =
+      mode === BM.Longs
+        ? (t as IntegerArrayTarget).longs!
+        : (t as IntegerArrayTarget).values!;
+    if (out.length > written) out.length = written;
+  }
+
+  /**
+   * Offer the bulk hand-off for the array that just began, and resolve the answer
+   * once (CORELIB_PLAN §5.3.1's one implementation, and {@link ArrayTarget}'s
+   * contract): after this, the element loops know which destination to write to
+   * from {@link bulkMode} and re-decide nothing per element.
+   *
+   * Raised after `arrayBegin` and before the first element, so a receiver cap on
+   * the count (§6.2.1) is still compared in `arrayBegin` and a rejected array is
+   * never offered. A visitor that declares no `arrayBulk` pays one short-circuited
+   * optional call per array.
+   *
+   * **An empty array is offered too**, with `count` of 0. There is nothing to
+   * write, but there is something to say: a destination held across fields would
+   * otherwise still be holding the last array's elements, and its length is the
+   * only place this one's emptiness could show up (see {@link trimPlain}).
+   */
+  private askBulk(kind: ArrayKind, count: number): void {
+    // `cur` is SKIP inside a declined subtree and declares nothing, so the offer
+    // short-circuits there exactly like every other callback (§6.2.1's "a skipped
+    // field is never capped" falls out the same way).
+    const t = this.cur.arrayBulk?.(this.id, kind, count) ?? null;
+    if (t === null) {
+      this.bulk = null;
+      return;
+    }
+    // Resolve *before* storing: a target this machine cannot fill is a caller
+    // mistake (§6.3's third row), and it is refused with nothing written and the
+    // array still on the per-element path's terms.
+    this.bulkMode = this.resolveTarget(t, kind, count);
+    this.bulk = t;
+  }
+
+  /**
+   * Which destination `t` names — or an `Argument` refusal if it names none, more
+   * than one, one that contradicts the array's element kind, or one too short to
+   * hold `count` elements.
+   *
+   * These are caller mistakes rather than message verdicts, so they are
+   * `InvalidArgument` (§6.3) and not `INVALID_MSG`: the same bytes decode fine for
+   * a visitor that hands over a destination it can actually fill. Checked once per
+   * array, which is why the fill loops need no guard of their own.
+   */
+  private resolveTarget(t: ArrayTarget, kind: ArrayKind, count: number): BM {
+    if (kind === ArrayKind.Fp32 || kind === ArrayKind.Fp64) {
+      const f = t as FloatArrayTarget;
+      const is32 = kind === ArrayKind.Fp32;
+      // An fp32 array takes values *or* wire words; an fp64 array takes values,
+      // its `Float64Array` already carrying every bit (a payload NaN included).
+      const dest = is32 ? (f.f32 ?? f.bits) : f.f64;
+      const named =
+        (f.f32 !== undefined ? 1 : 0) +
+        (f.bits !== undefined ? 1 : 0) +
+        (f.f64 !== undefined ? 1 : 0);
+      const want = is32 ? "f32 or bits" : "f64";
+      if (dest === undefined || named !== 1) {
+        throw argumentError(
+          `array ${this.id}: an ${is32 ? "fp32" : "fp64"} array needs` +
+            ` exactly the ${want} destination`,
+        );
+      }
+      if (dest.length < count) {
+        throw argumentError(
+          `array ${this.id}: ${is32 ? "fp32" : "fp64"} destination holds` +
+            ` ${dest.length} of ${count} elements`,
+        );
+      }
+      if (!is32) return BM.F64;
+      return f.bits !== undefined ? BM.F32Bits : BM.F32;
+    }
+
+    const it = t as IntegerArrayTarget;
+    const halves = it.lo !== undefined || it.hi !== undefined;
+    const named =
+      (it.values !== undefined ? 1 : 0) + (it.longs !== undefined ? 1 : 0) + (halves ? 1 : 0);
+    if (named !== 1) {
+      throw argumentError(
+        `array ${this.id}: an integer array target needs exactly one destination` +
+          ` (values, longs, or lo+hi), got ${named}`,
+      );
+    }
+    // The bound governs every element about to be written, so a bound that is not
+    // one is refused before the first of them — the same reasoning the receiver
+    // bounds in `seq.ts` are checked at construction for (§6.2.1, §6.3).
+    if (
+      (it.minLo >>> 0) !== it.minLo ||
+      (it.minHi >>> 0) !== it.minHi ||
+      (it.maxLo >>> 0) !== it.maxLo ||
+      (it.maxHi >>> 0) !== it.maxHi
+    ) {
+      throw argumentError(
+        `array ${this.id}: the element bound must be four unsigned 32-bit halves`,
+      );
+    }
+    // An interval that cannot contain anything is a mistake in the *call*, and it
+    // has to be judged in the signedness the array's kind will compare it in: the
+    // widest unsigned bound handed to a signed array reads as `maxHi | 0 === -1`,
+    // an empty interval, and every element of a well-formed message would be
+    // refused as `INVALID`. §6.3 keeps those apart — this one is `ARGUMENT`.
+    const signed = kind === ArrayKind.Signed;
+    const minHi = signed ? it.minHi | 0 : it.minHi;
+    const maxHi = signed ? it.maxHi | 0 : it.maxHi;
+    if (minHi > maxHi || (minHi === maxHi && it.minLo > it.maxLo)) {
+      throw argumentError(
+        `array ${this.id}: the element bound is empty` +
+          ` (min ${it.minHi}:${it.minLo} > max ${it.maxHi}:${it.maxLo})`,
+      );
+    }
+    if (halves) {
+      const lo = it.lo;
+      const hi = it.hi;
+      if (lo === undefined || hi === undefined) {
+        throw argumentError(`array ${this.id}: the halves destination needs both lo and hi`);
+      }
+      if (lo.length < count || hi.length < count) {
+        throw argumentError(
+          `array ${this.id}: halves destination holds` +
+            ` ${Math.min(lo.length, hi.length)} of ${count} elements`,
+        );
+      }
+      return BM.Halves;
+    }
+    // A plain array needs no length: it grows on write. What it does need is to
+    // be a real `Array` — a typed one would take the writes and silently drop
+    // every index past its own length, and it is the one destination shape whose
+    // length is not checked. Its *tail* is cut where the fill ended, not here:
+    // emptying it at the hand-off would make every write a grow, which measured
+    // 181 583 -> 231 815 Ir/op on `array<u16>` — the whole win and then some.
+    // {@link trimPlain} does it at the end instead, for nothing.
+    if (it.longs !== undefined) {
+      if (!Array.isArray(it.longs)) {
+        throw argumentError(`array ${this.id}: the longs destination must be an Array`);
+      }
+      return BM.Longs;
+    }
+    if (!Array.isArray(it.values)) {
+      throw argumentError(`array ${this.id}: the values destination must be an Array`);
+    }
+    // The 32-bit arm is legal exactly when no legal element can reach the high
+    // half — which is what a bound with both high halves zero says.
+    return it.minHi === 0 && it.maxHi === 0 ? BM.Values32 : BM.Values;
+  }
+
+  /**
+   * The whole `S.ArrayUElem` arm for an array whose destination was handed over:
+   * drain what this chunk holds, store a straddling tail element, close the array
+   * when it ends. Returns the new read position; the caller's `break` then either
+   * re-enters this state for the next chunk or leaves it, exactly as before.
+   *
+   * **Out of line, for the reason {@link fpDrain} already gives.** Everything
+   * written into {@link push}'s switch is paid for by every decode that never
+   * reaches it, so this arm is three lines at the call site and a method here.
+   * Carrying its body in the switch instead cost `decode: typical` 5092 -> 5099
+   * Ir/op and `decode: u64 array` 705.0k -> 708.5k; giving each bulk arm a state
+   * of its own — which keeps the per-element arms untouched but adds three labels
+   * — cost 5163 on `typical`, worse than either. What is left is what the
+   * hand-off costs a decode that never takes it: 0.34% (5075 -> 5092, 702.5k ->
+   * 705.0k), in the loop's own size.
+   *
+   * Suspension needs no signal of its own: a varint that did not complete consumed
+   * the chunk to its end, so the returned position is `n` and the decode loop exits
+   * on its own condition.
+   *
+   * **One loop per destination**, chosen once (see {@link bulkMode}) rather than
+   * branched on per element: the shapes differ only in what a stored element *is*,
+   * and a loop deciding that per element would give back what the hand-off saves.
+   * `arrIndex` is likewise written once per drain instead of once per element,
+   * which is part of why a bulk fill costs less than *discarding* the same
+   * elements. A refusal mid-loop leaves it at the last committed value; nothing
+   * reads it afterwards, because that verdict is terminal (§5.2.1).
+   */
+  private uBulkArm(
+    input: Uint8Array,
+    i: number,
+    n: number,
+    count: number,
+    safeEnd: number,
+  ): number {
+    const t = this.bulk as IntegerArrayTarget;
+    const mode = this.bulkMode;
+    const minLo = t.minLo;
+    const minHi = t.minHi;
+    const maxLo = t.maxLo;
+    const maxHi = t.maxHi;
+    // Drain, then tail, then drain again — in **one** call. A short array is all
+    // tail (the drain only runs where a whole varint is guaranteed to be in the
+    // chunk, which the last ten bytes never are), so returning to the decode
+    // switch per tail element put two calls and a re-read of the bound on every
+    // element of exactly the arrays with the fewest to amortise them.
+    for (;;) {
+      if (this.vBytes === 0) {
+        let idx = this.arrIndex;
+        if (mode === BM.Values32) {
+          const out = t.values!;
+          while (idx < count && i <= safeEnd) {
+            i = this.varintFull(input, i);
+            const lo = this.vLo >>> 0;
+            // A high half of its own puts the element past every 32-bit bound, so
+            // one test covers "too large to be this type" and "outside the bound".
+            if (this.vHi !== 0 || lo < minLo || lo > maxLo) this.outOfBound(idx);
+            out[idx++] = lo;
+          }
+        } else if (mode === BM.Values) {
+          const out = t.values!;
+          while (idx < count && i <= safeEnd) {
+            i = this.varintFull(input, i);
+            const lo = this.vLo >>> 0;
+            const hi = this.vHi >>> 0;
+            if (
+              hi < minHi ||
+              (hi === minHi && lo < minLo) ||
+              hi > maxHi ||
+              (hi === maxHi && lo > maxLo)
+            ) {
+              this.outOfBound(idx);
+            }
+            out[idx++] = hi <= 0x1fffff ? hi * TWO32 + lo : joinU64(lo, hi);
+          }
+        } else if (mode === BM.Longs) {
+          const out = t.longs!;
+          while (idx < count && i <= safeEnd) {
+            i = this.varintFull(input, i);
+            const lo = this.vLo >>> 0;
+            const hi = this.vHi >>> 0;
+            if (
+              hi < minHi ||
+              (hi === minHi && lo < minLo) ||
+              hi > maxHi ||
+              (hi === maxHi && lo > maxLo)
+            ) {
+              this.outOfBound(idx);
+            }
+            out[idx++] = new Long(lo, hi);
+          }
+        } else {
+          const oLo = t.lo!;
+          const oHi = t.hi!;
+          while (idx < count && i <= safeEnd) {
+            i = this.varintFull(input, i);
+            const lo = this.vLo >>> 0;
+            const hi = this.vHi >>> 0;
+            if (
+              hi < minHi ||
+              (hi === minHi && lo < minLo) ||
+              hi > maxHi ||
+              (hi === maxHi && lo > maxLo)
+            ) {
+              this.outOfBound(idx);
+            }
+            oLo[idx] = lo;
+            oHi[idx] = hi;
+            idx++;
+          }
+        }
+        this.arrIndex = idx;
+      }
+      if (this.arrIndex === count) {
+        this.endArray();
+        return i;
+      }
+      if (i >= n) return i;
+      // One element out of the resumable accumulator: the straddling case, and
+      // every element of an array that sits in the last ten bytes of a chunk.
+      i = this.varintStep(input, i);
+      if (!this.vComplete) return i;
+      // Out of line, like the float arm's: inlined here it makes this method big
+      // enough that V8 optimises the fill loops above it worse (the float twin
+      // measured 37 542 -> 49 154 Ir/op from exactly this).
+      this.bulkStoreU(this.arrIndex, this.vLo >>> 0, this.vHi >>> 0);
+      if (++this.arrIndex === count) {
+        this.endArray();
+        return i;
+      }
+    }
+  }
+
+  /** The signed twin of {@link uBulkArm}: the same shape, with the zig-zag undone. */
+  private sBulkArm(
+    input: Uint8Array,
+    i: number,
+    n: number,
+    count: number,
+    safeEnd: number,
+  ): number {
+    const t = this.bulk as IntegerArrayTarget;
+    const mode = this.bulkMode;
+    const minLo = t.minLo;
+    const minHi = t.minHi | 0;
+    const maxLo = t.maxLo;
+    const maxHi = t.maxHi | 0;
+    for (;;) {
+      if (this.vBytes === 0) {
+        let idx = this.arrIndex;
+        while (idx < count && i <= safeEnd) {
+          i = this.varintFull(input, i);
+          const raw = this.vLo >>> 0;
+          const rawHi = this.vHi >>> 0;
+          const mask = -(raw & 1) >>> 0;
+          const lo = ((((raw >>> 1) | (rawHi << 31)) >>> 0) ^ mask) >>> 0;
+          const hi = ((rawHi >>> 1) ^ mask) >>> 0;
+          const shi = hi | 0;
+          if (
+            shi < minHi ||
+            (shi === minHi && lo < minLo) ||
+            shi > maxHi ||
+            (shi === maxHi && lo > maxLo)
+          ) {
+            this.outOfBound(idx);
+          }
+          if (mode === BM.Values || mode === BM.Values32) {
+            // vSigned() inlined: the halves are in hand and this runs per element.
+            let v: number | bigint;
+            if (rawHi <= 0x1fffff) {
+              const r = rawHi * TWO32 + raw; // raw zig-zag, ≤ 2^53-1
+              v = r % 2 === 0 ? r / 2 : -(r + 1) / 2;
+            } else {
+              v = joinI64(lo, hi);
+            }
+            t.values![idx] = v;
+          } else if (mode === BM.Longs) {
+            t.longs![idx] = new Long(lo, hi);
+          } else {
+            t.lo![idx] = lo;
+            t.hi![idx] = hi;
+          }
+          idx++;
+        }
+        this.arrIndex = idx;
+      }
+      if (this.arrIndex === count) {
+        this.endArray();
+        return i;
+      }
+      if (i >= n) return i;
+      i = this.varintStep(input, i);
+      if (!this.vComplete) return i;
+      this.bulkStoreS(this.arrIndex, this.vLo >>> 0, this.vHi >>> 0);
+      if (++this.arrIndex === count) {
+        this.endArray();
+        return i;
+      }
+    }
+  }
+
+  /** The float twin of {@link uBulkArm}; a straddling element resumes through {@link fpStep}. */
+  private fpBulkArm(
+    input: Uint8Array,
+    i: number,
+    n: number,
+    count: number,
+    size: number,
+    isFp32: boolean,
+  ): number {
+    if (this.have === 0 && this.arrIndex < count && n - i >= size) {
+      const t = this.bulk as FloatArrayTarget;
+      const run = Math.min(count - this.arrIndex, ((n - i) / size) | 0);
+      let idx = this.arrIndex;
+      const bitsOut = this.bulkMode === BM.F32Bits ? t.bits! : null;
+      if (run >= (isFp32 ? FP32_HANDLE_MIN : FP64_HANDLE_MIN)) {
+        // Past the threshold the handle pays for itself — for the wire words as
+        // much as for the values: one `getUint32` beats four byte loads and a
+        // shift per element (an fp32 run into `bits` measured 80 934 -> 37 611
+        // Ir/op over 1000 elements).
+        const dv = this.dataView(input);
+        if (bitsOut !== null) {
+          for (let k = 0; k < run; k++) {
+            bitsOut[idx++] = dv.getUint32(i, true);
+            i += 4;
+          }
+        } else if (isFp32) {
+          const out = t.f32!;
+          for (let k = 0; k < run; k++) {
+            out[idx++] = dv.getFloat32(i, true);
+            i += 4;
+          }
+        } else {
+          const out = t.f64!;
+          for (let k = 0; k < run; k++) {
+            out[idx++] = dv.getFloat64(i, true);
+            i += 8;
+          }
+        }
+      } else if (bitsOut !== null) {
+        // Below it, byte loads and no handle at all — the §6.6.2 count is the
+        // one `fpDrain` already justified, unchanged by this hand-off.
+        for (let k = 0; k < run; k++) {
+          bitsOut[idx++] = u32le(input, i);
+          i += 4;
+        }
+      } else if (isFp32) {
+        const out = t.f32!;
+        for (let k = 0; k < run; k++) {
+          out[idx++] = fp32FromBits(u32le(input, i));
+          i += 4;
+        }
+      } else {
+        const out = t.f64!;
+        for (let k = 0; k < run; k++) {
+          out[idx++] = fp64FromBits(u32le(input, i), u32le(input, i + 4));
+          i += 8;
+        }
+      }
+      this.arrIndex = idx;
+    }
+    if (this.arrIndex === count) {
+      this.endArray();
+      return i;
+    }
+    if (i >= n) return i;
+    i = this.fpStep(input, i, n);
+    if (this.have < this.need) return i;
+    const lo = this.fpLo;
+    const hi = this.fpHi;
+    this.fpBegin(size); // next element starts from a clear accumulator
+    this.bulkStoreFp(this.arrIndex, lo, hi, isFp32);
+    if (++this.arrIndex === count) this.endArray();
+    return i;
+  }
+
+  /** Store one float element that straddled a chunk boundary (see {@link bulkStoreU}). */
+  private bulkStoreFp(idx: number, lo: number, hi: number, isFp32: boolean): void {
+    const t = this.bulk as FloatArrayTarget;
+    if (!isFp32) t.f64![idx] = fp64FromBits(lo, hi);
+    else if (this.bulkMode === BM.F32Bits) t.bits![idx] = lo >>> 0;
+    else t.f32![idx] = fp32FromBits(lo);
+  }
+
+  /**
+   * Store one unsigned element that straddled a chunk boundary — the tail a drain
+   * loop cannot take, resumed from the varint accumulator. At most one per chunk,
+   * so it re-decides the destination rather than duplicating three loops.
+   */
+  private bulkStoreU(idx: number, lo: number, hi: number): void {
+    const t = this.bulk as IntegerArrayTarget;
+    if (
+      hi < t.minHi ||
+      (hi === t.minHi && lo < t.minLo) ||
+      hi > t.maxHi ||
+      (hi === t.maxHi && lo > t.maxLo)
+    ) {
+      this.outOfBound(idx);
+    }
+    if (this.bulkMode === BM.Values || this.bulkMode === BM.Values32) {
+      t.values![idx] = this.vUnsigned();
+    } else if (this.bulkMode === BM.Longs) {
+      t.longs![idx] = new Long(lo, hi);
+    } else {
+      t.lo![idx] = lo;
+      t.hi![idx] = hi;
+    }
+  }
+
+  /** The signed twin of {@link bulkStoreU}; `raw`/`rawHi` are the zig-zag halves. */
+  private bulkStoreS(idx: number, raw: number, rawHi: number): void {
+    const t = this.bulk as IntegerArrayTarget;
+    const mask = -(raw & 1) >>> 0;
+    const lo = ((((raw >>> 1) | (rawHi << 31)) >>> 0) ^ mask) >>> 0;
+    const hi = ((rawHi >>> 1) ^ mask) >>> 0;
+    const shi = hi | 0;
+    if (
+      shi < (t.minHi | 0) ||
+      (shi === (t.minHi | 0) && lo < t.minLo) ||
+      shi > (t.maxHi | 0) ||
+      (shi === (t.maxHi | 0) && lo > t.maxLo)
+    ) {
+      this.outOfBound(idx);
+    }
+    if (this.bulkMode === BM.Values || this.bulkMode === BM.Values32) {
+      t.values![idx] = this.vSigned();
+    }
+    else if (this.bulkMode === BM.Longs) t.longs![idx] = new Long(lo, hi);
+    else {
+      t.lo![idx] = lo;
+      t.hi![idx] = hi;
+    }
+  }
+
+  /**
+   * Refuse an element outside the bound its target declared (§7.3): the message
+   * says a thing the schema does not allow, so it is `INVALID` and terminal, the
+   * same verdict at the same point as a generated per-element guard raises today.
+   * The destination keeps everything written before this element — see
+   * {@link ArrayTarget}.
+   */
+  private outOfBound(index: number): never {
+    // The prefix stands and the tail goes, exactly as on a completed array: what
+    // is left is what this array wrote (see {@link trimPlain}).
+    const t = this.bulk;
+    if (t !== null) this.trimPlain(t, index);
+    this.fail(`array ${this.id}: element ${index} outside the schema bound`);
   }
 
   /**
@@ -1126,58 +1699,6 @@ export class DecoderState {
   /** The accumulated varint with its low 3 tag bits stripped (`value >> 3`). */
   private vUpper(): number {
     return (this.vHi >>> 0) * (TWO32 / 8) + (this.vLo >>> 3);
-  }
-
-  /**
-   * Deliver every float element that lies wholly inside this chunk, from
-   * {@link arrIndex} on; returns the new read position.
-   *
-   * Its own method rather than a block inside {@link push}'s switch, and that is
-   * measured: inlined, the two loops push `push` past what V8 keeps cheap and every
-   * *other* decode path pays ~0.4% for code it never runs (`decode: typical` 5324 ->
-   * 5344 Ir/op, `decode: u64 array` 706.6k -> 709.8k). Out of line the call is paid
-   * once per drain, over a run of at least one element, and both figures come back.
-   *
-   * How many elements the chunk can still deliver decides the route. Past the
-   * threshold, one handle (§6.6.2) beats the byte loads and pays for itself; below
-   * it, building the handle costs more than the whole run saves. The two arms
-   * produce identical values — the split is arithmetic, not semantics (see
-   * {@link FP32_HANDLE_MIN}).
-   */
-  private fpDrain(
-    input: Uint8Array,
-    i: number,
-    n: number,
-    count: number,
-    size: number,
-    isFp32: boolean,
-  ): number {
-    const cur = this.cur;
-    const id = this.id;
-    let idx = this.arrIndex;
-    if (Math.min(count - idx, (n - i) / size) >= (isFp32 ? FP32_HANDLE_MIN : FP64_HANDLE_MIN)) {
-      const dv = this.dataView(input);
-      do {
-        if (isFp32) {
-          // Two reads of the same four bytes: §6.5 needs the value *and* the exact
-          // bits, and a double cannot carry an fp32 signaling NaN.
-          cur.arrayFp32?.(id, idx, dv.getFloat32(i, true), dv.getUint32(i, true));
-        } else {
-          cur.arrayFp64?.(id, idx, dv.getFloat64(i, true));
-        }
-        i += size;
-        this.arrIndex = ++idx;
-      } while (idx < count && n - i >= size);
-      return i;
-    }
-    do {
-      const lo = u32le(input, i);
-      if (isFp32) cur.arrayFp32?.(id, idx, fp32FromBits(lo), lo);
-      else cur.arrayFp64?.(id, idx, fp64FromBits(lo, u32le(input, i + 4)));
-      i += size;
-      this.arrIndex = ++idx;
-    } while (idx < count && n - i >= size);
-    return i;
   }
 
   /**

@@ -95,9 +95,10 @@ class MaterializingVisitor implements Visitor {
     this.fields.push(`arrayBegin(${id},${kind},${count})`);
     this.calls.push(`arrayBegin(${id},${kind},${count})`);
   }
-  arrayUnsigned(id: number, index: number, v: number | bigint) {
-    this.fields.push(`arrayUnsigned(${id},${index},${v})`);
-    this.calls.push(`arrayUnsigned(${id},${index},${v})`);
+  arrayBulk(id: number, _kind: number, count: number) {
+    this.fields.push(`arrayBulk(${id},${count})`);
+    this.calls.push(`arrayBulk(${id},${count})`);
+    return { values: [], ...{ minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff } };
   }
   arrayEnd(id: number) {
     this.fields.push(`arrayEnd(${id})`);

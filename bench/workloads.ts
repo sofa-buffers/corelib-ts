@@ -27,11 +27,13 @@
  */
 
 import {
+  ArrayKind,
   DecodeStatus,
   IStream,
   OStream,
   decode,
   growingOStream,
+  type ArrayTarget,
   type FlushSink,
   type Visitor,
 } from "../src/index.js";
@@ -231,6 +233,11 @@ export class DiscardSink {
  * checksum than in the decoder it was reporting on, and `decode: u64 array
  * (1000)` charged 1000 bigint adds per op to this port's decoder. What the row
  * should measure is the decode.
+ *
+ * Array elements arrive through the hand-off (`arrayBulk`), the one way they are
+ * delivered. The destinations are allocated **once, here**, and are the raw-halves
+ * and float shapes — so what the array rows measure is the decode and a fold over
+ * what it wrote, with no per-element `bigint` and no per-array allocation.
  */
 export class Checksum implements Visitor {
   acc = 0;
@@ -252,19 +259,67 @@ export class Checksum implements Visitor {
   blob(_id: number, _total: number, _offset: number, _src: Uint8Array, start: number, end: number): void {
     this.acc += end - start;
   }
-  arrayUnsigned(_id: number, _i: number, v: number | bigint): void {
-    this.acc += typeof v === "number" ? v : Number(v);
+  /**
+   * Destinations for the hand-off, **shared by every sink ever built**: a
+   * `Checksum` is constructed per operation, so holding 20 KB of typed arrays per
+   * instance would charge every row an allocation it is not there to measure
+   * (`decode: typical message` read 43 845 Ir/op that way, against 5 075 before).
+   * A benchmark sink has one thread and one array in flight at a time.
+   */
+  private readonly lo = SINK_LO;
+  private readonly hi = SINK_HI;
+  private readonly f32s = SINK_F32;
+  private readonly f64s = SINK_F64;
+  private kind: ArrayKind = ArrayKind.Unsigned;
+  private count = 0;
+
+  arrayBegin(_id: number, kind: ArrayKind, count: number): void {
+    this.kind = kind;
+    this.count = count;
   }
-  arraySigned(_id: number, _i: number, v: number | bigint): void {
-    this.acc += typeof v === "number" ? v : Number(v);
+  arrayBulk(_id: number, kind: ArrayKind, count: number): ArrayTarget | null {
+    if (count > SINK_CAP) {
+      // Declined: `arrayEnd` must then fold nothing, or it would sum the previous
+      // array's leftovers — and past SINK_CAP, `undefined` — and quietly turn the
+      // anti-DCE checksum into NaN. No workload reaches this; the guard is so a
+      // future dataset fails loudly instead.
+      this.count = 0;
+      return null;
+    }
+    // The four targets are built once, not per array: a fresh object literal per
+    // array is an allocation the decode row would then be reporting
+    // (`decode: typical message` 5 075 -> 6 727 Ir/op that way). Generated code
+    // holds one target per field for the same reason.
+    if (kind === ArrayKind.Fp32) return SINK_T_F32;
+    if (kind === ArrayKind.Fp64) return SINK_T_F64;
+    return kind === ArrayKind.Unsigned ? SINK_T_U : SINK_T_S;
   }
-  arrayFp32(_id: number, _i: number, v: number): void {
-    this.acc += v;
-  }
-  arrayFp64(_id: number, _i: number, v: number): void {
-    this.acc += v;
+  arrayEnd(_id: number): void {
+    const n = this.count;
+    if (this.kind === ArrayKind.Fp32) {
+      for (let k = 0; k < n; k++) this.acc += this.f32s[k]!;
+    } else if (this.kind === ArrayKind.Fp64) {
+      for (let k = 0; k < n; k++) this.acc += this.f64s[k]!;
+    } else {
+      for (let k = 0; k < n; k++) this.acc += this.lo[k]! + this.hi[k]!;
+    }
   }
 }
+
+/** Longest array any workload carries, so one set of destinations serves them all. */
+const SINK_CAP = 1024;
+const SINK_LO = new Uint32Array(SINK_CAP);
+const SINK_HI = new Uint32Array(SINK_CAP);
+const SINK_F32 = new Float32Array(SINK_CAP);
+const SINK_F64 = new Float64Array(SINK_CAP);
+const SINK_T_F32: ArrayTarget = { f32: SINK_F32 };
+const SINK_T_F64: ArrayTarget = { f64: SINK_F64 };
+const SINK_T_U: ArrayTarget = {
+  lo: SINK_LO, hi: SINK_HI, minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff,
+};
+const SINK_T_S: ArrayTarget = {
+  lo: SINK_LO, hi: SINK_HI, minLo: 0, minHi: 0x80000000, maxLo: 0xffffffff, maxHi: 0x7fffffff,
+};
 
 /** Encode into a fresh accumulating stream and copy the bytes out (setup only). */
 export function encodeToBytes(write: (os: OStream) => void): Uint8Array {

@@ -9,17 +9,21 @@
  *
  * The declared width is **schema** knowledge, and the corelib never learns a
  * schema (§6.2.1) — so what is tested here is the property the corelib owes the
- * generated layer that does know it: **elements are delivered as they arrive**,
- * one call per element, before the decoder discovers that the array is truncated.
- * A visitor can therefore reject at the element, and its verdict wins.
+ * generated layer that does know it: the interval the reader states travels with
+ * its destination (`ArrayTarget`), and is compared **at the element**, as the
+ * element arrives — before the decoder discovers that the array is truncated. The
+ * comparison lives in the codec and the number never does.
  */
 
 import { describe, expect, it } from "vitest";
 import {
+  ArrayKind,
+  Long,
   SofabError,
   SofabErrorCode,
   decode,
   growingOStream,
+  type ArrayTarget,
   type Visitor,
 } from "../src/index.js";
 
@@ -31,27 +35,29 @@ function arrayBytes(id: number, values: number[], signed: boolean): Uint8Array {
 }
 
 /**
- * A generated-layer stand-in: it knows the declared element range and rejects an
- * element outside it, exactly where the element is handed over.
+ * A generated-layer stand-in: it knows the declared element range and states it
+ * with the destination, which is where the comparison then happens.
+ *
+ * An absent bound is the *widest* one the element kind can carry — "this reader
+ * declares no narrower width", not "unbounded", which the hand-off has no
+ * spelling for and needs none: an integer element always has a declared width.
  */
-function widthChecked(
-  out: (number | bigint)[],
-  min?: number,
-  max?: number,
-): Visitor {
-  const check = (v: number | bigint): void => {
-    const n = typeof v === "bigint" ? v : BigInt(v);
-    if ((min !== undefined && n < BigInt(min)) || (max !== undefined && n > BigInt(max))) {
-      throw new SofabError(
-        SofabErrorCode.InvalidMsg,
-        `element ${v} outside the declared width`,
-      );
-    }
-    out.push(v);
-  };
+function widthChecked(out: (number | bigint)[], min?: number, max?: number): Visitor {
   return {
-    arrayUnsigned: (_id, _i, v) => check(v),
-    arraySigned: (_id, _i, v) => check(v),
+    arrayBulk: (_id, kind): ArrayTarget => {
+      const unsigned = kind === ArrayKind.Unsigned;
+      const lo = Long.fromBigInt(min !== undefined ? BigInt(min) : unsigned ? 0n : -(2n ** 63n));
+      const hi = Long.fromBigInt(
+        max !== undefined ? BigInt(max) : unsigned ? 2n ** 64n - 1n : 2n ** 63n - 1n,
+      );
+      return {
+        values: out,
+        minLo: lo.low,
+        minHi: lo.high,
+        maxLo: hi.low,
+        maxHi: hi.high,
+      };
+    },
   };
 }
 

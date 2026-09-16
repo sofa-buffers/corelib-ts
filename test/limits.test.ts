@@ -187,12 +187,18 @@ describe("the codec holds no receiver limit (§6.2.1)", () => {
 describe("the enforcement point the codec owes generated code (§6.2.1)", () => {
   it("hands over the element count before a single element is delivered", () => {
     const events: string[] = [];
+    const values: (number | bigint)[] = [];
     decode(arrayOf(5), {
       arrayBegin: (_id, _kind, count) => void events.push(`begin ${count}`),
-      arrayUnsigned: (_id, i) => void events.push(`elem ${i}`),
+      // The hand-off is offered after `arrayBegin` and before any element, so a
+      // cap compared there has already run when the destination is asked for.
+      arrayBulk: () => {
+        events.push("bulk");
+        return { values, ...{ minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff } };
+      },
+      arrayEnd: () => void events.push(`end ${values.length}`),
     });
-    expect(events[0]).toBe("begin 5");
-    expect(events).toHaveLength(6);
+    expect(events).toStrictEqual(["begin 5", "bulk", "end 5"]);
   });
 
   it("hands over the declared length before any payload piece", () => {
@@ -206,7 +212,15 @@ describe("the enforcement point the codec owes generated code (§6.2.1)", () => 
 
   it("a rejection at that point stops the decode with nothing materialized", () => {
     const seen: string[] = [];
-    const v = capping({ array: 4 }, { arrayUnsigned: () => void seen.push("elem") });
+    const v = capping(
+      { array: 4 },
+      {
+        arrayBulk: () => {
+          seen.push("bulk");
+          return null;
+        },
+      },
+    );
     expect(codeOf(() => decode(arrayOf(8), v))).toBe(SofabErrorCode.LimitExceeded);
     expect(codeOf(() => drainStream(arrayOf(8), v))).toBe(SofabErrorCode.LimitExceeded);
     expect(codeOf(() => drainChunked(arrayOf(8), v))).toBe(SofabErrorCode.LimitExceeded);

@@ -149,12 +149,8 @@ describe("kernel parity: the inlined bulk writer matches the shared helper", () 
   it("round-trips the whole corpus through the decoder", () => {
     const os = growingOStream();
     os.writeUnsignedArray(7, corpus);
-    const seen: bigint[] = [];
-    decode(os.bytes(), {
-      arrayUnsigned(_id, _i, v) {
-        seen.push(typeof v === "bigint" ? v : BigInt(v));
-      },
-    });
-    expect(seen).toEqual(corpus);
+    const seen: (number | bigint)[] = [];
+    decode(os.bytes(), { arrayBulk: () => ({ values: seen, ...{ minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff } }) });
+    expect(seen.map((v) => BigInt(v))).toEqual(corpus);
   });
 });

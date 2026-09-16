@@ -150,10 +150,13 @@ function generatedGuard(c: HeaderLimitCase, log: Event[], ceiling: Ceiling | nul
     },
     string: payload,
     blob: payload,
-    arrayUnsigned: payload,
-    arraySigned: payload,
-    arrayFp32: payload,
-    arrayFp64: payload,
+    // An array's elements reach a visitor only through the hand-off, which is
+    // offered *after* `arrayBegin` — so being offered it at all is this log's
+    // "the payload was entered", and a cap that fired above must prevent it.
+    arrayBulk: () => {
+      payload();
+      return null;
+    },
   };
 }
 

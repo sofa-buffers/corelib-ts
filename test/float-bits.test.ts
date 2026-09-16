@@ -145,12 +145,17 @@ describe("fp32 bits re-encode byte-for-byte (§4.6/§6.5; #66)", () => {
       os.writeFp32ArrayRaw(5, payload);
       const wire = os.bytes().slice();
 
-      const seen: number[] = [];
-      drive(wire, { arrayFp32: (_id, _i, _v, bits) => void seen.push(bits >>> 0) });
+      let seen = new Uint32Array(0);
+      drive(wire, {
+        arrayBulk: (_id, _kind, count) => {
+          seen = new Uint32Array(count);
+          return { bits: seen };
+        },
+      });
 
       const raw = new Uint8Array(seen.length * 4);
       const dv = new DataView(raw.buffer);
-      seen.forEach((b, k) => dv.setUint32(k * 4, b, true));
+      seen.forEach((b, k) => dv.setUint32(k * 4, b >>> 0, true));
       const out = growingOStream();
       out.writeFp32ArrayRaw(5, raw);
       expect(bytesToHex(out.bytes())).toBe(bytesToHex(wire));
