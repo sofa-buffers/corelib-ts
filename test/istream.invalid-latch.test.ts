@@ -44,8 +44,9 @@ class RecordingVisitor implements Visitor {
   arrayBegin(id: number, kind: number, count: number) {
     this.calls.push(`arrayBegin(${id},${kind},${count})`);
   }
-  arrayUnsigned(id: number, index: number, v: number | bigint) {
-    this.calls.push(`arrayUnsigned(${id},${index},${v})`);
+  arrayBulk(id: number, _kind: number, count: number) {
+    this.calls.push(`arrayBulk(${id},${count})`);
+    return { values: [], ...{ minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff } };
   }
   arrayEnd(id: number) {
     this.calls.push(`arrayEnd(${id})`);

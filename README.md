@@ -246,6 +246,22 @@ Everything schema-shaped stays on the later, more informative hook: a fixlen
 subtype and a declared length on `fixlenBegin`, a declared element count on
 `arrayBegin`.
 
+An array's **elements** arrive through `arrayBulk(id, kind, count)`, and only
+there: return the destination they should be written into — a `number[]`, a
+`Long[]`, a pair of `Uint32Array` halves, a `Float32Array` / `Float64Array`, or the
+raw `fp32` words — together with the schema's element bound as `min`/`max` 32-bit
+halves, and the decoder fills it directly. Return `null` (or declare no
+`arrayBulk`) and the elements are walked over without being decoded at all. There
+is no callback per element: one array is one call.
+
+```ts
+const big: number[] = [];
+const v: Visitor = {
+  arrayBulk: (id) =>
+    id === 6 ? { values: big, minLo: 0, minHi: 0, maxLo: 0xffff, maxHi: 0 } : null,
+};
+```
+
 `sequenceBegin(id, depth)` opens a nested scope and `sequenceEnd(id, depth)` closes
 it — the same visitor receives the scope's fields, with their own ids and
 `depth + 1`. Route on the `(id, depth)` pair, which a schema fixes statically:
@@ -358,17 +374,24 @@ os.writeUnsignedArrayLong(3, [1n, 2n].map(Long.fromValue)); // array
 
 On the decode side there is no channel to switch on: **every** integer callback
 carries the exact 64 bits as two unsigned 32-bit halves, beside the number-first
-value. Read whichever you want — the halves cost nothing to pass and nothing to
-ignore, and a `Long` built from them never goes through `bigint` arithmetic:
+value, and an array hands its elements over as `Long`s or as raw halves. Read
+whichever you want — the halves cost nothing to pass and nothing to ignore, and a
+`Long` built from them never goes through `bigint` arithmetic:
 
 ```ts
-import { decode, Long, type Visitor } from "@sofa-buffers/corelib";
+import { ArrayKind, decode, Long, type Visitor } from "@sofa-buffers/corelib";
 
+const longs: Long[] = [];
 const v: Visitor = {
   unsigned(id, value, lo, hi) { const x = Long.fromBits(lo, hi); },
   signed(id, value, lo, hi)   { /* lo/hi are the decoded two's-complement halves */ },
-  arrayUnsigned(id, i, value, lo, hi) { /* … per element */ },
-  arraySigned(id, i, value, lo, hi)   { /* … */ },
+  // One call per array, not per element: the decoder fills `longs` itself. A
+  // destination has to match the element kind, so decline the ones it does not:
+  // `null` costs nothing but the call.
+  arrayBulk: (id, kind) =>
+    kind === ArrayKind.Unsigned
+      ? { longs, minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff }
+      : null,
 };
 decode(bytes, v);
 ```
@@ -486,8 +509,8 @@ const streamed = st === DecodeStatus.Complete ? dec.message : null;
 
 A generated visitor takes the nested cases too: a nested message switches the
 router into the child's fields on `sequenceBegin(id, depth)`, and a compact scalar
-array arrives element by element through `arrayBegin` / `arraySigned`, so no part of
-the message is ever buffered whole. Nothing from a fed chunk is retained either — a
+array is filled straight into the destination the router hands over at
+`arrayBegin` / `arrayBulk`, so no part of the message is ever buffered whole. Nothing from a fed chunk is retained either — a
 string is decoded and a blob copied on the way into the destination — so a chunk is
 reusable the moment `feed` returns.
 
@@ -581,7 +604,9 @@ Who owns the bytes:
   `IStream` is the one allocating step, and `decode()` reuses one decoder across
   calls so a one-shot caller does not pay it per message. A `bigint` for an integer
   past `2^53` is not an exception: it is a *value*, not storage, and the `lo` / `hi`
-  halves beside it are there for a consumer that would rather not have one.
+  halves beside it are there for a consumer that would rather not have one. A `Long`
+  written into a `longs` bulk destination is the same kind of thing — a value, placed
+  in storage you supplied.
 - **The language-forced handles, itemised** (§6.6.2). JavaScript will not let a codec
   place or take an IEEE-754 value at a byte offset, or copy a *range* of bytes,
   without building an object first: `TypedArray.set` — the only `memcpy` there is —
@@ -602,6 +627,19 @@ Who owns the bytes:
   exactly, including the short runs that allocate nothing and the element one under
   the threshold. The thresholds and what they were derived from are on
   `FP32_HANDLE_MIN` / `FP64_HANDLE_MIN` in the API documentation.
+- **The bulk array hand-off borrows your destination until `arrayEnd`.**
+  `Visitor.arrayBulk` hands the decoder the array, `Long[]` or typed array it should
+  fill for one array field; the decoder writes into it ascending from index 0 and
+  holds it from the hand-off until that array ends, which on a chunked decode spans
+  several `feed` calls. It is dropped there, and on `decode()`'s pooled machine when
+  the call returns. The object must stay the same one for the whole array. A typed
+  destination must already hold `count` elements; a plain `number[]` / `Long[]`
+  grows as it fills and is **cut to the elements written** when the array ends —
+  including to zero for an array that is empty on the wire — so reusing one across
+  arrays or messages never leaves the previous array's tail behind and its `length`
+  after `arrayEnd` is exactly that array's element count. An element the target's bound rejects stops the fill: everything before
+  it is written, it and everything after it are not. This is the only reference the
+  decoder keeps into your storage between calls.
 - **The static helper layer allocates, on your behalf.** `PayloadAcc`,
   `ElementSeq`, `StringSeq`, `BlobSeq`, `decodeUtf8` and `elementsEqual` are the
   generated layer's code shipped here for reuse (ARCHITECTURE §8), not part of the

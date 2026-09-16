@@ -1,24 +1,25 @@
 /**
  * The bigint-free 64-bit path: `Long` + the `*Long` encoder methods must produce
  * byte-identical wire to their `bigint` twins, and the value must come back
- * exactly — rebuilt from the `lo`/`hi` halves every integer callback carries, the
- * decode-side half of the same `bigint`-free route (§6.6.3: a value, not storage).
+ * exactly — through the `longs` destination of the array hand-off, and from the
+ * `lo`/`hi` halves every scalar callback carries: the decode-side half of the same
+ * `bigint`-free route (§6.6.3: a value, not storage).
  */
 
 import { describe, expect, it } from "vitest";
 import { Long, OStream, decode, growingOStream } from "../src/index.js";
 
-/** Every unsigned array element of `wire`, rebuilt from the visitor's lo/hi halves. */
+/** Every unsigned array element of `wire`, taken as `Long`s — no bigint anywhere. */
 function unsignedLongs(wire: Uint8Array): Long[] {
   const out: Long[] = [];
-  decode(wire, { arrayUnsigned: (_id, _i, _v, lo, hi) => void out.push(Long.fromBits(lo, hi)) });
+  decode(wire, { arrayBulk: () => ({ longs: out, ...{ minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff } }) });
   return out;
 }
 
-/** Every signed array element of `wire`, rebuilt from the visitor's lo/hi halves. */
+/** Every signed array element of `wire`, taken as `Long`s. */
 function signedLongs(wire: Uint8Array): Long[] {
   const out: Long[] = [];
-  decode(wire, { arraySigned: (_id, _i, _v, lo, hi) => void out.push(Long.fromBits(lo, hi)) });
+  decode(wire, { arrayBulk: () => ({ longs: out, ...{ minLo: 0, minHi: 0x80000000, maxLo: 0xffffffff, maxHi: 0x7fffffff } }) });
   return out;
 }
 

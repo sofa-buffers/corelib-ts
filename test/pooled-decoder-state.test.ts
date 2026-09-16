@@ -74,6 +74,7 @@ const REFERENCE = reference();
 /** Everything the reference message decodes to, as one comparable log. */
 function transcript(bytes: Uint8Array): string[] {
   const log: string[] = [];
+  let elems: (number | bigint)[] | Uint32Array = [];
   const v: Visitor = {
     unsigned: (id, value, lo, hi) => void log.push(`u ${id}=${value} ${lo}/${hi}`),
     signed: (id, value, lo, hi) => void log.push(`s ${id}=${value} ${lo}/${hi}`),
@@ -84,10 +85,17 @@ function transcript(bytes: Uint8Array): string[] {
       void log.push(`str ${id} ${total} ${offset} ${decodeUtf8(src, start, end)}`),
     blob: (id, total, offset, src, start, end) =>
       void log.push(`blob ${id} ${total} ${offset} ${[...src.subarray(start, end)].join(",")}`),
-    arrayBegin: (id, kind: ArrayKind, count) => void log.push(`ab ${id} ${kind} ${count}`),
-    arrayUnsigned: (id, i, value, lo, hi) => void log.push(`au ${id}[${i}]=${value} ${lo}/${hi}`),
-    arrayFp32: (id, i, value, bits) => void log.push(`af32 ${id}[${i}]=${value} ${bits >>> 0}`),
-    arrayEnd: (id) => void log.push(`ae ${id}`),
+    arrayBegin: (id, kind: ArrayKind, count) => {
+      log.push(`ab ${id} ${kind} ${count}`);
+      elems = kind === ArrayKind.Fp32 ? new Uint32Array(count) : [];
+    },
+    // Elements arrive through the hand-off; `fp32` takes the wire words, so the
+    // log stays bit-exact for a value a double cannot carry.
+    arrayBulk: (_id, kind) =>
+      kind === ArrayKind.Fp32
+        ? { bits: elems as Uint32Array }
+        : { values: elems as (number | bigint)[], ...{ minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff } },
+    arrayEnd: (id) => void log.push(`ae ${id} [${Array.from(elems as Iterable<unknown>).join(",")}]`),
     sequenceBegin: (id, depth) => void log.push(`sb ${id}@${depth}`),
     sequenceEnd: (id, depth) => void log.push(`se ${id}@${depth}`),
   };
@@ -134,8 +142,11 @@ const ABORTS: [string, () => string][] = [
 
 describe("a pooled decoder carries nothing from the decode before it", () => {
   it("has a reference transcript to compare against", () => {
-    expect(EXPECTED.length).toBeGreaterThan(15);
+    expect(EXPECTED.length).toBeGreaterThan(12);
     expect(EXPECTED).toContain("str 5 5 0 sofab");
+    // An array's elements are one line — the filled destination, read at its end —
+    // so the transcript still carries every value the message holds.
+    expect(EXPECTED.some((line) => /^ae \d+ \[.+\]$/.test(line))).toBe(true);
   });
 
   it("stays clean after an abort at every single cut point", () => {

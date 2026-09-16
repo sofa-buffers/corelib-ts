@@ -43,7 +43,189 @@
 import { DecodeStatus } from "../constants.js";
 import type { ArrayKind, FeedStatus, FixlenSubtype, WireType } from "../constants.js";
 import { incompleteError } from "../errors.js";
+import type { Long } from "../long.js";
 import { DecoderState } from "./state.js";
+
+/**
+ * Where an array's elements are written when the visitor takes the **bulk
+ * hand-off** ({@link Visitor.arrayBulk}): the destination it already owns, handed
+ * over once, instead of one callback per element.
+ *
+ * **Why this replaced the per-element callbacks.** There used to be an
+ * `arrayUnsigned` / `arraySigned` / `arrayFp32` / `arrayFp64` beside this, one call
+ * per element. Measured with `bench/run_callgrind.sh`'s method over 1000-element
+ * arrays (Ir/op for a message that is one array), against this hand-off filling
+ * the same destination:
+ *
+ * | array | per element (removed) | hand-off | |
+ * |---|---:|---:|---:|
+ * | `array<u16>` into a `number[]` | 235 433 | 184 025 | −21.8% |
+ * | `array<u64>` into a `Long[]` | 576 206 | 429 113 | −25.5% |
+ * | `array<u64>` into {@link IntegerArrayTarget.lo}/`hi` | 498 618 | 299 180 | −40.0% |
+ * | `array<fp64>` into a `Float64Array` | 93 520 | 36 890 | −60.6% |
+ * | `array<fp32>` into a `Float32Array` | 94 497 | 35 259 | −62.7% |
+ *
+ * Floats gain most because their *reading* was already bulk (the §6.6.2 handle in
+ * the element drain), so the callback was very nearly all that was left.
+ *
+ * **A short array is not the exception.** The fixed cost — the offer, the
+ * target's resolution, the bound's validation — is about 600 Ir, but the hand-off
+ * takes a whole array in one call, tail elements included, so it is paid once:
+ * four elements at the end of a 37-byte message cost 578 Ir against the 563 the
+ * removed callbacks cost, and everything longer is the table above.
+ *
+ * **What did move is the consumer's side, for a consumer that folds.** An element
+ * callback let a reader sum, hash or convert *inside* the delivery; reading a
+ * filled destination is a second pass. A reader that wants the values where they
+ * are — which is what generated code wants — has no second pass and gets the
+ * table. A reader that folds pays one: the same four-element array costs 1 063 Ir
+ * if it sums the destination at `arrayEnd`, against 563 folding per element.
+ * It is a cheaper pass than the calls it replaced on any array long enough to
+ * matter, and on a four-element one it is not.
+ *
+ * **Declining costs nothing at all.** An array no visitor takes is walked over
+ * rather than decoded: `array<fp64>` 36 890 → 9 383 Ir/op, `array<u16>` 184 025 →
+ * 152 082.
+ *
+ * **This is how array elements are delivered — the only way.** There is no
+ * callback per element beside it: §5.3.1 allows a rule one implementation, and
+ * two delivery routes for the same elements were two places for the element bound
+ * to be compared, two resume paths to keep in step, and a standing invitation for
+ * generated code to take the slower one. `arrayBegin` and `arrayEnd` still fire
+ * for every array; returning `null` declines delivery, and the elements are then
+ * walked over without being decoded into existence — the `skip` half of §6.7.2's
+ * two intents, which is what a visitor that declares no `arrayBulk` gets for
+ * every array.
+ *
+ * **The destination is filled ascending from index 0**, one write per element,
+ * and it must stay valid — same object, same length — until `arrayEnd`, which for
+ * a chunked decode is several {@link IStream.feed} calls later. A plain-array
+ * destination (`values` / `longs`) is **cut to the elements written when the array
+ * ends** — including to zero for an array that is empty on the wire, and to the
+ * prefix when an element is refused — so reusing one across arrays or messages can
+ * never leave the previous array's tail behind, and after `arrayEnd` its `length`
+ * is exactly this array's element count. (Cutting at the end rather than emptying
+ * up front is measured: emptying first makes every element write a grow, which
+ * cost `array<u16>` 181 583 → 231 815 Ir/op.) A typed destination is neither cut
+ * nor emptied — it cannot be — and must already hold `count` elements.
+ *
+ * A decode that fails *inside* an array for any other reason — malformed bytes, or
+ * input that simply ends — leaves the destination holding what had been written
+ * when it stopped. `length` is a statement about the array only once `arrayEnd`
+ * has been raised or an element has been refused. This is the one
+ * place the codec holds a reference to the caller's storage between calls (§6.6
+ * otherwise holds nothing past a callback), and the reference is dropped at
+ * `arrayEnd` and whenever a pooled machine is released.
+ *
+ * **A refused element leaves the destination holding the prefix**: everything
+ * before it is written, the offending element and everything after it is not, and
+ * a plain-array destination is cut to exactly that length. Like every `INVALID`
+ * verdict it is terminal (§5.2.1).
+ */
+export type ArrayTarget = IntegerArrayTarget | FloatArrayTarget;
+
+/**
+ * An integer array's destination and the **element bound** to enforce while
+ * filling it — for an `ArrayKind.Unsigned` or `ArrayKind.Signed` array.
+ *
+ * Exactly one destination must be set (`values`, `longs`, or `lo` *and* `hi`);
+ * any other combination is a caller mistake and is refused with
+ * {@link SofabErrorCode.Argument} before a single element is written.
+ *
+ * **The bound is four halves, and it is never optional.** The interval is the
+ * schema's — `0..65535` for a `u16`, `-2^63..2^63-1` for an `i64` — so its
+ * violation is `INVALID`, a statement about the message (§6.2.1 keeps a
+ * *receiver* cap off a field the schema already bounds; a receiver cap on the
+ * element *count* is compared by the visitor in `arrayBegin`, as before, and this
+ * hand-off happens after it).
+ *
+ * Halves rather than a `number` pair because a `number` cannot express the
+ * 64-bit domain: `u64`'s bound is `2^64-1` and `Number.MAX_SAFE_INTEGER` is
+ * `2^53-1`, so a `number` bound both *rejects valid messages* at the top of the
+ * range and makes the comparison a mixed `bigint`/`number` one, which measured
+ * +35% on `array<u64>` — worse than the per-element path it replaces. Two
+ * unsigned 32-bit comparisons are exact and cost nothing.
+ *
+ * For a **signed** array the halves are the two's-complement ones (an `i16`
+ * minimum of `-32768` is `minLo = 0xffff8000`, `minHi = 0xffffffff`).
+ * {@link Long.fromBigInt} is the ready-made way to compute them from the schema's
+ * bound once.
+ *
+ * The codec **compares** the bound; it never owns one (§6.2.1). There is no
+ * default and no "unbounded" spelling, because an integer element always has a
+ * declared width: the widest `u64` interval is `0 .. 0xffffffff_ffffffff` and is
+ * stated as such.
+ */
+export interface IntegerArrayTarget {
+  /**
+   * Number-first destination: each element as the `value` its per-element
+   * callback would have received — a `number` when it fits exactly (`≤ 2^53-1`,
+   * every `u8`..`u32` and small 64-bit values) and a `bigint` beyond that. The
+   * right destination for `u8`..`u32` / `i8`..`i32` arrays, where no `bigint` is
+   * ever built.
+   *
+   * A real `Array` — grown as it fills and cut to length when the array ends, so
+   * it need not be pre-sized and never carries a previous array's tail. A typed
+   * array here is refused with {@link SofabErrorCode.Argument}: it would take the
+   * writes and silently drop everything past its own length.
+   */
+  values?: (number | bigint)[];
+  /**
+   * Destination taking each element as a {@link Long} — no `bigint` is
+   * materialised at all, which is most of why this is a quarter cheaper than the
+   * per-element path for a 64-bit array (see {@link ArrayTarget}). A real
+   * `Array`, cut to length at the array's end, exactly like {@link values}.
+   */
+  longs?: Long[];
+  /**
+   * Allocation-free destination: the element's low half at `lo[index]` and its
+   * high half at `hi[index]` (for a signed array, the two's-complement halves).
+   * Both must be set and both must hold at least `count` elements. The fastest
+   * shape there is — nothing is allocated per element, not even a `Long`.
+   */
+  lo?: Uint32Array;
+  /** The high halves; see {@link lo}. */
+  hi?: Uint32Array;
+  /** Low half of the smallest element the schema allows. */
+  minLo: number;
+  /** High half of the smallest element the schema allows. */
+  minHi: number;
+  /** Low half of the largest element the schema allows. */
+  maxLo: number;
+  /** High half of the largest element the schema allows. */
+  maxHi: number;
+}
+
+/**
+ * A float array's destination — for an `ArrayKind.Fp32` or `ArrayKind.Fp64`
+ * array. Exactly one of the two must be set, it must match the element width the
+ * array's own `fixlen_word` declared (§4.8), and it must hold at least `count`
+ * elements; anything else is refused with {@link SofabErrorCode.Argument} before
+ * a single element is written.
+ *
+ * There is no bound here: §4.6 gives a float no schema interval to violate, so
+ * there is nothing to compare and nothing for the caller to state.
+ *
+ * An `fp32` array chooses between the two: {@link f32} takes values, {@link bits}
+ * takes the wire words. The choice is real, not stylistic — reading an `fp32`
+ * through a double quiets a *signaling* NaN (`0x7fa00001` comes back
+ * `0x7fe00001`), so a reader that must reproduce `fp32` payloads bit-for-bit
+ * (§4.6/§6.5) takes {@link bits}. `fp64` needs no such choice: a `Float64Array`
+ * carries all 64 bits, payload NaNs included.
+ */
+export interface FloatArrayTarget {
+  /** Value destination for an `ArrayKind.Fp32` array. */
+  f32?: Float32Array;
+  /**
+   * Bit destination for an `ArrayKind.Fp32` array: each element as its 4 wire
+   * bytes in one little-endian 32-bit word — the same number `OStream.writeFp32Bits`
+   * takes, so a payload read through this and written back reproduces the wire
+   * exactly, signaling NaNs included.
+   */
+  bits?: Uint32Array;
+  /** Destination for an `ArrayKind.Fp64` array. */
+  f64?: Float64Array;
+}
 
 /**
  * Receives decoded fields from an {@link IStream} — the one decode surface
@@ -181,26 +363,34 @@ export interface Visitor {
   ): void;
   /** Start of an array; `count` elements of `kind` follow. */
   arrayBegin?(id: number, kind: ArrayKind, count: number): void;
-  /** One unsigned array element — `value` / `lo` / `hi` as in {@link unsigned}. */
-  arrayUnsigned?(
-    id: number,
-    index: number,
-    value: number | bigint,
-    lo: number,
-    hi: number,
-  ): void;
-  /** One signed array element — `value` / `lo` / `hi` as in {@link signed}. */
-  arraySigned?(
-    id: number,
-    index: number,
-    value: number | bigint,
-    lo: number,
-    hi: number,
-  ): void;
-  /** One fp32 array element — `bits` is the element's 4 wire bytes, see {@link fp32}. */
-  arrayFp32?(id: number, index: number, value: number, bits: number): void;
-  /** One fp64 array element. `value` is exact — see {@link fp64}. */
-  arrayFp64?(id: number, index: number, value: number): void;
+  /**
+   * Offer of the **bulk hand-off**: return the destination this visitor has
+   * already allocated for array `id` and the decoder fills it directly, one write
+   * per element and no callback at all; return `null` (or leave this method
+   * unimplemented) to be served element by element as before.
+   *
+   * Called once per array, after {@link arrayBegin} and before the first element —
+   * so a receiver cap on `count` is still compared where it always was, in
+   * `arrayBegin`, and a rejected array is never offered. **An array that is empty
+   * on the wire is offered too**, with `count` of 0: there is nothing to write,
+   * but a destination held across fields would otherwise still hold the previous
+   * array's elements, and its length is the only place this array's emptiness
+   * could show.
+   *
+   * `kind` is the element kind and it decides which destination is legal
+   * ({@link IntegerArrayTarget} for `Unsigned` / `Signed`,
+   * {@link FloatArrayTarget} for `Fp32` / `Fp64`); a destination that contradicts
+   * it, or that is shorter than `count`, is a caller mistake and is refused with
+   * {@link SofabErrorCode.Argument} before any element is written. Declining on
+   * a kind this visitor did not expect is always available — and is the right
+   * answer, since `null` costs nothing but the call.
+   *
+   * See {@link ArrayTarget} for what the decoder then guarantees: ascending
+   * writes, the element bound enforced here and only here, the destination held
+   * until `arrayEnd` across as many `feed` calls as the chunking takes, and a
+   * partially filled destination if an element is refused.
+   */
+  arrayBulk?(id: number, kind: ArrayKind, count: number): ArrayTarget | null;
   /** End of an array. */
   arrayEnd?(id: number): void;
   /**

@@ -110,16 +110,22 @@ export function runChecks(api, label) {
         };
       })(),
       arrayBegin(id, kind) { this._a = { id, kind, vals: [] }; },
-      arrayUnsigned(_id, _i, v) { this._a.vals.push(v); },
-      arraySigned(_id, _i, v) { this._a.vals.push(v); },
-      arrayFp32(_id, _i, v) { this._a.vals.push(v); },
-      arrayFp64(_id, _i, v) { this._a.vals.push(v); },
+      // Elements arrive through the hand-off: the decoder fills the destination
+      // this returns, and no callback is made per element.
+      arrayBulk(_id, kind, count) {
+        const a = this._a;
+        if (kind === 2) return { f32: (a.f32 = new Float32Array(count)) };
+        if (kind === 3) return { f64: (a.f64 = new Float64Array(count)) };
+        return kind === 0
+          ? { values: a.vals, minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff }
+          : { values: a.vals, minLo: 0, minHi: 0x80000000, maxLo: 0xffffffff, maxHi: 0x7fffffff };
+      },
       arrayEnd(id) {
         const a = this._a;
         if (a.kind === 0) out.writeUnsignedArray(id, a.vals);
         else if (a.kind === 1) out.writeSignedArray(id, a.vals);
-        else if (a.kind === 2) out.writeFp32Array(id, a.vals);
-        else out.writeFp64Array(id, a.vals);
+        else if (a.kind === 2) out.writeFp32Array(id, a.f32 ?? []);
+        else out.writeFp64Array(id, a.f64 ?? []);
       },
       // endKeep, not end: a transcode must reproduce its input byte for byte,
       // including an empty frame the input may legitimately carry (§2/§5.1).

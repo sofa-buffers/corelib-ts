@@ -27,6 +27,7 @@ import v8 from "node:v8";
 import vm from "node:vm";
 import { FP32_HANDLE_MIN, FP64_HANDLE_MIN } from "../src/constants.js";
 import {
+  ArrayKind,
   DecodeStatus,
   IStream,
   OStream,
@@ -77,6 +78,13 @@ const WIRE = (() => {
 
 /** A visitor that allocates nothing itself, so only the codec is on trial. */
 function foldingVisitor(): Visitor & { acc: number } {
+  // Destinations for the array hand-off, allocated **here** — before any measured
+  // region — and long enough for every array in these messages, so the fold costs
+  // the decode nothing. `length >= count` is all the hand-off asks of them.
+  const lo = new Uint32Array(256);
+  const hi = new Uint32Array(256);
+  const f32 = new Float32Array(256);
+  const f64 = new Float64Array(256);
   return {
     acc: 0,
     unsigned(_id, v, lo) { this.acc += lo + (typeof v === "number" ? 1 : 2); },
@@ -87,11 +95,16 @@ function foldingVisitor(): Visitor & { acc: number } {
     string(_id, _t, _o, src, start, end) { this.acc += src[start]! + end; },
     blob(_id, _t, _o, src, start, end) { this.acc += src[start]! + end; },
     arrayBegin(_id, _kind, count) { this.acc += count; },
-    arrayUnsigned(_id, _i, _v, lo) { this.acc += lo; },
-    arraySigned(_id, _i, _v, lo) { this.acc += lo; },
-    arrayFp32(_id, _i, _v, bits) { this.acc += bits; },
-    arrayFp64(_id, _i, v) { this.acc += v; },
-    arrayEnd(_id) { this.acc += 1; },
+    arrayBulk(_id, kind) {
+      if (kind === ArrayKind.Fp32) return { f32 };
+      if (kind === ArrayKind.Fp64) return { f64 };
+      // The widest interval of the element's own signedness: this visitor is
+      // about allocation, not about validity, and must refuse nothing.
+      return kind === ArrayKind.Unsigned
+        ? { lo, hi, minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff }
+        : { lo, hi, minLo: 0, minHi: 0x80000000, maxLo: 0xffffffff, maxHi: 0x7fffffff };
+    },
+    arrayEnd(_id) { this.acc += 1 + lo[0]! + f32[0]! + f64[0]!; },
     sequenceBegin(_id, depth) { this.acc += depth; },
     sequenceEnd(_id, depth) { this.acc += depth; },
   };
@@ -314,6 +327,46 @@ describe("read: the itemised handles, and nothing else (§6.6.2 / §6.6.4)", () 
     ).toStrictEqual({});
     expect(st).toBe(DecodeStatus.Complete);
     expect(piecemeal.acc).toBe(whole.acc); // same values, other route
+  });
+
+  it("a bulk hand-off into typed destinations allocates nothing beyond the one handle", () => {
+    // The hand-off writes into storage the *visitor* supplied, so it adds no
+    // allocation of its own: an integer array into `lo`/`hi` builds nothing at all,
+    // and a float array into a `Float64Array` builds the one chunk handle its
+    // per-element twin builds — §6.6.2's itemisation is unchanged by it existing.
+    const bulk = (() => {
+      const os = growingOStream();
+      os.writeUnsignedArray(1, U_ARRAY);
+      os.writeFp64Array(2, F64_BULK);
+      return os.bytes().slice();
+    })();
+    const lo = new Uint32Array(U_ARRAY.length);
+    const hi = new Uint32Array(U_ARRAY.length);
+    const f64 = new Float64Array(F64_BULK.length);
+    const is = new IStream({
+      arrayBulk: (id) =>
+        id === 1
+          ? { lo, hi, minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff }
+          : { f64 },
+    });
+    expect(allocationsDuring(() => void is.feed(bulk))).toStrictEqual({ DataView: 1 });
+    expect([...lo]).toEqual(U_ARRAY);
+    expect([...f64]).toEqual(F64_BULK);
+  });
+
+  it("a bulk float run under the threshold builds no handle either", () => {
+    // One element under FP64_HANDLE_MIN: the hand-off takes the byte-load route for
+    // exactly the same reason the per-element drain does.
+    const short = F64_BULK.slice(0, FP64_HANDLE_MIN - 1);
+    const bulk = (() => {
+      const os = growingOStream();
+      os.writeFp64Array(1, short);
+      return os.bytes().slice();
+    })();
+    const f64 = new Float64Array(short.length);
+    const is = new IStream({ arrayBulk: () => ({ f64 }) });
+    expect(allocationsDuring(() => void is.feed(bulk))).toStrictEqual({});
+    expect([...f64]).toEqual(short);
   });
 
   it("a chunked decode allocates nothing at all", () => {

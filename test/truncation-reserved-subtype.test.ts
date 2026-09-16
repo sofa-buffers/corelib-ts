@@ -49,8 +49,6 @@ const greedy: Visitor = {
   fp32: () => undefined,
   fp64: () => undefined,
   arrayBegin: () => true,
-  arrayFp32: () => undefined,
-  arrayFp64: () => undefined,
 };
 
 /** The §6.3 code `decode()` reports for `buf`, or `undefined` when it completes. */

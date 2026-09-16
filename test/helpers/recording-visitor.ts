@@ -9,7 +9,22 @@
  * flat event log for direct value assertions.
  */
 
-import { ArrayKind, FixlenSubtype, OStream, type Visitor } from "../../src/index.js";
+import {
+  ArrayKind,
+  FixlenSubtype,
+  OStream,
+  type ArrayTarget,
+  type Visitor,
+} from "../../src/index.js";
+
+/**
+ * The widest bound of each signedness. Array elements reach a visitor only
+ * through the bulk hand-off, which enforces the *schema's* interval — and these
+ * helpers have no schema: they assert what the decoder does with the bytes, so
+ * they accept every value the wire can carry.
+ */
+const U64_RANGE = { minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff };
+const I64_RANGE = { minLo: 0, minHi: 0x80000000, maxLo: 0xffffffff, maxHi: 0x7fffffff };
 
 /** Decodes into an OStream so the round-tripped bytes can be compared to input. */
 export class TranscodeVisitor implements Visitor {
@@ -17,11 +32,32 @@ export class TranscodeVisitor implements Visitor {
     kind: ArrayKind;
     id: number;
     vals: (bigint | number)[];
-    bits: number[];
+    words?: Uint32Array;
+    f64?: Float64Array;
   } | null = null;
   private fix: { sub: FixlenSubtype; id: number; buf: Uint8Array; got: number } | null = null;
 
   constructor(private readonly out: OStream) {}
+
+  /**
+   * Array elements arrive only here. `fp32` takes the **bits** destination rather
+   * than the value one: re-encoding a transcode must reproduce the wire exactly,
+   * and a signaling NaN read as a value comes back quiet (§4.6/§6.5).
+   */
+  arrayBulk(_id: number, kind: ArrayKind, count: number): ArrayTarget | null {
+    const a = this.array!;
+    if (kind === ArrayKind.Fp32) {
+      a.words = new Uint32Array(count);
+      return { bits: a.words };
+    }
+    if (kind === ArrayKind.Fp64) {
+      a.f64 = new Float64Array(count);
+      return { f64: a.f64 };
+    }
+    return kind === ArrayKind.Unsigned
+      ? { values: a.vals, ...U64_RANGE }
+      : { values: a.vals, ...I64_RANGE };
+  }
 
   unsigned(id: number, value: number | bigint): void {
     this.out.writeUnsigned(id, value);
@@ -46,20 +82,7 @@ export class TranscodeVisitor implements Visitor {
   }
 
   arrayBegin(id: number, kind: ArrayKind, _count: number): void {
-    this.array = { kind, id, vals: [], bits: [] };
-  }
-  arrayUnsigned(_id: number, _index: number, value: number | bigint): void {
-    this.array!.vals.push(value);
-  }
-  arraySigned(_id: number, _index: number, value: number | bigint): void {
-    this.array!.vals.push(value);
-  }
-  arrayFp32(_id: number, _index: number, value: number, bits: number): void {
-    this.array!.vals.push(value);
-    this.array!.bits.push(bits);
-  }
-  arrayFp64(_id: number, _index: number, value: number): void {
-    this.array!.vals.push(value);
+    this.array = { kind, id, vals: [] };
   }
   arrayEnd(id: number): void {
     const a = this.array!;
@@ -67,12 +90,13 @@ export class TranscodeVisitor implements Visitor {
     if (a.kind === ArrayKind.Unsigned) this.out.writeUnsignedArray(id, a.vals);
     else if (a.kind === ArrayKind.Signed) this.out.writeSignedArray(id, a.vals);
     else if (a.kind === ArrayKind.Fp32) {
-      // Bit-exact re-emit from the raw element bits (preserves an sNaN element).
-      const payload = new Uint8Array(a.bits.length * 4);
+      // Bit-exact re-emit from the raw element words (preserves an sNaN element).
+      const words = a.words ?? new Uint32Array(0);
+      const payload = new Uint8Array(words.length * 4);
       const dv = new DataView(payload.buffer);
-      a.bits.forEach((b, k) => dv.setUint32(k * 4, b >>> 0, true));
+      words.forEach((b, k) => dv.setUint32(k * 4, b >>> 0, true));
       this.out.writeFp32ArrayRaw(id, payload);
-    } else this.out.writeFp64Array(id, a.vals as number[]);
+    } else this.out.writeFp64Array(id, a.f64 ?? []);
   }
 
   sequenceBegin(id: number): void {
@@ -122,7 +146,13 @@ export type Event =
 /** Collects a flat event log; string/blob pieces are joined. */
 export class RecordingVisitor implements Visitor {
   readonly events: Event[] = [];
-  protected array: { id: number; arrayKind: ArrayKind; values: (bigint | number)[] } | null = null;
+  protected array: {
+    id: number;
+    arrayKind: ArrayKind;
+    values: (bigint | number)[];
+    floats?: Float32Array;
+    doubles?: Float64Array;
+  } | null = null;
   private fix: { id: number; isString: boolean; buf: Uint8Array; got: number } | null = null;
 
   unsigned(id: number, value: number | bigint): void {
@@ -146,20 +176,25 @@ export class RecordingVisitor implements Visitor {
   arrayBegin(id: number, kind: ArrayKind): void {
     this.array = { id, arrayKind: kind, values: [] };
   }
-  arrayUnsigned(_id: number, _i: number, value: number | bigint): void {
-    this.array!.values.push(value);
-  }
-  arraySigned(_id: number, _i: number, value: number | bigint): void {
-    this.array!.values.push(value);
-  }
-  arrayFp32(_id: number, _i: number, value: number): void {
-    this.array!.values.push(value);
-  }
-  arrayFp64(_id: number, _i: number, value: number): void {
-    this.array!.values.push(value);
+  arrayBulk(_id: number, kind: ArrayKind, count: number): ArrayTarget | null {
+    const a = this.array;
+    if (a === null) return null; // this array is being skipped
+    if (kind === ArrayKind.Fp32) {
+      a.floats = new Float32Array(count);
+      return { f32: a.floats };
+    }
+    if (kind === ArrayKind.Fp64) {
+      a.doubles = new Float64Array(count);
+      return { f64: a.doubles };
+    }
+    return kind === ArrayKind.Unsigned
+      ? { values: a.values, ...U64_RANGE }
+      : { values: a.values, ...I64_RANGE };
   }
   arrayEnd(id: number): void {
-    this.events.push({ kind: "array", id, arrayKind: this.array!.arrayKind, values: this.array!.values });
+    const a = this.array!;
+    const values = a.floats ?? a.doubles ?? a.values;
+    this.events.push({ kind: "array", id, arrayKind: a.arrayKind, values: [...values] });
     this.array = null;
   }
   sequenceBegin(id: number): void {
@@ -224,17 +259,10 @@ export class SkipVisitor extends RecordingVisitor {
   override arrayBegin(id: number, kind: ArrayKind): void {
     if (!this.skip.has(id)) super.arrayBegin(id, kind);
   }
-  override arrayUnsigned(id: number, i: number, value: number | bigint): void {
-    if (!this.skip.has(id)) super.arrayUnsigned(id, i, value);
-  }
-  override arraySigned(id: number, i: number, value: number | bigint): void {
-    if (!this.skip.has(id)) super.arraySigned(id, i, value);
-  }
-  override arrayFp32(id: number, i: number, value: number): void {
-    if (!this.skip.has(id)) super.arrayFp32(id, i, value);
-  }
-  override arrayFp64(id: number, i: number, value: number): void {
-    if (!this.skip.has(id)) super.arrayFp64(id, i, value);
+  override arrayBulk(id: number, kind: ArrayKind, count: number): ArrayTarget | null {
+    // A skipped array is declined: its elements are walked over and never
+    // decoded into existence.
+    return this.skip.has(id) ? null : super.arrayBulk(id, kind, count);
   }
   override arrayEnd(id: number): void {
     if (!this.skip.has(id)) super.arrayEnd(id);

@@ -41,7 +41,7 @@ class Rec implements Visitor {
   string(id: number, total: number): void { this.ev.push(`s ${id} ${total}`); }
   blob(id: number, total: number): void { this.ev.push(`b ${id} ${total}`); }
   arrayBegin(id: number, k: ArrayKind, n: number): void { this.ev.push(`arr ${id} ${k} ${n}`); }
-  arrayUnsigned(id: number, i: number): void { this.ev.push(`ae ${id} ${i}`); }
+  arrayBulk(id: number): null { this.ev.push(`arrBulk ${id}`); return null; }
   arrayEnd(id: number): void { this.ev.push(`arrEnd ${id}`); }
   sequenceBegin(id: number): boolean {
     this.ev.push(`seq ${id}`);

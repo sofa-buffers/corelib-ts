@@ -280,7 +280,12 @@ describe("sequence-array growth (§7.2 item 8)", () => {
       arrayBegin(_id, _kind, count) {
         if (count > CAP) throw new SofabError(SofabErrorCode.LimitExceeded, "over cap");
       },
-      arrayUnsigned: () => void seen.push(1),
+      // The hand-off is the only way elements reach a visitor, so being offered
+      // it at all is what must not happen after the cap threw.
+      arrayBulk: () => {
+        seen.push(1);
+        return null;
+      },
     });
     expect(() => is.feed(os.bytes().slice())).toThrow(
       expect.objectContaining({ code: SofabErrorCode.LimitExceeded }),

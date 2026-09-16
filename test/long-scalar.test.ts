@@ -28,7 +28,8 @@ import {
   SofabError,
   SofabErrorCode,
   decode,
-  type Visitor, growingOStream } from "../src/index.js";
+  type ArrayTarget,
+  type Visitor, growingOStream, ArrayKind } from "../src/index.js";
 
 /** Unsigned corpus: every varint-width and number/bigint boundary that matters. */
 const UNSIGNED: bigint[] = [
@@ -200,12 +201,20 @@ describe("the decoder's lo/hi halves", () => {
     const os = growingOStream();
     os.writeUnsignedArray(1, UNSIGNED);
     os.writeSignedArray(2, SIGNED);
-    const uArray: number[][] = [];
-    const sArray: number[][] = [];
+    // The array side reads the halves through the hand-off's `lo`/`hi`
+    // destination — the same two numbers, the other delivery shape.
+    const uLo = new Uint32Array(UNSIGNED.length);
+    const uHi = new Uint32Array(UNSIGNED.length);
+    const sLo = new Uint32Array(SIGNED.length);
+    const sHi = new Uint32Array(SIGNED.length);
     decode(os.bytes().slice(), {
-      arrayUnsigned: (_id, _i, _v, lo, hi) => void uArray.push([lo, hi]),
-      arraySigned: (_id, _i, _v, lo, hi) => void sArray.push([lo, hi]),
+      arrayBulk: (id) =>
+        id === 1
+          ? { lo: uLo, hi: uHi, ...{ minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff } }
+          : { lo: sLo, hi: sHi, ...{ minLo: 0, minHi: 0x80000000, maxLo: 0xffffffff, maxHi: 0x7fffffff } },
     });
+    const uArray = [...uLo].map((lo, k) => [lo, uHi[k]!]);
+    const sArray = [...sLo].map((lo, k) => [lo, sHi[k]!]);
 
     const each = growingOStream();
     UNSIGNED.forEach((v, i) => each.writeUnsigned(i, v));
@@ -239,23 +248,35 @@ type IntEvent = { kind: "u" | "s" | "au" | "as"; id: number; value: bigint };
 /** Collects the integer events from the number-first `value`. */
 class PlainRecorder implements Visitor {
   readonly events: IntEvent[] = [];
+  private array: { id: number; kind: ArrayKind; values: (number | bigint)[] } | null = null;
+
   unsigned(id: number, v: number | bigint): void {
     this.events.push({ kind: "u", id, value: BigInt(v) });
   }
   signed(id: number, v: number | bigint): void {
     this.events.push({ kind: "s", id, value: BigInt(v) });
   }
-  arrayUnsigned(id: number, _i: number, v: number | bigint): void {
-    this.events.push({ kind: "au", id, value: BigInt(v) });
+  arrayBegin(id: number, kind: ArrayKind): void {
+    this.array = { id, kind, values: [] };
   }
-  arraySigned(id: number, _i: number, v: number | bigint): void {
-    this.events.push({ kind: "as", id, value: BigInt(v) });
+  arrayBulk(): ArrayTarget {
+    const a = this.array!;
+    return a.kind === ArrayKind.Unsigned
+      ? { values: a.values, ...{ minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff } }
+      : { values: a.values, ...{ minLo: 0, minHi: 0x80000000, maxLo: 0xffffffff, maxHi: 0x7fffffff } };
+  }
+  arrayEnd(): void {
+    const a = this.array!;
+    this.array = null;
+    const kind = a.kind === ArrayKind.Unsigned ? "au" : "as";
+    for (const v of a.values) this.events.push({ kind, id: a.id, value: BigInt(v) });
   }
 }
 
 /** The same events, read from the `lo`/`hi` halves instead. */
 class LongRecorder implements Visitor {
   readonly events: IntEvent[] = [];
+  private array: { id: number; kind: ArrayKind; longs: Long[] } | null = null;
 
   unsigned(id: number, _v: number | bigint, lo: number, hi: number): void {
     this.events.push({ kind: "u", id, value: Long.fromBits(lo, hi).toBigInt() });
@@ -263,11 +284,22 @@ class LongRecorder implements Visitor {
   signed(id: number, _v: number | bigint, lo: number, hi: number): void {
     this.events.push({ kind: "s", id, value: Long.fromBits(lo, hi).toBigInt(true) });
   }
-  arrayUnsigned(id: number, _i: number, _v: number | bigint, lo: number, hi: number): void {
-    this.events.push({ kind: "au", id, value: Long.fromBits(lo, hi).toBigInt() });
+  arrayBegin(id: number, kind: ArrayKind): void {
+    this.array = { id, kind, longs: [] };
   }
-  arraySigned(id: number, _i: number, _v: number | bigint, lo: number, hi: number): void {
-    this.events.push({ kind: "as", id, value: Long.fromBits(lo, hi).toBigInt(true) });
+  arrayBulk(): ArrayTarget {
+    const a = this.array!;
+    return a.kind === ArrayKind.Unsigned
+      ? { longs: a.longs, ...{ minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff } }
+      : { longs: a.longs, ...{ minLo: 0, minHi: 0x80000000, maxLo: 0xffffffff, maxHi: 0x7fffffff } };
+  }
+  arrayEnd(): void {
+    const a = this.array!;
+    this.array = null;
+    const unsigned = a.kind === ArrayKind.Unsigned;
+    for (const l of a.longs) {
+      this.events.push({ kind: unsigned ? "au" : "as", id: a.id, value: l.toBigInt(!unsigned) });
+    }
   }
 }
 

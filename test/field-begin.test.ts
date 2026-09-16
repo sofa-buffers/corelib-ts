@@ -160,8 +160,9 @@ class Rec implements Visitor {
   arrayBegin(id: number, kind: ArrayKind, count: number): void {
     this.ev.push(`arrayBegin ${id} ${kind} ${count}`);
   }
-  arrayUnsigned(id: number, index: number): void {
-    this.ev.push(`arrayUnsigned ${id} ${index}`);
+  arrayBulk(id: number): null {
+    this.ev.push(`arrayBulk ${id}`);
+    return null; // this recorder is about the header stream, not the elements
   }
   arrayEnd(id: number): void {
     this.ev.push(`arrayEnd ${id}`);
@@ -301,8 +302,7 @@ describe("Visitor.fieldBegin", () => {
       "fp64 5",
       `fieldBegin 6 ${WireType.ArrayUnsigned}`,
       `arrayBegin 6 ${ArrayKind.Unsigned} 2`,
-      "arrayUnsigned 6 0",
-      "arrayUnsigned 6 1",
+      "arrayBulk 6",
       "arrayEnd 6",
       `fieldBegin 7 ${WireType.SequenceStart}`,
       "sequenceBegin 7",
