@@ -122,7 +122,23 @@ import { DecoderState } from "./state.js";
  * a plain-array destination is cut to exactly that length. Like every `INVALID`
  * verdict it is terminal (§5.2.1).
  */
-export type ArrayTarget = IntegerArrayTarget | FloatArrayTarget;
+export type ArrayTarget = IntegerArrayTarget | FloatArrayTarget | BoolArrayTarget;
+
+/**
+ * A `boolean` array's destination: one byte per element, `0` or `1`.
+ *
+ * It carries **no bound**, and that is the whole reason it is a shape of its own
+ * rather than a {@link IntegerArrayTarget.typed} `Uint8Array`. §4.4 gives a boolean
+ * no width bound — every non-zero wire value is `true` — so there is no interval to
+ * state and nothing for the width check to compare. A raw store would be wrong
+ * twice over: 256 would mask to `0` and turn `true` into `false`. The decoder
+ * NORMALIZES instead, writing `1` for any non-zero, which is also the only value
+ * §4.4 lets an encoder emit back — so a filled destination re-encodes canonically
+ * with no conversion step in between.
+ */
+export interface BoolArrayTarget {
+  bool: Uint8Array;
+}
 
 /**
  * An integer array's destination and the **element bound** to enforce while
@@ -204,7 +220,15 @@ export interface IntegerArrayTarget {
    * interval could not represent every legal element, and is refused with
    * {@link SofabErrorCode.Argument} rather than silently masking.
    */
-  typed?: Uint8Array | Uint16Array | Uint32Array | Int8Array | Int16Array | Int32Array;
+  typed?:
+    | Uint8Array
+    | Uint16Array
+    | Uint32Array
+    | Int8Array
+    | Int16Array
+    | Int32Array
+    | BigUint64Array
+    | BigInt64Array;
   lo?: Uint32Array;
   /** The high halves; see {@link lo}. */
   hi?: Uint32Array;

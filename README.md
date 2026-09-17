@@ -256,11 +256,20 @@ elements are walked over without being decoded at all. There is no callback per
 element: one array is one call.
 
 The **exact-width** destination (`typed`) is for a field whose declared width is a
-typed array's own — a `u16` array into a `Uint16Array`. It stores unboxed, it costs
+typed array's own — a `u16` array into a `Uint16Array`, a `u64` array into a
+`BigUint64Array`. It stores unboxed, it costs
 two bytes an element rather than a tagged slot, and it lets the *encoder* know the
 width too: `writeUnsignedArray` reads a `Uint16Array` element without the type and
 range guards a `number[]` element needs, and reserves three bytes an element rather
 than ten, which is what a caller-sized buffer has room for.
+
+A **64-bit** destination is filled through the two 32-bit halves of each element,
+written into a `Uint32Array` over the array's own buffer — `b[i] = 5n` would demand
+a `bigint` per element, and this builds none. The same view reads them back when
+such an array is encoded. A **`boolean`** array has a destination of its own,
+`bool`, one byte per element: §4.4 gives a boolean no width bound, so a wire value
+of 256 is `true` and must NOT mask to `0` — the decoder normalizes every non-zero
+to `1`, which is also the only value an encoder may write back.
 
 The element bound is still compared, and that is not a formality: a typed array
 *masks* on store (`a[0] = 70000` in a `Uint16Array` is 4464), while an element

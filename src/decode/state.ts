@@ -49,6 +49,7 @@ import { fp32FromBits, fp64FromBits } from "../varint/num64.js";
 import { SKIP } from "./skip.js";
 import type {
   ArrayTarget,
+  BoolArrayTarget,
   FloatArrayTarget,
   IntegerArrayTarget,
   Visitor,
@@ -69,13 +70,24 @@ const enum S {
 
 const TWO32 = 0x1_0000_0000; // 2^32, for combining the 32-bit halves
 
+/**
+ * Whether this machine stores a 64-bit typed array's low half first. The halves
+ * of a `BigUint64Array` element are two 32-bit words in memory, and which one
+ * comes first is the platform's business — so it is asked once, here, and the
+ * fill and drain loops index accordingly instead of building a `bigint` to stay
+ * portable.
+ */
+const LE = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
+
 type TypedIntCtor =
   | Uint8ArrayConstructor
   | Uint16ArrayConstructor
   | Uint32ArrayConstructor
   | Int8ArrayConstructor
   | Int16ArrayConstructor
-  | Int32ArrayConstructor;
+  | Int32ArrayConstructor
+  | BigUint64ArrayConstructor
+  | BigInt64ArrayConstructor;
 
 /**
  * What each exact-width destination can hold, so {@link IntegerArrayTarget.typed}
@@ -89,7 +101,17 @@ const TYPED_CAPACITY = new Map<TypedIntCtor, { min: number; max: number }>([
   [Int8Array, { min: -0x80, max: 0x7f }],
   [Int16Array, { min: -0x8000, max: 0x7fff }],
   [Int32Array, { min: -0x80000000, max: 0x7fffffff }],
+  // The 64-bit pair is the accumulator's own range on both sides, so any bound a
+  // caller can state fits: `min`/`max` here are the sentinels the fit test needs,
+  // not numbers anything is compared against (the fill writes raw halves).
+  [BigUint64Array, { min: 0, max: Number.POSITIVE_INFINITY }],
+  [BigInt64Array, { min: Number.NEGATIVE_INFINITY, max: Number.POSITIVE_INFINITY }],
 ]);
+
+/** Whether `d` is one of the two 64-bit destinations, which fill through halves. */
+function is64(d: object): boolean {
+  return d instanceof BigUint64Array || d instanceof BigInt64Array;
+}
 
 /**
  * Which destination an accepted {@link ArrayTarget} named — resolved once, at the
@@ -115,6 +137,15 @@ const enum BM {
    * leaves the small-integer range.
    */
   Typed,
+  /**
+   * {@link IntegerArrayTarget.typed} holding a `BigUint64Array` / `BigInt64Array`.
+   * Filled through a `Uint32Array` over the same buffer, two halves per element,
+   * so a 64-bit array costs no `bigint` at all — the store a `BigUint64Array`
+   * would otherwise demand one for.
+   */
+  Typed64,
+  /** {@link IntegerArrayTarget.bool} — one normalized byte per element. */
+  Bool,
   /** {@link IntegerArrayTarget.longs} — a {@link Long} per element, no `bigint`. */
   Longs,
   /** {@link IntegerArrayTarget.lo} / `hi` — raw halves, nothing allocated. */
@@ -287,6 +318,8 @@ export class DecoderState {
   private bulk: ArrayTarget | null = null;
   /** Which destination {@link bulk} named; meaningless while it is `null`. */
   private bulkMode: BM = BM.Values;
+  /** The `Uint32Array` over a 64-bit typed destination; see {@link BM.Typed64}. */
+  private bulk64: Uint32Array | null = null;
 
   constructor(visitor: Visitor = SKIP) {
     this.root = visitor;
@@ -338,6 +371,7 @@ export class DecoderState {
     this.vBytes = 0;
     this.have = 0;
     this.bulk = null;
+    this.bulk64 = null;
   }
 
   /**
@@ -352,6 +386,7 @@ export class DecoderState {
     // A decode aborted inside an array leaves the visitor's destination here;
     // a pooled machine must not keep it alive (see {@link bulk}).
     this.bulk = null;
+    this.bulk64 = null;
   }
 
   /** Feed `input` to the machine, dispatching to the bound visitor. */
@@ -794,6 +829,7 @@ export class DecoderState {
     // as it would have been at `arrayEnd`: a latched stream the caller keeps must
     // not keep *their* storage alive with it (§6.6; see {@link bulk}).
     this.bulk = null;
+    this.bulk64 = null;
     return e;
   }
 
@@ -961,6 +997,7 @@ export class DecoderState {
     const t = this.bulk;
     if (t !== null) this.trimPlain(t, this.arrIndex);
     this.bulk = null;
+    this.bulk64 = null;
     this.cur.arrayEnd?.(this.id);
   }
 
@@ -1013,6 +1050,7 @@ export class DecoderState {
     const t = this.cur.arrayBulk?.(this.id, kind, count) ?? null;
     if (t === null) {
       this.bulk = null;
+      this.bulk64 = null;
       return;
     }
     // Resolve *before* storing: a target this machine cannot fill is a caller
@@ -1060,6 +1098,32 @@ export class DecoderState {
       return f.bits !== undefined ? BM.F32Bits : BM.F32;
     }
 
+    // The bool destination carries no bound, so it is settled before the four
+    // halves are even looked at.
+    const bt = t as BoolArrayTarget;
+    if (bt.bool !== undefined) {
+      const other = t as IntegerArrayTarget;
+      if (
+        other.values !== undefined ||
+        other.longs !== undefined ||
+        other.typed !== undefined ||
+        other.lo !== undefined ||
+        other.hi !== undefined
+      ) {
+        throw argumentError(
+          `array ${this.id}: an integer array target needs exactly one destination`,
+        );
+      }
+      if (kind !== ArrayKind.Unsigned) {
+        throw argumentError(`array ${this.id}: a bool destination needs an unsigned array`);
+      }
+      if (bt.bool.length < count) {
+        throw argumentError(
+          `array ${this.id}: bool destination holds ${bt.bool.length} of ${count} elements`,
+        );
+      }
+      return BM.Bool;
+    }
     const it = t as IntegerArrayTarget;
     const halves = it.lo !== undefined || it.hi !== undefined;
     const named =
@@ -1114,6 +1178,18 @@ export class DecoderState {
       // beyond that same bound.
       const cap = TYPED_CAPACITY.get(d.constructor as TypedIntCtor);
       const signed = kind === ArrayKind.Signed;
+      if (is64(d)) {
+        // The 64-bit pair covers the whole accumulator, so no bound can fall
+        // outside it and there is nothing to compare. What it does need is the
+        // view the fill writes halves through, built once per array.
+        if (signed !== d instanceof BigInt64Array) {
+          throw argumentError(
+            `array ${this.id}: a 64-bit typed destination must match the array's signedness`,
+          );
+        }
+        this.bulk64 = new Uint32Array(d.buffer, d.byteOffset, d.length * 2);
+        return BM.Typed64;
+      }
       const minV = signed ? (it.minHi | 0) * TWO32 + it.minLo : it.minHi * TWO32 + it.minLo;
       const maxV = signed ? (it.maxHi | 0) * TWO32 + it.maxLo : it.maxHi * TWO32 + it.maxLo;
       if (cap === undefined) {
@@ -1233,6 +1309,35 @@ export class DecoderState {
             if (this.vHi !== 0 || lo < minLo || lo > maxLo) this.outOfBound(idx);
             out[idx++] = lo;
           }
+        } else if (mode === BM.Typed64) {
+          // Two raw halves per element, straight into the 64-bit array's own
+          // storage: no `bigint` is built, which the element store this replaces
+          // would have demanded one for.
+          const out = this.bulk64!;
+          while (idx < count && i <= safeEnd) {
+            i = this.varintFull(input, i);
+            const lo = this.vLo >>> 0;
+            const hi = this.vHi >>> 0;
+            if (
+              hi < minHi ||
+              (hi === minHi && lo < minLo) ||
+              hi > maxHi ||
+              (hi === maxHi && lo > maxLo)
+            ) {
+              this.outOfBound(idx);
+            }
+            out[LE ? idx * 2 : idx * 2 + 1] = lo;
+            out[LE ? idx * 2 + 1 : idx * 2] = hi;
+            idx++;
+          }
+        } else if (mode === BM.Bool) {
+          // §4.4: every non-zero reads as `true`, and `1` is the only value an
+          // encoder may write back — so the normalization is the store.
+          const out = (this.bulk as BoolArrayTarget).bool;
+          while (idx < count && i <= safeEnd) {
+            i = this.varintFull(input, i);
+            out[idx++] = this.vLo !== 0 || this.vHi !== 0 ? 1 : 0;
+          }
         } else if (mode === BM.Values) {
           const out = t.values!;
           while (idx < count && i <= safeEnd) {
@@ -1341,7 +1446,11 @@ export class DecoderState {
             this.outOfBound(idx);
           }
           if (mode === BM.Typed) {
-            t.typed![idx] = lo | 0;
+            (t.typed as Int32Array)[idx] = lo | 0;
+          } else if (mode === BM.Typed64) {
+            const o = this.bulk64!;
+            o[LE ? idx * 2 : idx * 2 + 1] = lo;
+            o[LE ? idx * 2 + 1 : idx * 2] = hi;
           } else if (mode === BM.Values || mode === BM.Values32) {
             // vSigned() inlined: the halves are in hand and this runs per element.
             let v: number | bigint;
@@ -1478,7 +1587,13 @@ export class DecoderState {
     if (this.bulkMode === BM.Values || this.bulkMode === BM.Values32) {
       t.values![idx] = this.vUnsigned();
     } else if (this.bulkMode === BM.Typed) {
-      t.typed![idx] = lo;
+      (t.typed as Uint32Array)[idx] = lo;
+    } else if (this.bulkMode === BM.Typed64) {
+      const o = this.bulk64!;
+      o[LE ? idx * 2 : idx * 2 + 1] = lo;
+      o[LE ? idx * 2 + 1 : idx * 2] = hi;
+    } else if (this.bulkMode === BM.Bool) {
+      (this.bulk as BoolArrayTarget).bool[idx] = lo !== 0 || hi !== 0 ? 1 : 0;
     } else if (this.bulkMode === BM.Longs) {
       t.longs![idx] = new Long(lo, hi);
     } else {
@@ -1504,8 +1619,12 @@ export class DecoderState {
     }
     if (this.bulkMode === BM.Values || this.bulkMode === BM.Values32) {
       t.values![idx] = this.vSigned();
-    } else if (this.bulkMode === BM.Typed) t.typed![idx] = lo | 0;
-    else if (this.bulkMode === BM.Longs) t.longs![idx] = new Long(lo, hi);
+    } else if (this.bulkMode === BM.Typed) (t.typed as Int32Array)[idx] = lo | 0;
+    else if (this.bulkMode === BM.Typed64) {
+      const o = this.bulk64!;
+      o[LE ? idx * 2 : idx * 2 + 1] = lo;
+      o[LE ? idx * 2 + 1 : idx * 2] = hi;
+    } else if (this.bulkMode === BM.Longs) t.longs![idx] = new Long(lo, hi);
     else {
       t.lo![idx] = lo;
       t.hi![idx] = hi;

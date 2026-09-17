@@ -265,3 +265,148 @@ describe("exact-width source: the encoder emits the same bytes as the general pa
     expect([...out]).toEqual(vals);
   });
 });
+
+describe("exact-width destination: the 64-bit pair fills through halves", () => {
+  const U64 = { minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff };
+  const I64 = { minLo: 0, minHi: 0x80000000, maxLo: 0xffffffff, maxHi: 0x7fffffff };
+  const uVals = [0n, 1n, 255n, 4294967296n, 9223372036854775808n, 18446744073709551615n];
+  const iVals = [0n, -1n, 1n, -4294967296n, -9223372036854775808n, 9223372036854775807n];
+
+  // The reason this destination exists: `b[i] = 5` on a BigUint64Array throws,
+  // so an element store would have to build a `bigint` per element — the very
+  // cost a 64-bit array is meant to avoid. Writing the two 32-bit halves through
+  // a view over the same buffer builds none.
+  it("fills a BigUint64Array exactly", () => {
+    const bytes = wire((os) => os.writeUnsignedArray(1, uVals));
+    const out = new BigUint64Array(uVals.length);
+    decode(bytes, { arrayBulk: () => ({ typed: out, ...U64 }) });
+    expect([...out]).toEqual(uVals);
+  });
+
+  it("fills a BigInt64Array exactly, zig-zag undone and sign preserved", () => {
+    const bytes = wire((os) => os.writeSignedArray(1, iVals));
+    const out = new BigInt64Array(iVals.length);
+    decode(bytes, { arrayBulk: () => ({ typed: out, ...I64 }) });
+    expect([...out]).toEqual(iVals);
+  });
+
+  it("fills identically at every chunking, both signs", () => {
+    for (const [vals, Ctor, bound, signed] of [
+      [uVals, BigUint64Array, U64, false],
+      [iVals, BigInt64Array, I64, true],
+    ] as const) {
+      const bytes = wire((os) =>
+        signed ? os.writeSignedArray(1, vals) : os.writeUnsignedArray(1, vals),
+      );
+      for (const chunk of [1, 2, 3, 7, 13, Number.MAX_SAFE_INTEGER]) {
+        const out = new Ctor(vals.length);
+        feedChunked(bytes, { arrayBulk: () => ({ typed: out, ...bound }) }, chunk);
+        expect([...out], `chunk ${chunk}`).toEqual([...vals]);
+      }
+    }
+  });
+
+  it("fills a long array, past the drain and through the resumable tail", () => {
+    const vals = Array.from({ length: 777 }, (_, i) => BigInt(i) * 0x1_0000_0001n);
+    const bytes = wire((os) => os.writeUnsignedArray(1, vals));
+    for (const chunk of [1, 64, Number.MAX_SAFE_INTEGER]) {
+      const out = new BigUint64Array(vals.length);
+      feedChunked(bytes, { arrayBulk: () => ({ typed: out, ...U64 }) }, chunk);
+      expect([...out], `chunk ${chunk}`).toEqual(vals);
+    }
+  });
+
+  it("refuses a destination whose signedness contradicts the array", () => {
+    const u = wire((os) => os.writeUnsignedArray(1, [1n, 2n]));
+    const s = wire((os) => os.writeSignedArray(1, [1n, 2n]));
+    for (const [bytes, target] of [
+      [u, { typed: new BigInt64Array(2), ...U64 }],
+      [s, { typed: new BigUint64Array(2), ...I64 }],
+    ] as const) {
+      try {
+        decode(bytes, { arrayBulk: () => target as ArrayTarget });
+        expect.unreachable("a mismatched 64-bit destination must be refused");
+      } catch (e) {
+        expect((e as { code: string }).code).toBe(SofabErrorCode.Argument);
+        expect((e as Error).message).toMatch(/must match the array's signedness/);
+      }
+    }
+  });
+
+  it("refuses one too short for the count", () => {
+    const bytes = wire((os) => os.writeUnsignedArray(1, [1n, 2n, 3n]));
+    try {
+      decode(bytes, { arrayBulk: () => ({ typed: new BigUint64Array(2), ...U64 }) });
+      expect.unreachable("a short destination must be refused");
+    } catch (e) {
+      expect((e as { code: string }).code).toBe(SofabErrorCode.Argument);
+    }
+  });
+
+  it("encodes from a typed 64-bit source with the same bytes as a bigint[]", () => {
+    for (const [vals, Ctor, signed] of [
+      [uVals, BigUint64Array, false],
+      [iVals, BigInt64Array, true],
+    ] as const) {
+      const plain = wire((os) => (signed ? os.writeSignedArray(1, vals) : os.writeUnsignedArray(1, vals)));
+      const typed = wire((os) =>
+        signed ? os.writeSignedArray(1, new Ctor(vals)) : os.writeUnsignedArray(1, new Ctor(vals)),
+      );
+      expect([...typed]).toEqual([...plain]);
+    }
+  });
+});
+
+describe("bool destination: §4.4 normalizes rather than masks", () => {
+  it("writes 1 for every non-zero, whatever its width", () => {
+    // The trap a plain Uint8Array `typed` destination would fall into: 256 masks
+    // to 0, turning `true` into `false`. A boolean carries NO width bound (§4.4),
+    // so the store normalizes instead.
+    const bytes = wire((os) => os.writeUnsignedArray(1, [0, 1, 2, 255, 256, 4294967296, 0]));
+    const out = new Uint8Array(7);
+    decode(bytes, { arrayBulk: () => ({ bool: out }) });
+    expect([...out]).toEqual([0, 1, 1, 1, 1, 1, 0]);
+  });
+
+  it("normalizes identically at every chunking", () => {
+    const bytes = wire((os) => os.writeUnsignedArray(1, [0, 256, 1, 4294967296]));
+    for (const chunk of [1, 2, 3, Number.MAX_SAFE_INTEGER]) {
+      const out = new Uint8Array(4);
+      feedChunked(bytes, { arrayBulk: () => ({ bool: out }) }, chunk);
+      expect([...out], `chunk ${chunk}`).toEqual([0, 1, 1, 1]);
+    }
+  });
+
+  it("takes an empty array, and leaves a reused destination's tail alone", () => {
+    const out = new Uint8Array(4).fill(9);
+    decode(wire((os) => os.writeUnsignedArray(1, [1, 0])), { arrayBulk: () => ({ bool: out }) });
+    expect([...out]).toEqual([1, 0, 9, 9]);
+  });
+
+  it("refuses a signed array, a short destination, and a second destination", () => {
+    const u = wire((os) => os.writeUnsignedArray(1, [1, 0, 1]));
+    const s = wire((os) => os.writeSignedArray(1, [1, 0, 1]));
+    const cases: [Uint8Array, unknown, RegExp][] = [
+      [s as never, { bool: new Uint8Array(3) }, /needs an unsigned array/],
+      [u, { bool: new Uint8Array(2) }, /holds 2 of 3 elements/],
+      [u, { bool: new Uint8Array(3), values: [], minLo: 0, minHi: 0, maxLo: 1, maxHi: 0 }, /exactly one destination/],
+    ];
+    for (const [bytes, target, match] of cases) {
+      try {
+        decode(bytes, { arrayBulk: () => target as ArrayTarget });
+        expect.unreachable(`expected a refusal for ${JSON.stringify(Object.keys(target as object))}`);
+      } catch (e) {
+        expect((e as { code: string }).code).toBe(SofabErrorCode.Argument);
+        expect((e as Error).message).toMatch(match);
+      }
+    }
+  });
+
+  it("round-trips: a normalized destination re-encodes as the canonical 0/1", () => {
+    const bytes = wire((os) => os.writeUnsignedArray(1, [0, 256, 4294967296]));
+    const out = new Uint8Array(3);
+    decode(bytes, { arrayBulk: () => ({ bool: out }) });
+    const back = wire((os) => os.writeUnsignedArray(1, out));
+    expect([...back]).toEqual([...wire((os) => os.writeUnsignedArray(1, [0, 1, 1]))]);
+  });
+});

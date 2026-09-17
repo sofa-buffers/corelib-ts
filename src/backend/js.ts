@@ -10,7 +10,10 @@
 import { argumentError } from "../errors.js";
 import { FP32_HANDLE_MIN, FP64_HANDLE_MIN } from "../constants.js";
 import { HI, LO, S_U32, splitI64, splitU64 } from "../varint/bits64.js";
-import { encodeVarintNum } from "../varint/leb128.js";
+import { encodeVarintLoHi, encodeVarintNum } from "../varint/leb128.js";
+
+/** Whether a 64-bit typed array stores its low half first; see `state.ts`. */
+const LE = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
 import { packFp32, packFp64, toBigInt } from "../varint/num64.js";
 import { encodeZigzagVarintLoHi } from "../varint/zigzag.js";
 import type { Kernel } from "./kernel.js";
@@ -38,6 +41,18 @@ export const jsKernel: Kernel = {
     // Three identity compares, once per array. `u64` is deliberately absent:
     // a `BigUint64Array` element is a `bigint` and would still need the split.
     const ctor = (values as object).constructor;
+    // A 64-bit typed source carries its elements as two 32-bit words in memory,
+    // and a `Uint32Array` over the same buffer reads them without materialising
+    // the `bigint` that indexing the array itself would produce. The varint is
+    // then emitted from the halves, exactly as the scalar Long writers do.
+    if (ctor === BigUint64Array) {
+      const a = values as unknown as BigUint64Array;
+      const h = new Uint32Array(a.buffer, a.byteOffset, a.length * 2);
+      for (let i = 0; i < n; i++) {
+        pos = encodeVarintLoHi(h[LE ? i * 2 : i * 2 + 1]!, h[LE ? i * 2 + 1 : i * 2]!, out, pos);
+      }
+      return pos;
+    }
     if (ctor === Uint8Array || ctor === Uint16Array || ctor === Uint32Array) {
       const a = values as unknown as Uint32Array;
       for (let i = 0; i < n; i++) {
@@ -107,6 +122,19 @@ export const jsKernel: Kernel = {
     // element cannot leave 32 bits — `-2^31` maps to `2^32-1` — so the whole
     // 64-bit split and its domain check are unreachable for this source.
     const ctorS = (values as object).constructor;
+    if (ctorS === BigInt64Array) {
+      const a = values as unknown as BigInt64Array;
+      const h = new Uint32Array(a.buffer, a.byteOffset, a.length * 2);
+      for (let i = 0; i < a.length; i++) {
+        pos = encodeZigzagVarintLoHi(
+          h[LE ? i * 2 : i * 2 + 1]!,
+          h[LE ? i * 2 + 1 : i * 2]!,
+          out,
+          pos,
+        );
+      }
+      return pos;
+    }
     if (ctorS === Int8Array || ctorS === Int16Array || ctorS === Int32Array) {
       const a = values as unknown as Int32Array;
       const n = a.length;

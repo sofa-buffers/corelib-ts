@@ -32,6 +32,7 @@ export type { FlushSink } from "./encode/sink.js";
 export { IStream, decode } from "./decode/istream.js";
 export type {
   ArrayTarget,
+  BoolArrayTarget,
   FloatArrayTarget,
   IntegerArrayTarget,
   Visitor,
