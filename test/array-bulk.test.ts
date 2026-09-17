@@ -563,8 +563,11 @@ describe("bulk hand-off: a target this decoder cannot fill is a caller mistake",
     // choice exists rather than one shape serving both.
     const f32 = new Float32Array(2);
     decode(os.bytes().slice(), { arrayBulk: () => ({ f32 }) });
-    const back = new DataView(f32.buffer);
-    expect(back.getUint32(0, true)).toBe(0x7fe00001);
+    // Read through a `Uint32Array`, not a little-endian `DataView`: the array's
+    // own buffer is in HOST order, so forcing LE reads it byte-swapped on a
+    // big-endian machine and the assertion would fail there for a reason that has
+    // nothing to do with what it is testing.
+    expect(new Uint32Array(f32.buffer)[0]).toBe(0x7fe00001);
   });
 
   it("refuses a typed destination shorter than the array", () => {

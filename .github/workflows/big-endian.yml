@@ -86,11 +86,23 @@ jobs:
           # every fork is a fresh emulated process. Threads keep the whole run
           # inside one, which is most of the difference between 15 minutes and 40.
           #
-          # `--testTimeout` -- vitest's default is 5s, and a ~20x slower machine
-          # puts the chunk-size sweeps well past it: `long-scalar.test.ts` takes
-          # 32s there and `small-buffer-encode.test.ts` 10s. Both pass; they were
-          # simply being timed out. A generous limit keeps this job reporting on
-          # byte order and nothing else.
+          # `--testTimeout` -- the suite's own limit is 20s, and a ~20x slower
+          # machine puts several cases past it: the destination-shape differential
+          # needs ~50s there and `long-scalar.test.ts` 32s. Both pass once allowed
+          # to finish, which is the point -- this job should report on byte order,
+          # not on emulation speed.
+          # Three files sit out, none of them about byte order:
+          #   bench-*        shell out to the bench tools and measure throughput
+          #                  -- the 1 MB blob row alone takes over four minutes
+          #                  emulated, against a limit the file sets itself;
+          #   public-surface reads the sources and package.json to check the
+          #                  export surface, and trips a vitest/esbuild bug on
+          #                  s390x before it collects a single test
+          #                  ("Bad escaped character in JSON"). Reproducible in
+          #                  isolation, nothing to do with this codebase.
           docker run --rm --platform linux/s390x \
             -v "$PWD":/work -w /work node:24 \
-            sh -c 'npm ci --no-audit --no-fund && npx vitest run --pool=threads --testTimeout=120000'
+            sh -c 'npm ci --no-audit --no-fund && npx vitest run --pool=threads \
+              --testTimeout=300000 \
+              --exclude "test/bench-*.test.ts" \
+              --exclude "test/public-surface.test.ts"'

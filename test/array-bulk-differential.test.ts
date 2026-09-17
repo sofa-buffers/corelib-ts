@@ -188,8 +188,10 @@ function normalise(h: {
   if (h.f64 !== undefined) return [...h.f64];
   // fp32 compares as bits either way, so the value and word destinations meet.
   if (h.f32 !== undefined) {
-    const dv = new DataView(h.f32.buffer);
-    return [...h.f32].map((_, k) => dv.getUint32(k * 4, true));
+    // Host order, via a `Uint32Array` over the same buffer — a little-endian
+    // `DataView` would read these byte-swapped on a big-endian machine and the
+    // shapes would "disagree" for a reason that is this helper's, not theirs.
+    return [...new Uint32Array(h.f32.buffer, h.f32.byteOffset, h.f32.length)];
   }
   if (h.bits !== undefined) return [...h.bits];
   if (h.longs !== undefined) return h.longs.map((l) => l.toBigInt(signed));
@@ -226,5 +228,9 @@ describe("bulk hand-off: every destination shape agrees with every other", () =>
         }
       }
     }
+    // No per-test limit here on purpose: the suite-wide `testTimeout` in
+    // `vitest.config.ts` covers it, and a run on a slower machine (the emulated
+    // big-endian job) raises that from the command line. An explicit limit would
+    // override it and have to be right for both.
   });
 });
