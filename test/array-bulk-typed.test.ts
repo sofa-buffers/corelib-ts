@@ -410,3 +410,55 @@ describe("bool destination: §4.4 normalizes rather than masks", () => {
     expect([...back]).toEqual([...wire((os) => os.writeUnsignedArray(1, [0, 1, 1]))]);
   });
 });
+
+describe("an fp32 array written from a Float32Array is bit-exact", () => {
+  // §4.6/§6.5: a JS number is a double, and widening an fp32 SIGNALING NaN into
+  // one quiets it. A `Float32Array` already holds the wire words, so the encoder
+  // copies them instead of reading the values — which is what lets a caller drop
+  // the raw-bytes companion it would otherwise have to carry beside the numbers.
+  const words = [0x7f800001, 0x3f800000, 0xffa00001, 0x7fc00001, 0x00000000];
+
+  it("preserves every bit pattern, signaling NaNs included", () => {
+    const f = new Float32Array(words.length);
+    new Uint32Array(f.buffer).set(words);
+    const bytes = wire((os) => os.writeFp32Array(1, f));
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    // 1 header byte + 1 count byte + 1 fixlen word, then the payload.
+    const off = bytes.length - words.length * 4;
+    expect(words.map((_, i) => dv.getUint32(off + i * 4, true))).toEqual(words);
+  });
+
+  it("emits the same bytes as a number[] for ordinary values", () => {
+    const vals = [0, 1.5, -0.25, 3.25, 1e30];
+    const plain = wire((os) => os.writeFp32Array(1, vals));
+    const typed = wire((os) => os.writeFp32Array(1, new Float32Array(vals)));
+    expect([...typed]).toEqual([...plain]);
+  });
+
+  it("round-trips bit-exactly through `bits` over a Float32Array's own buffer", () => {
+    // The decode side has the same asymmetry, and it decides which destination a
+    // Float32Array member must take. `f32` writes VALUES: an fp32 signaling NaN
+    // is widened to a double to be stored, which quiets it, and narrowing it back
+    // into the array cannot recover the payload. `bits` writes the wire WORDS, and
+    // a `Uint32Array` over the float array's own buffer is both — the words land
+    // exactly and reading the array gives the values.
+    const f = new Float32Array(words.length);
+    new Uint32Array(f.buffer).set(words);
+    const bytes = wire((os) => os.writeFp32Array(1, f));
+
+    const out = new Float32Array(words.length);
+    const view = new Uint32Array(out.buffer);
+    decode(bytes, { arrayBulk: () => ({ bits: view }) });
+    expect([...view]).toEqual(words);
+    expect([...wire((os) => os.writeFp32Array(1, out))]).toEqual([...bytes]);
+  });
+
+  it("...where the value destination would quiet it — the reason for the choice", () => {
+    const f = new Float32Array(1);
+    new Uint32Array(f.buffer)[0] = 0x7f800001; // signaling
+    const bytes = wire((os) => os.writeFp32Array(1, f));
+    const viaValues = new Float32Array(1);
+    decode(bytes, { arrayBulk: () => ({ f32: viaValues }) });
+    expect(new Uint32Array(viaValues.buffer)[0], "f32 quiets it").toBe(0x7fc00001);
+  });
+});

@@ -179,6 +179,21 @@ export const jsKernel: Kernel = {
   // wins, and a two-element array through a handle is a pessimisation.
   packFp32Array(values, out, pos) {
     const n = values.length;
+    // A `Float32Array` source already HOLDS the 32-bit wire words, so they are
+    // copied rather than read: `values[i]` widens each element to a double, and
+    // widening a SIGNALING NaN quiets it (0x7f800001 comes back 0x7fc00001), so
+    // reading the values is exactly how an fp32 payload gets lost (§4.6/§6.5).
+    // Going through the words is bit-exact for every value, not only NaNs, and it
+    // removes any need for a caller to carry the wire bytes beside the numbers.
+    if (values instanceof Float32Array) {
+      const w = new Uint32Array(values.buffer, values.byteOffset, n);
+      const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
+      for (let i = 0; i < n; i++) {
+        dv.setUint32(pos, w[i]!, true);
+        pos += 4;
+      }
+      return pos;
+    }
     if (n < FP32_HANDLE_MIN) {
       for (let i = 0; i < n; i++) pos = packFp32(out, pos, values[i]!);
       return pos;
