@@ -265,3 +265,40 @@ describe("exact-width source: the encoder emits the same bytes as the general pa
     expect([...out]).toEqual(vals);
   });
 });
+
+describe("the stated element width is load-bearing, so understating it is refused", () => {
+  it("refuses an element wider than the caller said, rather than truncating silently", () => {
+    // A write past a `Uint8Array`'s end is a no-op, so an understated width used
+    // to leave a SHORT message whose `bytesUsed` reported the length that was
+    // never written — partial output handed back as complete, which §5.1 forbids.
+    // The buffer here is exactly what the (wrong) claim promises: 2 header bytes
+    // plus 3 elements at 1 byte. Each element actually needs 3.
+    const os = new OStream(new Uint8Array(5));
+    try {
+      os.writeUnsignedArray(0, [999999, 999999, 999999], 1);
+      expect.unreachable("an understated width must be refused");
+    } catch (e) {
+      expect((e as { code: string }).code).toBe(SofabErrorCode.BufferFull);
+    }
+  });
+
+  it("an honest width in the same buffer encodes, and identically to the default", () => {
+    const vals = [999999, 999999, 999999];
+    const stated = new OStream(new Uint8Array(64));
+    stated.writeUnsignedArray(0, vals, 5);
+    const guessed = new OStream(new Uint8Array(64));
+    guessed.writeUnsignedArray(0, vals);
+    expect([...stated.bytes()]).toEqual([...guessed.bytes()]);
+  });
+
+  it("a width WIDER than the elements need is merely slack, never a refusal", () => {
+    const os = new OStream(new Uint8Array(64));
+    os.writeUnsignedArray(0, [1, 2, 3], 10);
+    expect([...os.bytes()]).toEqual([0x03, 0x03, 1, 2, 3]);
+  });
+
+  it("the signed writer guards the same way", () => {
+    const os = new OStream(new Uint8Array(5));
+    expect(() => os.writeSignedArray(0, [-999999, -999999, -999999], 1)).toThrow();
+  });
+});

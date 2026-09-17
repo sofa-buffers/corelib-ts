@@ -554,11 +554,26 @@ export class OStream implements ByteSink {
 
   // --- arrays -------------------------------------------------------------
 
-  /** Write an array of unsigned integers (each a varint). */
-  writeUnsignedArray(id: number, values: ArrayLike<number | bigint>): void {
+  /**
+   * Write an array of unsigned integers (each a varint).
+   *
+   * `maxBytes` is the most varint bytes ONE element can take, which the caller
+   * usually knows far better than this function can: a `boolean` array is one
+   * byte an element, a `u16` three, a `bitfield` as many as the width its
+   * declaration implies needs. It
+   * decides whether the bulk kernel may run — the kernel writes the whole array
+   * in one go and so needs room for the worst case up front — and the default of
+   * ten is the answer for a source whose elements could be any 64-bit value.
+   *
+   * That default is not free: a caller-owned buffer is sized from the element's
+   * REAL maximum, so `count * 10` asks for room that by construction does not
+   * exist, and the array falls to the element-at-a-time route, which builds a
+   * `bigint` per element. State the width and the bulk path becomes reachable.
+   */
+  writeUnsignedArray(id: number, values: ArrayLike<number | bigint>, maxBytes?: number): void {
     this.arrayHead(id, WireType.ArrayUnsigned, values.length);
-    if (this.reserveBulk(values.length * maxVarintBytes(values))) {
-      this.pos = this.kernel.encodeUnsignedVarints(values, this.buf, this.pos);
+    if (this.reserveBulk(values.length * (maxBytes ?? maxVarintBytes(values)))) {
+      this.pos = this.bulkEnd(this.kernel.encodeUnsignedVarints(values, this.buf, this.pos));
     } else {
       // Streaming (fixed caller buffer): each element is range-checked and
       // split by the same single scratch round-trip the scalar writers use, and
@@ -576,10 +591,10 @@ export class OStream implements ByteSink {
   }
 
   /** Write an array of signed integers (each zig-zag + varint). */
-  writeSignedArray(id: number, values: ArrayLike<number | bigint>): void {
+  writeSignedArray(id: number, values: ArrayLike<number | bigint>, maxBytes?: number): void {
     this.arrayHead(id, WireType.ArraySigned, values.length);
-    if (this.reserveBulk(values.length * maxVarintBytes(values))) {
-      this.pos = this.kernel.encodeSignedVarints(values, this.buf, this.pos);
+    if (this.reserveBulk(values.length * (maxBytes ?? maxVarintBytes(values)))) {
+      this.pos = this.bulkEnd(this.kernel.encodeSignedVarints(values, this.buf, this.pos));
     } else {
       // See writeUnsignedArray: range-check and split in one round-trip, halves
       // out before the write, then zig-zag on the halves rather than in
@@ -1149,6 +1164,28 @@ export class OStream implements ByteSink {
    * buffer too narrow for the worst case never turns into a spurious
    * `BUFFER_FULL`.
    */
+  /**
+   * Commit the position a bulk kernel returned, refusing one that ran past the
+   * buffer.
+   *
+   * The reservation is what the kernel writes under, and it may be the caller's
+   * own `maxBytes` — so an element wider than the caller said is a caller mistake
+   * that lands HERE. It cannot corrupt memory (a write past a `Uint8Array`'s end
+   * is a no-op) but it silently truncates the message while `bytesUsed` reports
+   * the length that was never written, which §5.1 forbids: partial output must
+   * never be handed back as complete. One comparison per array turns that into a
+   * refusal, and is the reason `maxBytes` is safe to offer at all.
+   */
+  private bulkEnd(pos: number): number {
+    if (pos > this.buf.length) {
+      throw bufferFullError(
+        `output buffer full: an array element exceeded the stated width` +
+          ` (wrote ${pos} into ${this.buf.length} bytes)`,
+      );
+    }
+    return pos;
+  }
+
   private reserveBulk(n: number): boolean {
     if (this.buf.length - this.pos >= n) return true;
     if (this.flushSink === undefined) return false;
@@ -1185,7 +1222,16 @@ export class OStream implements ByteSink {
 }
 
 /**
- * The most varint bytes ONE element of `values` can take.
+ * The most varint bytes ONE element of `values` can take, when the caller did not
+ * say — the fallback behind `writeUnsignedArray`'s / `writeSignedArray`'s
+ * `maxBytes`, for a hand-written caller that has a typed array in hand and no
+ * schema to quote from.
+ *
+ * A caller that KNOWS should say so: a generator holds the declared element type,
+ * which bounds this far more tightly than any source type can. A `boolean` array
+ * is one byte an element and arrives here as a `number[]`, and a `bitfield` or an
+ * `enum` arrives as one too while being bounded by the width its declaration
+ * implies. None of that is inferable from the values.
  *
  * `VARINT_MAX_BYTES` (10) is the answer for a source whose elements could be any
  * 64-bit value, and for an exactly-sized caller buffer it is the wrong question:
