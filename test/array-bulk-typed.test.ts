@@ -462,3 +462,55 @@ describe("an fp32 array written from a Float32Array is bit-exact", () => {
     expect(new Uint32Array(viaValues.buffer)[0], "f32 quiets it").toBe(0x7fc00001);
   });
 });
+
+describe("two destinations are refused whichever pair they name", () => {
+  // "Exactly one destination" is the rule every other combination already
+  // enforces. The float and bool branches used to count only their own fields,
+  // so an integer destination beside a float one slipped through — and the
+  // realistic way in is the documented one: a target object reused across fields
+  // with a leftover from the previous array still set on it.
+  //
+  // What makes it worth a refusal rather than a shrug is that the leftover field
+  // SILENCES an error: `{ bool }` alone on an fp64 array is an `Argument`
+  // refusal, and `{ bool, f64 }` on the same array was not — the reader got an
+  // all-false array back with nothing to say it had never been filled.
+  const intWire = wire((os) => os.writeUnsignedArray(1, [1, 0, 1]));
+  const fpWire = wire((os) => os.writeFp64Array(1, [1.5, 2.5]));
+
+  function refuses(bytes: Uint8Array, target: unknown): void {
+    try {
+      decode(bytes, { arrayBulk: () => target as ArrayTarget } as Visitor);
+      expect.unreachable("a target with two destinations must be refused");
+    } catch (e) {
+      expect((e as { code: string }).code).toBe(SofabErrorCode.Argument);
+      // Each branch keeps its own wording — the float one names the destination
+      // that kind wants, which is more use than a generic sentence would be.
+      expect((e as Error).message).toMatch(/destination/);
+    }
+  }
+
+  it("refuses a bool destination beside a float one, on a float array", () => {
+    refuses(fpWire, { bool: new Uint8Array(2), f64: new Float64Array(2) });
+  });
+
+  it("refuses a bool destination beside a float one, on an integer array", () => {
+    refuses(intWire, { bool: new Uint8Array(3), f64: new Float64Array(3) });
+    refuses(intWire, { bool: new Uint8Array(3), f32: new Float32Array(3) });
+    refuses(intWire, { bool: new Uint8Array(3), bits: new Uint32Array(3) });
+  });
+
+  it("still refuses the pairs it always refused", () => {
+    refuses(intWire, { values: [], longs: [], ...U64 });
+    refuses(intWire, { bool: new Uint8Array(3), values: [], ...U64 });
+  });
+
+  it("still accepts each destination on its own", () => {
+    const bools = new Uint8Array(3);
+    decode(intWire, { arrayBulk: () => ({ bool: bools }) } as Visitor);
+    expect([...bools]).toEqual([1, 0, 1]);
+
+    const floats = new Float64Array(2);
+    decode(fpWire, { arrayBulk: () => ({ f64: floats }) } as Visitor);
+    expect([...floats]).toEqual([1.5, 2.5]);
+  });
+});

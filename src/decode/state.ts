@@ -1068,10 +1068,17 @@ export class DecoderState {
       // An fp32 array takes values *or* wire words; an fp64 array takes values,
       // its `Float64Array` already carrying every bit (a payload NaN included).
       const dest = is32 ? (f.f32 ?? f.bits) : f.f64;
+      // Every destination counts here, not only the float ones: a target
+      // carrying a leftover `bool` beside its `f64` would otherwise be accepted
+      // and the `bool` silently left empty — which also SUPPRESSES the refusal
+      // that same `bool` alone would have earned. "Exactly one" has to mean one
+      // out of all of them, or the check only holds for the fields it happens to
+      // look at.
       const named =
         (f.f32 !== undefined ? 1 : 0) +
         (f.bits !== undefined ? 1 : 0) +
-        (f.f64 !== undefined ? 1 : 0);
+        (f.f64 !== undefined ? 1 : 0) +
+        ((t as BoolArrayTarget).bool !== undefined ? 1 : 0);
       const want = is32 ? "f32 or bits" : "f64";
       if (dest === undefined || named !== 1) {
         throw argumentError(
@@ -1094,16 +1101,20 @@ export class DecoderState {
     const bt = t as BoolArrayTarget;
     if (bt.bool !== undefined) {
       const other = t as IntegerArrayTarget;
+      const float = t as FloatArrayTarget;
+      // The float fields are checked too — see the float branch above: a target
+      // with two destinations must be refused whichever pair it names.
       if (
         other.values !== undefined ||
         other.longs !== undefined ||
         other.typed !== undefined ||
         other.lo !== undefined ||
-        other.hi !== undefined
+        other.hi !== undefined ||
+        float.f32 !== undefined ||
+        float.bits !== undefined ||
+        float.f64 !== undefined
       ) {
-        throw argumentError(
-          `array ${this.id}: an integer array target needs exactly one destination`,
-        );
+        throw argumentError(`array ${this.id}: an array target needs exactly one destination`);
       }
       if (kind !== ArrayKind.Unsigned) {
         throw argumentError(`array ${this.id}: a bool destination needs an unsigned array`);
