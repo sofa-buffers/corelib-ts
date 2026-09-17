@@ -247,12 +247,27 @@ subtype and a declared length on `fixlenBegin`, a declared element count on
 `arrayBegin`.
 
 An array's **elements** arrive through `arrayBulk(id, kind, count)`, and only
-there: return the destination they should be written into — a `number[]`, a
-`Long[]`, a pair of `Uint32Array` halves, a `Float32Array` / `Float64Array`, or the
-raw `fp32` words — together with the schema's element bound as `min`/`max` 32-bit
-halves, and the decoder fills it directly. Return `null` (or declare no
-`arrayBulk`) and the elements are walked over without being decoded at all. There
-is no callback per element: one array is one call.
+there: return the destination they should be written into — a `number[]`, an
+exact-width typed array (`Uint16Array`, `Int32Array`, …), a `Long[]`, a pair of
+`Uint32Array` halves, a `Float32Array` / `Float64Array`, or the raw `fp32` words —
+together with the schema's element bound as `min`/`max` 32-bit halves, and the
+decoder fills it directly. Return `null` (or declare no `arrayBulk`) and the
+elements are walked over without being decoded at all. There is no callback per
+element: one array is one call.
+
+The **exact-width** destination (`typed`) is for a field whose declared width is a
+typed array's own — a `u16` array into a `Uint16Array`. It stores unboxed, it costs
+two bytes an element rather than a tagged slot, and it lets the *encoder* know the
+width too: `writeUnsignedArray` reads a `Uint16Array` element without the type and
+range guards a `number[]` element needs, and reserves three bytes an element rather
+than ten, which is what a caller-sized buffer has room for.
+
+The element bound is still compared, and that is not a formality: a typed array
+*masks* on store (`a[0] = 70000` in a `Uint16Array` is 4464), while an element
+outside the declared width is a malformed message. So the width is matched against
+the bound once, at the hand-off — a destination narrower than the bound is refused
+with `Argument`, never silently truncated — and the fill then compares exactly as
+`values` does.
 
 ```ts
 const big: number[] = [];
@@ -605,7 +620,7 @@ Who owns the bytes:
   calls so a one-shot caller does not pay it per message. A `bigint` for an integer
   past `2^53` is not an exception: it is a *value*, not storage, and the `lo` / `hi`
   halves beside it are there for a consumer that would rather not have one. A `Long`
-  written into a `longs` bulk destination is the same kind of thing — a value, placed
+  written into a `longs` or `typed` bulk destination is the same kind of thing — a value, placed
   in storage you supplied.
 - **The language-forced handles, itemised** (§6.6.2). JavaScript will not let a codec
   place or take an IEEE-754 value at a byte offset, or copy a *range* of bytes,

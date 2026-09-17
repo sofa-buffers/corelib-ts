@@ -557,7 +557,7 @@ export class OStream implements ByteSink {
   /** Write an array of unsigned integers (each a varint). */
   writeUnsignedArray(id: number, values: ArrayLike<number | bigint>): void {
     this.arrayHead(id, WireType.ArrayUnsigned, values.length);
-    if (this.reserveBulk(values.length * VARINT_MAX_BYTES)) {
+    if (this.reserveBulk(values.length * maxVarintBytes(values))) {
       this.pos = this.kernel.encodeUnsignedVarints(values, this.buf, this.pos);
     } else {
       // Streaming (fixed caller buffer): each element is range-checked and
@@ -578,7 +578,7 @@ export class OStream implements ByteSink {
   /** Write an array of signed integers (each zig-zag + varint). */
   writeSignedArray(id: number, values: ArrayLike<number | bigint>): void {
     this.arrayHead(id, WireType.ArraySigned, values.length);
-    if (this.reserveBulk(values.length * VARINT_MAX_BYTES)) {
+    if (this.reserveBulk(values.length * maxVarintBytes(values))) {
       this.pos = this.kernel.encodeSignedVarints(values, this.buf, this.pos);
     } else {
       // See writeUnsignedArray: range-check and split in one round-trip, halves
@@ -1181,5 +1181,34 @@ export class OStream implements ByteSink {
       if (room === 0) throw bufferFullError("output buffer full");
     }
     return Math.min(room, want);
+  }
+}
+
+/**
+ * The most varint bytes ONE element of `values` can take.
+ *
+ * `VARINT_MAX_BYTES` (10) is the answer for a source whose elements could be any
+ * 64-bit value, and for an exactly-sized caller buffer it is the wrong question:
+ * a bounded schema sizes that buffer from the element's TRUE maximum (3 bytes for
+ * a `u16`), so `count * 10` never fits and the bulk kernel is unreachable for
+ * precisely the arrays it would pay on. An exact-width source settles it —
+ * `Uint16Array` elements are 0..65535, three varint bytes at most — so the
+ * reservation can be the real one and the bulk path becomes reachable.
+ *
+ * Zig-zag does not widen it: `i16`'s -32768 maps to 65535, the same three bytes.
+ */
+function maxVarintBytes(values: ArrayLike<unknown>): number {
+  switch ((values as object).constructor) {
+    case Uint8Array:
+    case Int8Array:
+      return 2;
+    case Uint16Array:
+    case Int16Array:
+      return 3;
+    case Uint32Array:
+    case Int32Array:
+      return 5;
+    default:
+      return VARINT_MAX_BYTES;
   }
 }

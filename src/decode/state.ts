@@ -69,6 +69,28 @@ const enum S {
 
 const TWO32 = 0x1_0000_0000; // 2^32, for combining the 32-bit halves
 
+type TypedIntCtor =
+  | Uint8ArrayConstructor
+  | Uint16ArrayConstructor
+  | Uint32ArrayConstructor
+  | Int8ArrayConstructor
+  | Int16ArrayConstructor
+  | Int32ArrayConstructor;
+
+/**
+ * What each exact-width destination can hold, so {@link IntegerArrayTarget.typed}
+ * is checked against the stated bound ONCE per array rather than per element.
+ * Keyed by constructor: the check is a map lookup, not a chain of `instanceof`.
+ */
+const TYPED_CAPACITY = new Map<TypedIntCtor, { min: number; max: number }>([
+  [Uint8Array, { min: 0, max: 0xff }],
+  [Uint16Array, { min: 0, max: 0xffff }],
+  [Uint32Array, { min: 0, max: 0xffffffff }],
+  [Int8Array, { min: -0x80, max: 0x7f }],
+  [Int16Array, { min: -0x8000, max: 0x7fff }],
+  [Int32Array, { min: -0x80000000, max: 0x7fffffff }],
+]);
+
 /**
  * Which destination an accepted {@link ArrayTarget} named — resolved once, at the
  * hand-off, so the drains switch on a small integer instead of re-deciding per
@@ -85,6 +107,14 @@ const enum BM {
    * 209 434 -> 181 866 Ir/op over 1000 elements).
    */
   Values32,
+  /**
+   * {@link IntegerArrayTarget.typed} — an exact-width typed array. The bound is
+   * compared exactly as in {@link Values32} (§7.1 forbids masking, and a typed
+   * store masks), so this arm buys the STORE and not the verdict: unboxed, and
+   * with none of the element-kind transitions a `number[]` takes when a value
+   * leaves the small-integer range.
+   */
+  Typed,
   /** {@link IntegerArrayTarget.longs} — a {@link Long} per element, no `bigint`. */
   Longs,
   /** {@link IntegerArrayTarget.lo} / `hi` — raw halves, nothing allocated. */
@@ -1033,11 +1063,14 @@ export class DecoderState {
     const it = t as IntegerArrayTarget;
     const halves = it.lo !== undefined || it.hi !== undefined;
     const named =
-      (it.values !== undefined ? 1 : 0) + (it.longs !== undefined ? 1 : 0) + (halves ? 1 : 0);
+      (it.values !== undefined ? 1 : 0) +
+      (it.longs !== undefined ? 1 : 0) +
+      (it.typed !== undefined ? 1 : 0) +
+      (halves ? 1 : 0);
     if (named !== 1) {
       throw argumentError(
         `array ${this.id}: an integer array target needs exactly one destination` +
-          ` (values, longs, or lo+hi), got ${named}`,
+          ` (values, typed, longs, or lo+hi), got ${named}`,
       );
     }
     // The bound governs every element about to be written, so a bound that is not
@@ -1066,6 +1099,33 @@ export class DecoderState {
         `array ${this.id}: the element bound is empty` +
           ` (min ${it.minHi}:${it.minLo} > max ${it.maxHi}:${it.maxLo})`,
       );
+    }
+    if (it.typed !== undefined) {
+      const d = it.typed;
+      if (d.length < count) {
+        throw argumentError(
+          `array ${this.id}: typed destination holds ${d.length} of ${count} elements`,
+        );
+      }
+      // A destination NARROWER than the bound could not represent every legal
+      // element, and a typed store would MASK it rather than refuse it — which is
+      // the one thing §7.1 forbids. So the width is settled once, here, against
+      // the bound the caller stated; the fill loop then needs no guard of its own
+      // beyond that same bound.
+      const cap = TYPED_CAPACITY.get(d.constructor as TypedIntCtor);
+      const signed = kind === ArrayKind.Signed;
+      const minV = signed ? (it.minHi | 0) * TWO32 + it.minLo : it.minHi * TWO32 + it.minLo;
+      const maxV = signed ? (it.maxHi | 0) * TWO32 + it.maxLo : it.maxHi * TWO32 + it.maxLo;
+      if (cap === undefined) {
+        throw argumentError(`array ${this.id}: unsupported typed destination`);
+      }
+      if (minV < cap.min || maxV > cap.max) {
+        throw argumentError(
+          `array ${this.id}: the element bound ${minV}..${maxV} does not fit the` +
+            ` typed destination (${cap.min}..${cap.max})`,
+        );
+      }
+      return BM.Typed;
     }
     if (halves) {
       const lo = it.lo;
@@ -1158,6 +1218,18 @@ export class DecoderState {
             const lo = this.vLo >>> 0;
             // A high half of its own puts the element past every 32-bit bound, so
             // one test covers "too large to be this type" and "outside the bound".
+            if (this.vHi !== 0 || lo < minLo || lo > maxLo) this.outOfBound(idx);
+            out[idx++] = lo;
+          }
+        } else if (mode === BM.Typed) {
+          // The same two comparisons Values32 makes — the bound is the message's
+          // verdict and a typed store would mask it away (§7.1) — over a
+          // destination whose width `resolveTarget` has already matched to that
+          // bound, so the store itself needs no guard.
+          const out = t.typed!;
+          while (idx < count && i <= safeEnd) {
+            i = this.varintFull(input, i);
+            const lo = this.vLo >>> 0;
             if (this.vHi !== 0 || lo < minLo || lo > maxLo) this.outOfBound(idx);
             out[idx++] = lo;
           }
@@ -1268,7 +1340,9 @@ export class DecoderState {
           ) {
             this.outOfBound(idx);
           }
-          if (mode === BM.Values || mode === BM.Values32) {
+          if (mode === BM.Typed) {
+            t.typed![idx] = lo | 0;
+          } else if (mode === BM.Values || mode === BM.Values32) {
             // vSigned() inlined: the halves are in hand and this runs per element.
             let v: number | bigint;
             if (rawHi <= 0x1fffff) {
@@ -1403,6 +1477,8 @@ export class DecoderState {
     }
     if (this.bulkMode === BM.Values || this.bulkMode === BM.Values32) {
       t.values![idx] = this.vUnsigned();
+    } else if (this.bulkMode === BM.Typed) {
+      t.typed![idx] = lo;
     } else if (this.bulkMode === BM.Longs) {
       t.longs![idx] = new Long(lo, hi);
     } else {
@@ -1428,7 +1504,7 @@ export class DecoderState {
     }
     if (this.bulkMode === BM.Values || this.bulkMode === BM.Values32) {
       t.values![idx] = this.vSigned();
-    }
+    } else if (this.bulkMode === BM.Typed) t.typed![idx] = lo | 0;
     else if (this.bulkMode === BM.Longs) t.longs![idx] = new Long(lo, hi);
     else {
       t.lo![idx] = lo;
