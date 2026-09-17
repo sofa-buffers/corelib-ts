@@ -642,14 +642,25 @@ Who owns the bytes:
   | `DataView` over the **output buffer** | `Kernel`, bulk `fp32` / `fp64` arrays | one per bulk call, and only from 64 `fp32` / 16 `fp64` elements up |
   | `DataView` over the **fed chunk** | `IStream`, bulk float array reads | one per chunk, on the first run in it that clears the same thresholds |
   | `subarray` of the caller's payload | `OStream.writeRaw`, as `set`'s source | one per copied piece, only when the payload does not fit the buffer |
+  | `Uint32Array` over a **64-bit destination** | `IStream`, an array handed a `BigUint64Array` / `BigInt64Array` | one per array |
+  | `Uint32Array` over a **64-bit source** | `Kernel`, `writeUnsignedArray` / `writeSignedArray` from one | one per bulk call |
+  | `Uint32Array` + `DataView` over an **`fp32` source** and the output | `Kernel`, `writeFp32Array` from a `Float32Array` | one pair per bulk call, at **every** length |
 
   Each addresses storage **you** supplied, each is sized by that storage and never by
-  a number from the wire, and none of them leaves the codec. A **scalar** float, a
-  float array below the element threshold, and a float array fed in chunks too small
-  to hold a long run all build no handle at all: they go through a shared 8-byte
-  scratch word, which is fixed state. `heap-free-codec.test.ts` asserts these counts
-  exactly, including the short runs that allocate nothing and the element one under
-  the threshold. The thresholds and what they were derived from are on
+  a number from the wire, and none of them leaves the codec. The three `Uint32Array`
+  rows are what a 64-bit element costs instead of a `bigint`: its halves are already
+  in hand, and a view over the caller's own array is how they are written without
+  building one.
+
+  A **scalar** float, a float array below the element threshold, and a float array fed
+  in chunks too small to hold a long run all build no handle at all: they go through a
+  shared 8-byte scratch word, which is fixed state. The one exception is the last row
+  — an `fp32` array whose source *is* a `Float32Array` already holds the wire words,
+  and copying them is what keeps a signaling NaN intact (§4.6/§6.5), so that pair is
+  built at any length rather than past a threshold. `heap-free-codec.test.ts` asserts
+  every count in this table exactly, including the short runs that allocate nothing,
+  the element one under the threshold, and the two-element `Float32Array` that builds
+  the pair anyway. The thresholds and what they were derived from are on
   `FP32_HANDLE_MIN` / `FP64_HANDLE_MIN` in the API documentation.
 - **The bulk array hand-off borrows your destination until `arrayEnd`.**
   `Visitor.arrayBulk` hands the decoder the array, `Long[]` or typed array it should

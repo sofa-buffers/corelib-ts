@@ -44,7 +44,7 @@ import {
 import type { FeedStatus } from "../constants.js";
 import { SofabError, SofabErrorCode, argumentError, invalidMsgError } from "../errors.js";
 import { Long } from "../long.js";
-import { joinI64, joinU64 } from "../varint/bits64.js";
+import { HI, LO, joinI64, joinU64 } from "../varint/bits64.js";
 import { fp32FromBits, fp64FromBits } from "../varint/num64.js";
 import { SKIP } from "./skip.js";
 import type {
@@ -69,15 +69,6 @@ const enum S {
 }
 
 const TWO32 = 0x1_0000_0000; // 2^32, for combining the 32-bit halves
-
-/**
- * Whether this machine stores a 64-bit typed array's low half first. The halves
- * of a `BigUint64Array` element are two 32-bit words in memory, and which one
- * comes first is the platform's business — so it is asked once, here, and the
- * fill and drain loops index accordingly instead of building a `bigint` to stay
- * portable.
- */
-const LE = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
 
 type TypedIntCtor =
   | Uint8ArrayConstructor
@@ -1326,8 +1317,10 @@ export class DecoderState {
             ) {
               this.outOfBound(idx);
             }
-            out[LE ? idx * 2 : idx * 2 + 1] = lo;
-            out[LE ? idx * 2 + 1 : idx * 2] = hi;
+            // `LO`/`HI` are the host's half order, probed once in `bits64` — the
+            // same question this indexing asks, already answered there.
+            out[idx * 2 + LO] = lo;
+            out[idx * 2 + HI] = hi;
             idx++;
           }
         } else if (mode === BM.Bool) {
@@ -1449,8 +1442,8 @@ export class DecoderState {
             (t.typed as Int32Array)[idx] = lo | 0;
           } else if (mode === BM.Typed64) {
             const o = this.bulk64!;
-            o[LE ? idx * 2 : idx * 2 + 1] = lo;
-            o[LE ? idx * 2 + 1 : idx * 2] = hi;
+            o[idx * 2 + LO] = lo;
+            o[idx * 2 + HI] = hi;
           } else if (mode === BM.Values || mode === BM.Values32) {
             // vSigned() inlined: the halves are in hand and this runs per element.
             let v: number | bigint;
@@ -1590,8 +1583,8 @@ export class DecoderState {
       (t.typed as Uint32Array)[idx] = lo;
     } else if (this.bulkMode === BM.Typed64) {
       const o = this.bulk64!;
-      o[LE ? idx * 2 : idx * 2 + 1] = lo;
-      o[LE ? idx * 2 + 1 : idx * 2] = hi;
+      o[idx * 2 + LO] = lo;
+      o[idx * 2 + HI] = hi;
     } else if (this.bulkMode === BM.Bool) {
       (this.bulk as BoolArrayTarget).bool[idx] = lo !== 0 || hi !== 0 ? 1 : 0;
     } else if (this.bulkMode === BM.Longs) {
@@ -1622,8 +1615,8 @@ export class DecoderState {
     } else if (this.bulkMode === BM.Typed) (t.typed as Int32Array)[idx] = lo | 0;
     else if (this.bulkMode === BM.Typed64) {
       const o = this.bulk64!;
-      o[LE ? idx * 2 : idx * 2 + 1] = lo;
-      o[LE ? idx * 2 + 1 : idx * 2] = hi;
+      o[idx * 2 + LO] = lo;
+      o[idx * 2 + HI] = hi;
     } else if (this.bulkMode === BM.Longs) t.longs![idx] = new Long(lo, hi);
     else {
       t.lo![idx] = lo;

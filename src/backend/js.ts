@@ -11,9 +11,6 @@ import { argumentError } from "../errors.js";
 import { FP32_HANDLE_MIN, FP64_HANDLE_MIN } from "../constants.js";
 import { HI, LO, S_U32, splitI64, splitU64 } from "../varint/bits64.js";
 import { encodeVarintLoHi, encodeVarintNum } from "../varint/leb128.js";
-
-/** Whether a 64-bit typed array stores its low half first; see `state.ts`. */
-const LE = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
 import { packFp32, packFp64, toBigInt } from "../varint/num64.js";
 import { encodeZigzagVarintLoHi } from "../varint/zigzag.js";
 import type { Kernel } from "./kernel.js";
@@ -49,7 +46,7 @@ export const jsKernel: Kernel = {
       const a = values as unknown as BigUint64Array;
       const h = new Uint32Array(a.buffer, a.byteOffset, a.length * 2);
       for (let i = 0; i < n; i++) {
-        pos = encodeVarintLoHi(h[LE ? i * 2 : i * 2 + 1]!, h[LE ? i * 2 + 1 : i * 2]!, out, pos);
+        pos = encodeVarintLoHi(h[i * 2 + LO]!, h[i * 2 + HI]!, out, pos);
       }
       return pos;
     }
@@ -126,12 +123,7 @@ export const jsKernel: Kernel = {
       const a = values as unknown as BigInt64Array;
       const h = new Uint32Array(a.buffer, a.byteOffset, a.length * 2);
       for (let i = 0; i < a.length; i++) {
-        pos = encodeZigzagVarintLoHi(
-          h[LE ? i * 2 : i * 2 + 1]!,
-          h[LE ? i * 2 + 1 : i * 2]!,
-          out,
-          pos,
-        );
+        pos = encodeZigzagVarintLoHi(h[i * 2 + LO]!, h[i * 2 + HI]!, out, pos);
       }
       return pos;
     }

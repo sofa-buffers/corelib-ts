@@ -49,6 +49,8 @@ const F64_ARRAY = [1, 2];
 // builds one on either side (FP32_HANDLE_MIN / FP64_HANDLE_MIN).
 const F32_BULK = Array.from({ length: FP32_HANDLE_MIN }, (_, i) => i + 0.5);
 const F64_BULK = Array.from({ length: FP64_HANDLE_MIN }, (_, i) => i + 0.25);
+/** A 64-bit array whose elements do not fit a `number`, so nothing can cheat. */
+const U64_ELEMS = [0n, 1n, 0x9e3779b97f4a7c15n, 2n ** 64n - 1n];
 
 /** A message with every wire type, including payloads longer than a small buffer. */
 function message(os: OStream): void {
@@ -111,7 +113,12 @@ function foldingVisitor(): Visitor & { acc: number } {
 }
 
 /** What a run allocated, by kind. An absent kind never happened. */
-type Tally = Partial<Record<"DataView" | "subarray" | "slice" | "Uint8Array" | "Array" | "text", number>>;
+type Tally = Partial<
+  Record<
+    "DataView" | "subarray" | "slice" | "Uint8Array" | "Uint32Array" | "Array" | "text",
+    number
+  >
+>;
 
 /**
  * Tally every allocation primitive a codec path could reach, while `body` runs.
@@ -130,6 +137,9 @@ function allocationsDuring(body: () => void): Tally {
   const savedU8 = globalThis.Uint8Array;
   const savedArray = globalThis.Array;
   const savedDataView = globalThis.DataView;
+  // Watched because the 64-bit and `fp32`-word paths build one over storage the
+  // CALLER supplied — §6.6.2's language-forced handle, and so itemised like the rest.
+  const savedU32 = globalThis.Uint32Array;
   const subarray = Uint8Array.prototype.subarray;
   const slice = Uint8Array.prototype.slice;
   const decodeText = TextDecoder.prototype.decode;
@@ -155,6 +165,7 @@ function allocationsDuring(body: () => void): Tally {
   (globalThis as { Uint8Array: unknown }).Uint8Array = ctor(savedU8, "Uint8Array");
   (globalThis as { Array: unknown }).Array = ctor(savedArray, "Array");
   (globalThis as { DataView: unknown }).DataView = ctor(savedDataView, "DataView");
+  (globalThis as { Uint32Array: unknown }).Uint32Array = ctor(savedU32, "Uint32Array");
   try {
     body();
   } finally {
@@ -165,6 +176,7 @@ function allocationsDuring(body: () => void): Tally {
     (globalThis as { Uint8Array: unknown }).Uint8Array = savedU8;
     (globalThis as { Array: unknown }).Array = savedArray;
     (globalThis as { DataView: unknown }).DataView = savedDataView;
+    (globalThis as { Uint32Array: unknown }).Uint32Array = savedU32;
   }
   return tally;
 }
@@ -258,6 +270,37 @@ describe("read: the itemised handles, and nothing else (§6.6.2 / §6.6.4)", () 
     // Two orders of magnitude of headroom against "per byte": the message is 40x the
     // buffer, and the whole point is that the count tracks pieces.
     expect(allocs.subarray).toBeLessThan(WIRE.length / 4);
+  });
+
+  it("an encode from a 64-bit typed source: one view, and no bigint", () => {
+    // The mirror of the decode case: the halves are read back through a
+    // `Uint32Array` over the source's own buffer rather than indexed out of it,
+    // which would materialise a `bigint` per element.
+    const src = BigUint64Array.from(U64_ELEMS);
+    // Built outside the measurement: constructing a stream is the one allocating
+    // step there is (§6.6), and this is about what a *write* costs.
+    const os = new OStream(new Uint8Array(256));
+    expect(allocationsDuring(() => void os.writeUnsignedArray(1, src))).toStrictEqual({
+      Uint32Array: 1,
+    });
+  });
+
+  it("an encode of an fp32 array from a Float32Array: a pair, at ANY length", () => {
+    // This one does not follow FP32_HANDLE_MIN, and the reason is correctness
+    // rather than arithmetic: a `Float32Array` already HOLDS the wire words, and
+    // reading its elements as numbers would quiet a signaling NaN (§4.6/§6.5). So
+    // the words are copied, which needs the pair — for two elements as much as for
+    // two hundred. The `number[]` source below is the contrast: no handle at all.
+    const short = new Float32Array([1.5, 2.5]);
+    const typedStream = new OStream(new Uint8Array(256));
+    const plainStream = new OStream(new Uint8Array(256));
+    expect(allocationsDuring(() => void typedStream.writeFp32Array(1, short))).toStrictEqual({
+      Uint32Array: 1,
+      DataView: 1,
+    });
+    expect(allocationsDuring(() => void plainStream.writeFp32Array(1, [1.5, 2.5]))).toStrictEqual(
+      {},
+    );
   });
 
   it("an encode with no float at all allocates nothing", () => {
@@ -367,6 +410,52 @@ describe("read: the itemised handles, and nothing else (§6.6.2 / §6.6.4)", () 
     const is = new IStream({ arrayBulk: () => ({ f64 }) });
     expect(allocationsDuring(() => void is.feed(bulk))).toStrictEqual({});
     expect([...f64]).toEqual(short);
+  });
+
+  it("a 64-bit typed destination: one view over the caller's own array", () => {
+    // A `BigUint64Array` element cannot be stored without a `bigint` — `b[i] = 5`
+    // throws — so the fill writes the halves it already holds through a
+    // `Uint32Array` over that array's own buffer. One per array, over storage the
+    // caller supplied, sized by it and never by the wire: §6.6.2's shape exactly.
+    const wire = (() => {
+      const os = growingOStream();
+      os.writeUnsignedArray(1, U64_ELEMS);
+      return os.bytes().slice();
+    })();
+    const dest = new BigUint64Array(U64_ELEMS.length);
+    const is = new IStream({
+      arrayBulk: () => ({
+        typed: dest,
+        minLo: 0,
+        minHi: 0,
+        maxLo: 0xffffffff,
+        maxHi: 0xffffffff,
+      }),
+    });
+    expect(allocationsDuring(() => void is.feed(wire))).toStrictEqual({ Uint32Array: 1 });
+    expect([...dest]).toEqual(U64_ELEMS);
+  });
+
+  it("the other typed destinations build nothing at all", () => {
+    // Every width below 64 bits is stored directly, so no view is needed for it —
+    // and the `bool` destination is a plain byte store.
+    const wire = (() => {
+      const os = growingOStream();
+      os.writeUnsignedArray(1, [1, 2, 3, 4]);
+      os.writeUnsignedArray(2, [0, 1, 255]);
+      return os.bytes().slice();
+    })();
+    const u16 = new Uint16Array(4);
+    const bools = new Uint8Array(3);
+    const is = new IStream({
+      arrayBulk: (id) =>
+        id === 1
+          ? { typed: u16, minLo: 0, minHi: 0, maxLo: 0xffff, maxHi: 0 }
+          : { bool: bools },
+    });
+    expect(allocationsDuring(() => void is.feed(wire))).toStrictEqual({});
+    expect([...u16]).toEqual([1, 2, 3, 4]);
+    expect([...bools]).toEqual([0, 1, 1]);
   });
 
   it("a chunked decode allocates nothing at all", () => {
