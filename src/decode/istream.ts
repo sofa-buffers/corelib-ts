@@ -183,6 +183,28 @@ export interface IntegerArrayTarget {
    * Both must be set and both must hold at least `count` elements. The fastest
    * shape there is — nothing is allocated per element, not even a `Long`.
    */
+  /**
+   * Exact-width destination: one typed array whose element width IS the schema's
+   * declared width — a `Uint16Array` for a `u16` array, an `Int8Array` for an
+   * `i8` one. Must hold at least `count` elements.
+   *
+   * **The bound is still compared, and that is not negotiable.** A typed array
+   * *masks* on store (`a[0] = 70000` in a `Uint16Array` is 4464), and
+   * MESSAGE_SPEC §7.1 makes an element outside the declared width INVALID —
+   * neither masked to the width nor kept. So this destination buys the storage,
+   * never the verdict: the fill loop compares exactly as {@link values} does and
+   * refuses the same elements.
+   *
+   * What it does buy is the store (unboxed, and no element-kind transition the
+   * way a `number[]` takes when a value leaves the small-integer range), the
+   * memory (2 bytes for a `u16`, against a tagged slot), and the *encoder's*
+   * side, where the width is then statically known.
+   *
+   * The bound must fit the array's own width: a destination narrower than the
+   * interval could not represent every legal element, and is refused with
+   * {@link SofabErrorCode.Argument} rather than silently masking.
+   */
+  typed?: Uint8Array | Uint16Array | Uint32Array | Int8Array | Int16Array | Int32Array;
   lo?: Uint32Array;
   /** The high halves; see {@link lo}. */
   hi?: Uint32Array;

@@ -28,6 +28,28 @@ export const jsKernel: Kernel = {
 
   encodeUnsignedVarints(values, out, pos) {
     const n = values.length;
+    // An EXACT-WIDTH source settles every per-element guard statically: a
+    // `Uint16Array` holds nothing but an integer in 0..65535, so the `typeof`,
+    // the sign, the safe-integer bound and the `Number.isInteger` below are all
+    // true for every element and belong outside the loop rather than in it. The
+    // element load is unboxed too, and the array never changes element kind the
+    // way a `number[]` does when a value leaves the small-integer range.
+    //
+    // Three identity compares, once per array. `u64` is deliberately absent:
+    // a `BigUint64Array` element is a `bigint` and would still need the split.
+    const ctor = (values as object).constructor;
+    if (ctor === Uint8Array || ctor === Uint16Array || ctor === Uint32Array) {
+      const a = values as unknown as Uint32Array;
+      for (let i = 0; i < n; i++) {
+        let v = a[i]!;
+        while (v > 0x7f) {
+          out[pos++] = (v & 0x7f) | 0x80;
+          v >>>= 7;
+        }
+        out[pos++] = v;
+      }
+      return pos;
+    }
     for (let i = 0; i < n; i++) {
       const v = values[i]!;
       // Number elements (u8..u32 and any small u64) skip bigint entirely.
@@ -81,6 +103,24 @@ export const jsKernel: Kernel = {
   },
 
   encodeSignedVarints(values, out, pos) {
+    // The signed twin of the exact-width arm above. Zig-zag on an `Int32Array`
+    // element cannot leave 32 bits — `-2^31` maps to `2^32-1` — so the whole
+    // 64-bit split and its domain check are unreachable for this source.
+    const ctorS = (values as object).constructor;
+    if (ctorS === Int8Array || ctorS === Int16Array || ctorS === Int32Array) {
+      const a = values as unknown as Int32Array;
+      const n = a.length;
+      for (let i = 0; i < n; i++) {
+        const x = a[i]!;
+        let z = ((x << 1) ^ (x >> 31)) >>> 0;
+        while (z > 0x7f) {
+          out[pos++] = (z & 0x7f) | 0x80;
+          z >>>= 7;
+        }
+        out[pos++] = z;
+      }
+      return pos;
+    }
     for (let i = 0; i < values.length; i++) {
       const v = values[i]!;
       if (typeof v === "number" && v >= -SIGNED_FAST_MAX && v <= SIGNED_FAST_MAX && Number.isInteger(v)) {
