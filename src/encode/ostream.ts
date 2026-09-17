@@ -1209,6 +1209,8 @@ function maxVarintBytes(values: ArrayLike<unknown>): number {
     case Int32Array:
       return 5;
     default:
+      // BigUint64Array / BigInt64Array land here too, and ten is their real
+      // answer: a 64-bit element can need every byte.
       return VARINT_MAX_BYTES;
   }
 }
