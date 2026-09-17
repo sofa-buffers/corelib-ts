@@ -1,4 +1,7 @@
-node_modules/
+# No trailing slash: with one, this matches a *directory* only, and a `node_modules`
+# SYMLINK — which is what a git worktree sharing an install ends up with — is a
+# file to git and slips past. One did, and was committed.
+node_modules
 dist/
 docs/
 coverage/
