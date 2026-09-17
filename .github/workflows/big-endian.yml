@@ -1,0 +1,96 @@
+# Two constants decide how every 64-bit value is read and written -- `LO` and
+# `HI` in `src/varint/bits64.ts`, the index of each 32-bit half in host byte
+# order. They are probed once at load, and on every machine this project has
+# ever run on they come back 0 and 1. The other answer, 1 and 0, is what a
+# big-endian host gives, and nothing in CI produces it: a port that had the two
+# swapped would be green on every runner and return garbage on s390x.
+#
+# So the suite runs once a night on an emulated big-endian machine. Not per PR:
+# emulation is ~20x slower, and the code this covers changes rarely.
+name: Big-endian
+
+on:
+  # A PR that touches byte-order-sensitive code -- or this job -- gets it too,
+  # because that is when the answer is actually in question.
+  pull_request:
+    paths:
+      - 'src/varint/bits64.ts'
+      - 'src/varint/num64.ts'
+      - 'src/long.ts'
+      - 'src/decode/state.ts'
+      - 'src/backend/js.ts'
+      - '.github/workflows/big-endian.yml'
+  schedule:
+    - cron: '35 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  s390x:
+    name: Full suite on s390x (emulated)
+    runs-on: ubuntu-latest
+    # Measured locally under qemu-user: the suite takes ~20x its native time, so
+    # roughly 10-15 minutes, and `npm ci` inside the emulated container adds a
+    # few more. Forty leaves room for a slow runner without letting a wedged job
+    # hold an Actions slot for six hours.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      # Registers binfmt_misc so an s390x binary -- including every child process
+      # the test runner spawns -- is transparently handed to QEMU.
+      - name: Install QEMU for s390x
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: s390x
+
+      # Pulled in its own step, with bounded retries: a registry hiccup should
+      # look like a registry hiccup, not like a test failure.
+      - name: Pull the s390x Node image
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            docker pull --platform linux/s390x node:24 && exit 0
+            echo "pull failed (attempt $attempt), retrying in 10s"
+            sleep 10
+          done
+          echo "::error::could not pull the s390x image"
+          exit 1
+
+      # The guard that makes the rest of this job mean something. If binfmt
+      # registration silently failed, the container would run as amd64 and every
+      # test below would pass while proving nothing at all.
+      - name: Prove the machine really is big-endian
+        run: |
+          set -euo pipefail
+          got=$(docker run --rm --platform linux/s390x node:24 \
+            node -e 'process.stdout.write(process.arch + " " + require("os").endianness())')
+          echo "reported: $got"
+          [ "$got" = "s390x BE" ] || {
+            echo "::error::expected 's390x BE', got '$got' -- the emulation did not take"
+            exit 1
+          }
+
+      - name: Full suite
+        run: |
+          set -euo pipefail
+          # Two flags, both about the emulation rather than about the code:
+          #
+          # `--pool=threads` -- the default pool forks a worker per file, and
+          # every fork is a fresh emulated process. Threads keep the whole run
+          # inside one, which is most of the difference between 15 minutes and 40.
+          #
+          # `--testTimeout` -- vitest's default is 5s, and a ~20x slower machine
+          # puts the chunk-size sweeps well past it: `long-scalar.test.ts` takes
+          # 32s there and `small-buffer-encode.test.ts` 10s. Both pass; they were
+          # simply being timed out. A generous limit keeps this job reporting on
+          # byte order and nothing else.
+          docker run --rm --platform linux/s390x \
+            -v "$PWD":/work -w /work node:24 \
+            sh -c 'npm ci --no-audit --no-fund && npx vitest run --pool=threads --testTimeout=120000'
