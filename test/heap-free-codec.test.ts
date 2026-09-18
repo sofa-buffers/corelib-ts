@@ -303,6 +303,20 @@ describe("read: the itemised handles, and nothing else (§6.6.2 / §6.6.4)", () 
     );
   });
 
+  it("a streamed fp32 array from a Float32Array: one word view per call, never per piece", () => {
+    // The element-at-a-time route copies words too (corelib-ts#185), so it takes
+    // the same `Uint32Array` as the bulk kernel — once, however many drains the
+    // array needs. A 4-byte buffer forces one drain per element here, and no
+    // `DataView` appears: the words are stored with shifts, not through a handle.
+    let flushes = 0;
+    const os = new OStream(new Uint8Array(4), 0, () => void flushes++);
+    const f = new Float32Array(3 * FP32_HANDLE_MIN);
+    expect(allocationsDuring(() => void os.writeFp32Array(1, f))).toStrictEqual({
+      Uint32Array: 1,
+    });
+    expect(flushes).toBeGreaterThanOrEqual(f.length);
+  });
+
   it("an encode with no float at all allocates nothing", () => {
     // The control that keeps the itemisation honest: the handles are forced by
     // *operations*, not held as a matter of course, so a message without floats and

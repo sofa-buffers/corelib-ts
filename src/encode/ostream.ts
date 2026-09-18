@@ -695,6 +695,15 @@ export class OStream implements ByteSink {
 
   /** Write an array of IEEE-754 32-bit floats. */
   writeFp32Array(id: number, values: ArrayLike<number>): void {
+    // A Float32Array holds the wire words already, and reading them as numbers
+    // would quiet a signaling NaN (§6.5), so it takes a route that copies words
+    // on every path, streamed included (corelib-ts#185). Split off here, at the
+    // entry, rather than as a branch beside the number loop below: the branch
+    // alone cost that loop 20% (Callgrind, 1000 elements through a 64-byte sink).
+    if (values instanceof Float32Array) {
+      this.writeFp32Words(id, values);
+      return;
+    }
     this.arrayHead(id, WireType.ArrayFixlen, values.length);
     // A fixlen array always carries its fixlen_word — even when empty (§4.8) —
     // so an empty fp32 array stays distinct from an empty fp64 one. The payload
@@ -999,6 +1008,50 @@ export class OStream implements ByteSink {
     this.putByte((bits >>> 8) & 0xff);
     this.putByte((bits >>> 16) & 0xff);
     this.putByte(bits >>> 24);
+  }
+
+  /**
+   * {@link writeFp32Array} for a `Float32Array` source: its own 32-bit words go
+   * out, never a `number`, which is what keeps a signaling NaN intact (§6.5) —
+   * on the bulk path (the kernel copies words too) and on the streamed one alike,
+   * so a small buffer produces the one-shot bytes (§5.1.4).
+   *
+   * Streamed, one `Uint32Array` over the source per call, the same handle the
+   * bulk kernel takes (§6.6.2); reading it gives each word's value whatever the
+   * host byte order, and the shifts below store it little-endian. The words go
+   * out one run per stretch of free buffer, with `buf`/`pos` in locals, and the
+   * split points are {@link putFp32}'s: drain when fewer than 4 bytes are free,
+   * split an element byte by byte only when the buffer itself is narrower than 4.
+   */
+  private writeFp32Words(id: number, values: Float32Array): void {
+    this.arrayHead(id, WireType.ArrayFixlen, values.length);
+    this.putVarintNum(4 * 8 + FixlenSubtype.Fp32);
+    if (this.reserveBulk(values.length * 4)) {
+      this.pos = this.kernel.packFp32Array(values, this.buf, this.pos);
+      return;
+    }
+    const w = new Uint32Array(values.buffer, values.byteOffset, values.length);
+    const n = w.length;
+    let i = 0;
+    while (i < n) {
+      if (this.buf.length - this.pos < 4 && !this.tryEnsure(4)) {
+        this.putFp32Bits(w[i++]!);
+        continue;
+      }
+      // Re-read after the drain: a sink may have installed another buffer (§5.1.5).
+      const buf = this.buf;
+      let p = this.pos;
+      const end = Math.min(n, i + ((buf.length - p) >> 2));
+      for (; i < end; i++) {
+        const b = w[i]!;
+        buf[p] = b & 0xff;
+        buf[p + 1] = (b >>> 8) & 0xff;
+        buf[p + 2] = (b >>> 16) & 0xff;
+        buf[p + 3] = b >>> 24;
+        p += 4;
+      }
+      this.pos = p;
+    }
   }
 
   /** Write the 8 little-endian bytes of an fp64 (§4.6) — see {@link putFp32}. */

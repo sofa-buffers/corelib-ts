@@ -68,6 +68,14 @@ const CASES: Array<[string, (os: OStream) => void]> = [
   ["a signed Long array", (os) =>
     os.writeSignedArrayLong(8, [-1n, 2n ** 62n, -(2n ** 63n)].map(Long.fromValue))],
   ["an fp32 array", (os) => os.writeFp32Array(9, [1.5, -2.5, 3.5])],
+  // A Float32Array source whose words a `number` cannot carry: widening the
+  // signaling NaNs to a double quiets them, so this case only passes if the
+  // element-at-a-time route copies words, as the bulk one does (corelib-ts#185).
+  ["an fp32 array of raw words", (os) => {
+    const f = new Float32Array(5);
+    new Uint32Array(f.buffer).set([0x7f800001, 0x3f800000, 0xffa00001, 0x7fc00001, 0x00000000]);
+    os.writeFp32Array(9, f);
+  }],
   ["an fp64 array", (os) => os.writeFp64Array(10, [1.5, -2.5, 3.5])],
   ["a raw fp32 array", (os) => os.writeFp32ArrayRaw(11, new Uint8Array(12).fill(0xa5))],
   ["nested sequences", (os) => {
