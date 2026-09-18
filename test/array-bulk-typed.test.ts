@@ -488,13 +488,13 @@ describe("an fp32 array written from a Float32Array is bit-exact", () => {
     expect([...wire((os) => os.writeFp32Array(1, out))]).toEqual([...bytes]);
   });
 
-  it("...where the value destination would quiet it — the reason for the choice", () => {
+  it("...and through the value destination too: a NaN is stored by its word", () => {
     const f = new Float32Array(1);
     new Uint32Array(f.buffer)[0] = 0x7f800001; // signaling
     const bytes = wire((os) => os.writeFp32Array(1, f));
     const viaValues = new Float32Array(1);
     decode(bytes, { arrayBulk: () => ({ f32: viaValues }) });
-    expect(new Uint32Array(viaValues.buffer)[0], "f32 quiets it").toBe(0x7fc00001);
+    expect(new Uint32Array(viaValues.buffer)[0], "f32 keeps it").toBe(0x7f800001);
   });
 });
 

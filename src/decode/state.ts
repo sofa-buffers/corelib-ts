@@ -1518,7 +1518,10 @@ export class DecoderState {
         } else if (isFp32) {
           const out = t.f32!;
           for (let k = 0; k < run; k++) {
-            out[idx++] = dv.getFloat32(i, true);
+            const v = dv.getFloat32(i, true);
+            if (v === v) out[idx] = v;
+            else f32StoreWord(out, idx, dv.getUint32(i, true));
+            idx++;
             i += 4;
           }
         } else {
@@ -1538,7 +1541,10 @@ export class DecoderState {
       } else if (isFp32) {
         const out = t.f32!;
         for (let k = 0; k < run; k++) {
-          out[idx++] = fp32FromBits(u32le(input, i));
+          const w = u32le(input, i);
+          if ((w & 0x7fffffff) > 0x7f800000) f32StoreWord(out, idx, w);
+          else out[idx] = fp32FromBits(w);
+          idx++;
           i += 4;
         }
       } else {
@@ -1570,6 +1576,7 @@ export class DecoderState {
     const t = this.bulk as FloatArrayTarget;
     if (!isFp32) t.f64![idx] = fp64FromBits(lo, hi);
     else if (this.bulkMode === BM.F32Bits) t.bits![idx] = lo >>> 0;
+    else if ((lo & 0x7fffffff) > 0x7f800000) f32StoreWord(t.f32!, idx, lo >>> 0);
     else t.f32![idx] = fp32FromBits(lo);
   }
 
@@ -1940,6 +1947,19 @@ export class DecoderState {
  * routes that do not clear the {@link FP32_HANDLE_MIN} threshold read their raw
  * bits this way, with no handle over the chunk.
  */
+/**
+ * Store an fp32 NaN into a `Float32Array` destination by its wire word (§4.6).
+ * Widening a NaN to a double quiets a signaling one (and an engine may purify
+ * the payload of any NaN it reads from a typed array), so a NaN never goes
+ * through a value: it is written through a word view over the destination's own
+ * storage. Every other fp32 survives the double exactly, which is why the view
+ * is built here, per NaN, and never on the common path — touching `.buffer`
+ * moves a small typed array's storage off the heap.
+ */
+function f32StoreWord(out: Float32Array, idx: number, word: number): void {
+  new Uint32Array(out.buffer, out.byteOffset, out.length)[idx] = word;
+}
+
 function u32le(b: Uint8Array, i: number): number {
   return (b[i]! | (b[i + 1]! << 8) | (b[i + 2]! << 16) | (b[i + 3]! << 24)) >>> 0;
 }

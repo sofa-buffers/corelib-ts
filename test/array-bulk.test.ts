@@ -559,15 +559,15 @@ describe("bulk hand-off: a target this decoder cannot fill is a caller mistake",
     decode(os.bytes().slice(), { arrayBulk: () => ({ bits }) });
     expect([...bits]).toEqual([0x7fa00001, 0x3fc00000]);
 
-    // The same array through the value destination quiets it — which is why the
-    // choice exists rather than one shape serving both.
+    // The value destination keeps it too: a NaN element is stored by its word
+    // (through a view built for that element only), never through a double.
     const f32 = new Float32Array(2);
     decode(os.bytes().slice(), { arrayBulk: () => ({ f32 }) });
     // Read through a `Uint32Array`, not a little-endian `DataView`: the array's
     // own buffer is in HOST order, so forcing LE reads it byte-swapped on a
     // big-endian machine and the assertion would fail there for a reason that has
     // nothing to do with what it is testing.
-    expect(new Uint32Array(f32.buffer)[0]).toBe(0x7fe00001);
+    expect([...new Uint32Array(f32.buffer)]).toEqual([0x7fa00001, 0x3fc00000]);
   });
 
   it("refuses a typed destination shorter than the array", () => {
