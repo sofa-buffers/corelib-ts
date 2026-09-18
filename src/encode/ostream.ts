@@ -698,8 +698,10 @@ export class OStream implements ByteSink {
     // A Float32Array holds the wire words already, and reading them as numbers
     // would quiet a signaling NaN (§6.5), so it takes a route that copies words
     // on every path, streamed included (corelib-ts#185). Split off here, at the
-    // entry, rather than as a branch beside the number loop below: the branch
-    // alone cost that loop 20% (Callgrind, 1000 elements through a 64-byte sink).
+    // entry, rather than as a branch beside the number loop below: an inlined
+    // `instanceof` has a runtime-call slow path, and past it TurboFan no longer
+    // trusts the maps it knew, so that loop re-checked `values` and `this` and
+    // reloaded both lengths on every element — +12% Ir with the branch empty.
     if (values instanceof Float32Array) {
       this.writeFp32Words(id, values);
       return;
@@ -1016,20 +1018,29 @@ export class OStream implements ByteSink {
    * on the bulk path (the kernel copies words too) and on the streamed one alike,
    * so a small buffer produces the one-shot bytes (§5.1.4).
    *
-   * Streamed, one `Uint32Array` over the source per call, the same handle the
-   * bulk kernel takes (§6.6.2); reading it gives each word's value whatever the
-   * host byte order, and the shifts below store it little-endian. The words go
-   * out one run per stretch of free buffer, with `buf`/`pos` in locals, and the
-   * split points are {@link putFp32}'s: drain when fewer than 4 bytes are free,
-   * split an element byte by byte only when the buffer itself is narrower than 4.
+   * Kept to the header and the bulk call, the streaming loop in its own method:
+   * with the loop in this body an 8-element one-shot array cost +416 Ir/op
+   * (+8.8%) over the pre-#185 encoder, split like this +1.1% (Callgrind).
    */
   private writeFp32Words(id: number, values: Float32Array): void {
     this.arrayHead(id, WireType.ArrayFixlen, values.length);
     this.putVarintNum(4 * 8 + FixlenSubtype.Fp32);
     if (this.reserveBulk(values.length * 4)) {
       this.pos = this.kernel.packFp32Array(values, this.buf, this.pos);
-      return;
+    } else {
+      this.putFp32Words(values);
     }
+  }
+
+  /**
+   * The streamed half of {@link writeFp32Words}: one `Uint32Array` over the
+   * source per call, the same handle the bulk kernel takes (§6.6.2); reading it gives each word's value whatever the
+   * host byte order, and the shifts below store it little-endian. The words go
+   * out one run per stretch of free buffer, with `buf`/`pos` in locals, and the
+   * split points are {@link putFp32}'s: drain when fewer than 4 bytes are free,
+   * split an element byte by byte only when the buffer itself is narrower than 4.
+   */
+  private putFp32Words(values: Float32Array): void {
     const w = new Uint32Array(values.buffer, values.byteOffset, values.length);
     const n = w.length;
     let i = 0;
