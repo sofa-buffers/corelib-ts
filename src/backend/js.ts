@@ -178,6 +178,30 @@ export const jsKernel: Kernel = {
     // Going through the words is bit-exact for every value, not only NaNs, and it
     // removes any need for a caller to carry the wire bytes beside the numbers.
     if (values instanceof Float32Array) {
+      // A short run needs no handle at all. Only a NaN can lose bits in the
+      // widening (every other fp32 narrows back exactly through the scratch), so
+      // the element is read as a value and the word view is built only when a
+      // NaN is actually met: touching `values.buffer` moves a small, on-heap
+      // typed array's storage off the heap, and a view plus a `DataView` per
+      // 5-element array cost more than the elements themselves.
+      if (n < FP32_HANDLE_MIN) {
+        let w: Uint32Array | null = null;
+        for (let i = 0; i < n; i++) {
+          const v = values[i]!;
+          if (v === v) {
+            pos = packFp32(out, pos, v);
+            continue;
+          }
+          if (w === null) w = new Uint32Array(values.buffer, values.byteOffset, n);
+          const x = w[i]!;
+          out[pos] = x;
+          out[pos + 1] = x >>> 8;
+          out[pos + 2] = x >>> 16;
+          out[pos + 3] = x >>> 24;
+          pos += 4;
+        }
+        return pos;
+      }
       const w = new Uint32Array(values.buffer, values.byteOffset, n);
       const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
       for (let i = 0; i < n; i++) {

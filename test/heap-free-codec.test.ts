@@ -285,18 +285,19 @@ describe("read: the itemised handles, and nothing else (§6.6.2 / §6.6.4)", () 
     });
   });
 
-  it("an encode of an fp32 array from a Float32Array: a pair, at ANY length", () => {
-    // This one does not follow FP32_HANDLE_MIN, and the reason is correctness
-    // rather than arithmetic: a `Float32Array` already HOLDS the wire words, and
-    // reading its elements as numbers would quiet a signaling NaN (§4.6/§6.5). So
-    // the words are copied, which needs the pair — for two elements as much as for
-    // two hundred. The `number[]` source below is the contrast: no handle at all.
+  it("an encode of an fp32 array from a Float32Array: a word view only for a NaN", () => {
+    // Below FP32_HANDLE_MIN a short run takes no handle. Only a NaN can lose bits
+    // when read as a number (a signaling one is quieted, §4.6/§6.5), so a word view
+    // over the source is built when — and only when — the run holds one. The
+    // `number[]` source below is the contrast: no handle at all.
     const short = new Float32Array([1.5, 2.5]);
+    const withNaN = new Float32Array(2);
+    new Uint32Array(withNaN.buffer)[0] = 0x7f800001;
     const typedStream = new OStream(new Uint8Array(256));
     const plainStream = new OStream(new Uint8Array(256));
-    expect(allocationsDuring(() => void typedStream.writeFp32Array(1, short))).toStrictEqual({
+    expect(allocationsDuring(() => void typedStream.writeFp32Array(1, short))).toStrictEqual({});
+    expect(allocationsDuring(() => void typedStream.writeFp32Array(2, withNaN))).toStrictEqual({
       Uint32Array: 1,
-      DataView: 1,
     });
     expect(allocationsDuring(() => void plainStream.writeFp32Array(1, [1.5, 2.5]))).toStrictEqual(
       {},
