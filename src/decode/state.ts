@@ -99,6 +99,28 @@ const TYPED_CAPACITY = new Map<TypedIntCtor, { min: number; max: number }>([
   [BigInt64Array, { min: Number.NEGATIVE_INFINITY, max: Number.POSITIVE_INFINITY }],
 ]);
 
+/**
+ * {@link TYPED_CAPACITY} with the six narrow constructors answered by identity
+ * first: the check runs once per array, and on a short array a `Map` probe keyed
+ * by an object was a measurable share of it. A narrow answer also lets the
+ * caller skip the two 64-bit `instanceof` tests.
+ */
+function typedCapacity(ctor: unknown): { min: number; max: number } | undefined {
+  if (ctor === Uint8Array) return CAP_U8;
+  if (ctor === Int8Array) return CAP_I8;
+  if (ctor === Uint16Array) return CAP_U16;
+  if (ctor === Int16Array) return CAP_I16;
+  if (ctor === Uint32Array) return CAP_U32;
+  if (ctor === Int32Array) return CAP_I32;
+  return TYPED_CAPACITY.get(ctor as TypedIntCtor);
+}
+const CAP_U8 = TYPED_CAPACITY.get(Uint8Array)!;
+const CAP_I8 = TYPED_CAPACITY.get(Int8Array)!;
+const CAP_U16 = TYPED_CAPACITY.get(Uint16Array)!;
+const CAP_I16 = TYPED_CAPACITY.get(Int16Array)!;
+const CAP_U32 = TYPED_CAPACITY.get(Uint32Array)!;
+const CAP_I32 = TYPED_CAPACITY.get(Int32Array)!;
+
 /** Whether `d` is one of the two 64-bit destinations, which fill through halves. */
 function is64(d: object): boolean {
   return d instanceof BigUint64Array || d instanceof BigInt64Array;
@@ -1167,43 +1189,14 @@ export class DecoderState {
       );
     }
     if (it.typed !== undefined) {
-      const d = it.typed;
-      if (d.length < count) {
-        throw argumentError(
-          `array ${this.id}: typed destination holds ${d.length} of ${count} elements`,
-        );
-      }
-      // A destination NARROWER than the bound could not represent every legal
-      // element, and a typed store would MASK it rather than refuse it — which is
-      // the one thing §7.1 forbids. So the width is settled once, here, against
-      // the bound the caller stated; the fill loop then needs no guard of its own
-      // beyond that same bound.
-      const cap = TYPED_CAPACITY.get(d.constructor as TypedIntCtor);
-      const signed = kind === ArrayKind.Signed;
-      if (is64(d)) {
-        // The 64-bit pair covers the whole accumulator, so no bound can fall
-        // outside it and there is nothing to compare. What it does need is the
-        // view the fill writes halves through, built once per array.
-        if (signed !== d instanceof BigInt64Array) {
-          throw argumentError(
-            `array ${this.id}: a 64-bit typed destination must match the array's signedness`,
-          );
-        }
-        this.bulk64 = new Uint32Array(d.buffer, d.byteOffset, d.length * 2);
-        return BM.Typed64;
-      }
-      const minV = signed ? (it.minHi | 0) * TWO32 + it.minLo : it.minHi * TWO32 + it.minLo;
-      const maxV = signed ? (it.maxHi | 0) * TWO32 + it.maxLo : it.maxHi * TWO32 + it.maxLo;
-      if (cap === undefined) {
-        throw argumentError(`array ${this.id}: unsupported typed destination`);
-      }
-      if (minV < cap.min || maxV > cap.max) {
-        throw argumentError(
-          `array ${this.id}: the element bound ${minV}..${maxV} does not fit the` +
-            ` typed destination (${cap.min}..${cap.max})`,
-        );
-      }
-      return BM.Typed;
+      // Split by signedness so each check site sees at most the three narrow
+      // constructors of its own sign (plus the 64-bit one): four maps stay
+      // polymorphic and V8 inlines `length`/`constructor` for them. One shared
+      // site saw all six, went megamorphic, and paid a generic accessor call per
+      // array (6.5 % of the arena's 434 B round trip).
+      return kind === ArrayKind.Signed
+        ? this.typedModeS(it, it.typed, kind, count)
+        : this.typedModeU(it, it.typed, kind, count);
     }
     if (halves) {
       const lo = it.lo;
@@ -1238,6 +1231,96 @@ export class DecoderState {
     // The 32-bit arm is legal exactly when no legal element can reach the high
     // half — which is what a bound with both high halves zero says.
     return it.minHi === 0 && it.maxHi === 0 ? BM.Values32 : BM.Values;
+  }
+
+  /** The typed-destination check of {@link resolveTarget} for an unsigned array. */
+  private typedModeU(
+    it: IntegerArrayTarget,
+    d: NonNullable<IntegerArrayTarget["typed"]>,
+    kind: ArrayKind,
+    count: number,
+  ): BM {
+    if (d.length < count) {
+      throw argumentError(
+        `array ${this.id}: typed destination holds ${d.length} of ${count} elements`,
+      );
+    }
+    // A destination NARROWER than the bound could not represent every legal
+    // element, and a typed store would MASK it rather than refuse it — which is
+    // the one thing §7.1 forbids. So the width is settled once, here, against
+    // the bound the caller stated; the fill loop then needs no guard of its own
+    // beyond that same bound.
+    const cap = typedCapacity(d.constructor);
+    const signed = kind === ArrayKind.Signed;
+    if ((cap === undefined || cap.max === Number.POSITIVE_INFINITY) && is64(d)) {
+      // The 64-bit pair covers the whole accumulator, so no bound can fall
+      // outside it and there is nothing to compare. What it does need is the
+      // view the fill writes halves through, built once per array.
+      if (signed !== d instanceof BigInt64Array) {
+        throw argumentError(
+          `array ${this.id}: a 64-bit typed destination must match the array's signedness`,
+        );
+      }
+      this.bulk64 = new Uint32Array(d.buffer, d.byteOffset, d.length * 2);
+      return BM.Typed64;
+    }
+    const minV = signed ? (it.minHi | 0) * TWO32 + it.minLo : it.minHi * TWO32 + it.minLo;
+    const maxV = signed ? (it.maxHi | 0) * TWO32 + it.maxLo : it.maxHi * TWO32 + it.maxLo;
+    if (cap === undefined) {
+      throw argumentError(`array ${this.id}: unsupported typed destination`);
+    }
+    if (minV < cap.min || maxV > cap.max) {
+      throw argumentError(
+        `array ${this.id}: the element bound ${minV}..${maxV} does not fit the` +
+          ` typed destination (${cap.min}..${cap.max})`,
+      );
+    }
+    return BM.Typed;
+  }
+
+  /** The signed twin of {@link typedModeU}: textually identical, for its own inline caches. */
+  private typedModeS(
+    it: IntegerArrayTarget,
+    d: NonNullable<IntegerArrayTarget["typed"]>,
+    kind: ArrayKind,
+    count: number,
+  ): BM {
+    if (d.length < count) {
+      throw argumentError(
+        `array ${this.id}: typed destination holds ${d.length} of ${count} elements`,
+      );
+    }
+    // A destination NARROWER than the bound could not represent every legal
+    // element, and a typed store would MASK it rather than refuse it — which is
+    // the one thing §7.1 forbids. So the width is settled once, here, against
+    // the bound the caller stated; the fill loop then needs no guard of its own
+    // beyond that same bound.
+    const cap = typedCapacity(d.constructor);
+    const signed = kind === ArrayKind.Signed;
+    if ((cap === undefined || cap.max === Number.POSITIVE_INFINITY) && is64(d)) {
+      // The 64-bit pair covers the whole accumulator, so no bound can fall
+      // outside it and there is nothing to compare. What it does need is the
+      // view the fill writes halves through, built once per array.
+      if (signed !== d instanceof BigInt64Array) {
+        throw argumentError(
+          `array ${this.id}: a 64-bit typed destination must match the array's signedness`,
+        );
+      }
+      this.bulk64 = new Uint32Array(d.buffer, d.byteOffset, d.length * 2);
+      return BM.Typed64;
+    }
+    const minV = signed ? (it.minHi | 0) * TWO32 + it.minLo : it.minHi * TWO32 + it.minLo;
+    const maxV = signed ? (it.maxHi | 0) * TWO32 + it.maxLo : it.maxHi * TWO32 + it.maxLo;
+    if (cap === undefined) {
+      throw argumentError(`array ${this.id}: unsupported typed destination`);
+    }
+    if (minV < cap.min || maxV > cap.max) {
+      throw argumentError(
+        `array ${this.id}: the element bound ${minV}..${maxV} does not fit the` +
+          ` typed destination (${cap.min}..${cap.max})`,
+      );
+    }
+    return BM.Typed;
   }
 
   /**
