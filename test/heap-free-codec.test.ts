@@ -185,7 +185,7 @@ describe("read: the itemised handles, and nothing else (§6.6.2 / §6.6.4)", () 
   // §6.6.2 lets a codec allocate a **language-forced handle** — a view, a slice
   // object, a span — where the language's only bulk primitive takes one instead of a
   // pointer and a length, provided the object carries no message bytes and no wire
-  // number sizes it. It asks the port to *itemise* them. This port has three, and
+  // number sizes it. It asks the port to *itemise* them. This port has four, and
   // they are asserted by exact count and kind below, so an allocation nobody listed
   // fails the count instead of hiding behind the paragraph:
   //
@@ -198,6 +198,10 @@ describe("read: the itemised handles, and nothing else (§6.6.2 / §6.6.4)", () 
   //   3. a `subarray` of the caller's payload, as the source of `TypedArray.set` —
   //      the only `memcpy` this language exposes takes a typed array. One per copied
   //      piece, and only when the payload does not fit the buffer.
+  //   4. a `Uint32Array` word view over a caller's **typed array**, where a word has
+  //      to cross as bits rather than as a number (a 64-bit element, an fp32 NaN).
+  //      One per call on the write side and one per array on the read side — an
+  //      `f32` destination builds it on its first NaN, and never without one.
   //
   // Everything else on both sides counts **zero**, which is what the absence of any
   // other key in these tallies says. Note what handles 1 and 2 are *not*: a scalar
@@ -385,6 +389,57 @@ describe("read: the itemised handles, and nothing else (§6.6.2 / §6.6.4)", () 
     ).toStrictEqual({});
     expect(st).toBe(DecodeStatus.Complete);
     expect(piecemeal.acc).toBe(whole.acc); // same values, other route
+  });
+
+  it("a decode of fp32 NaNs into an f32 destination: one word view per array, not per NaN", () => {
+    // A NaN is stored by its wire word (§4.6), through a view over the visitor's
+    // Float32Array — built on the array's first NaN and reused for the rest, so the
+    // count is the same for one NaN and for an array of nothing else. Both routes
+    // are covered: the short byte-load run and the long run over the chunk handle.
+    const nans = (n: number): Uint8Array => {
+      const src = new Float32Array(n);
+      new Uint32Array(src.buffer).fill(0x7f800001); // signaling, so a value would lose it
+      const os = growingOStream();
+      os.writeFp32Array(1, src);
+      return os.bytes().slice();
+    };
+    const short = nans(FP32_HANDLE_MIN - 1);
+    const long = nans(4 * FP32_HANDLE_MIN);
+    const shortStream = new IStream(foldingVisitor());
+    const longStream = new IStream(foldingVisitor());
+    expect(allocationsDuring(() => void shortStream.feed(short))).toStrictEqual({ Uint32Array: 1 });
+    expect(allocationsDuring(() => void longStream.feed(long))).toStrictEqual({
+      DataView: 1,
+      Uint32Array: 1,
+    });
+  });
+
+  it("the NaN word view lives per array: a stream of chunks builds it once", () => {
+    // 8 bytes at a time puts most elements on the byte-load route and some across a
+    // chunk boundary (bulkStoreFp) — three call sites, one view, because the view
+    // belongs to the array and not to the chunk. A second array builds its own.
+    const src = new Float32Array(3 * FP32_HANDLE_MIN);
+    new Uint32Array(src.buffer).fill(0x7fa00001);
+    const bulk = (() => {
+      const os = growingOStream();
+      os.writeFp32Array(1, src);
+      os.writeFp32Array(2, src);
+      return os.bytes().slice();
+    })();
+    const f32 = new Float32Array(src.length);
+    const words = new Uint32Array(f32.buffer);
+    const is = new IStream({ arrayBulk: () => ({ f32 }) });
+    const chunks = Array.from({ length: Math.ceil(bulk.length / 7) }, (_, i) =>
+      bulk.subarray(i * 7, i * 7 + 7),
+    );
+    let st: DecodeStatus = DecodeStatus.Complete;
+    expect(
+      allocationsDuring(() => {
+        for (const c of chunks) st = is.feed(c);
+      }),
+    ).toStrictEqual({ Uint32Array: 2 });
+    expect(st).toBe(DecodeStatus.Complete);
+    expect(words.every((w) => w === 0x7fa00001)).toBe(true); // bit-exact, every element
   });
 
   it("a bulk hand-off into typed destinations allocates nothing beyond the one handle", () => {

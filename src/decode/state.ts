@@ -331,7 +331,10 @@ export class DecoderState {
   private bulk: ArrayTarget | null = null;
   /** Which destination {@link bulk} named; meaningless while it is `null`. */
   private bulkMode: BM = BM.Values;
-  /** The `Uint32Array` over a 64-bit typed destination; see {@link BM.Typed64}. */
+  /**
+   * The `Uint32Array` over a 64-bit typed destination (see {@link BM.Typed64}),
+   * or over an `f32` destination once it has taken a NaN (see {@link f32StoreWord}).
+   */
   private bulk64: Uint32Array | null = null;
 
   constructor(visitor: Visitor = SKIP) {
@@ -1066,6 +1069,9 @@ export class DecoderState {
       this.bulk64 = null;
       return;
     }
+    // A view left from an earlier array would point into *its* storage, and the
+    // `f32` route builds its own only when it finds this slot empty.
+    this.bulk64 = null;
     // Resolve *before* storing: a target this machine cannot fill is a caller
     // mistake (§6.3's third row), and it is refused with nothing written and the
     // array still on the per-element path's terms.
@@ -1603,7 +1609,7 @@ export class DecoderState {
           for (let k = 0; k < run; k++) {
             const v = dv.getFloat32(i, true);
             if (v === v) out[idx] = v;
-            else f32StoreWord(out, idx, dv.getUint32(i, true));
+            else this.f32StoreWord(out, idx, dv.getUint32(i, true));
             idx++;
             i += 4;
           }
@@ -1625,7 +1631,7 @@ export class DecoderState {
         const out = t.f32!;
         for (let k = 0; k < run; k++) {
           const w = u32le(input, i);
-          if ((w & 0x7fffffff) > 0x7f800000) f32StoreWord(out, idx, w);
+          if ((w & 0x7fffffff) > 0x7f800000) this.f32StoreWord(out, idx, w);
           else out[idx] = fp32FromBits(w);
           idx++;
           i += 4;
@@ -1654,12 +1660,29 @@ export class DecoderState {
     return i;
   }
 
+  /**
+   * Store an fp32 NaN into a `Float32Array` destination by its wire word (§4.6).
+   * Widening a NaN to a double quiets a signaling one (and an engine may purify
+   * the payload of any NaN it reads from a typed array), so a NaN never goes
+   * through a value: it is written through a word view over the destination's own
+   * storage. Every other fp32 survives the double exactly, which is why the view
+   * is built lazily, on the array's first NaN, and never on the common path —
+   * touching `.buffer` moves a small typed array's storage off the heap. It is
+   * kept in {@link bulk64} for the rest of the array, so the count is one per
+   * array however many NaNs the wire carries (§6.6.2).
+   */
+  private f32StoreWord(out: Float32Array, idx: number, word: number): void {
+    let w = this.bulk64;
+    if (w === null) w = this.bulk64 = new Uint32Array(out.buffer, out.byteOffset, out.length);
+    w[idx] = word;
+  }
+
   /** Store one float element that straddled a chunk boundary (see {@link bulkStoreU}). */
   private bulkStoreFp(idx: number, lo: number, hi: number, isFp32: boolean): void {
     const t = this.bulk as FloatArrayTarget;
     if (!isFp32) t.f64![idx] = fp64FromBits(lo, hi);
     else if (this.bulkMode === BM.F32Bits) t.bits![idx] = lo >>> 0;
-    else if ((lo & 0x7fffffff) > 0x7f800000) f32StoreWord(t.f32!, idx, lo >>> 0);
+    else if ((lo & 0x7fffffff) > 0x7f800000) this.f32StoreWord(t.f32!, idx, lo >>> 0);
     else t.f32![idx] = fp32FromBits(lo);
   }
 
@@ -2030,19 +2053,6 @@ export class DecoderState {
  * routes that do not clear the {@link FP32_HANDLE_MIN} threshold read their raw
  * bits this way, with no handle over the chunk.
  */
-/**
- * Store an fp32 NaN into a `Float32Array` destination by its wire word (§4.6).
- * Widening a NaN to a double quiets a signaling one (and an engine may purify
- * the payload of any NaN it reads from a typed array), so a NaN never goes
- * through a value: it is written through a word view over the destination's own
- * storage. Every other fp32 survives the double exactly, which is why the view
- * is built here, per NaN, and never on the common path — touching `.buffer`
- * moves a small typed array's storage off the heap.
- */
-function f32StoreWord(out: Float32Array, idx: number, word: number): void {
-  new Uint32Array(out.buffer, out.byteOffset, out.length)[idx] = word;
-}
-
 function u32le(b: Uint8Array, i: number): number {
   return (b[i]! | (b[i + 1]! << 8) | (b[i + 2]! << 16) | (b[i + 3]! << 24)) >>> 0;
 }
