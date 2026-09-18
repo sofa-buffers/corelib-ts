@@ -212,12 +212,12 @@ describe("exact-width source: the encoder emits the same bytes as the general pa
     });
   }
 
-  it("reaches the bulk kernel through a buffer sized to the TRUE element width", () => {
-    // The reservation decides whether the bulk kernel runs AT ALL, and a
-    // caller-owned buffer is sized from the real maximum (3 bytes for a `u16`),
-    // never from the 10 a general 64-bit source needs. Asking for 10 per element
-    // there asks for a buffer that by construction does not exist, so the array
-    // falls to the element-at-a-time route — which costs a `bigint` per element.
+  it("reaches the bulk kernel from a MAX_SIZE buffer, whatever the source is", () => {
+    // Which path runs is not about the source's width. A caller-owned buffer is
+    // sized from the schema's worst case (3 bytes for a `u16`), never from the 10
+    // a general 64-bit source needs — and in the block mode that is enough for the
+    // kernel, because the buffer is meant to hold the whole message and the check
+    // is the buffer's own length, applied after the write.
     //
     // Identical bytes prove nothing here (both routes emit them), so the kernel
     // is swapped for one that counts: the claim is about WHICH path ran.
@@ -236,6 +236,7 @@ describe("exact-width source: the encoder emits the same bytes as the general pa
         return jsKernel.encodeUnsignedVarints(v, out, pos);
       },
     };
+    const expected = [...wire((o) => o.writeUnsignedArray(1, vals))];
     const previous = getKernel();
     setKernel(counting);
     try {
@@ -243,15 +244,49 @@ describe("exact-width source: the encoder emits the same bytes as the general pa
       const osTyped = new OStream(typedOut);
       osTyped.writeUnsignedArray(1, new Uint16Array(vals));
       expect(bulkCalls, "an exact-width source reaches the bulk kernel").toBe(1);
-      expect([...osTyped.bytes()]).toEqual([...wire((o) => o.writeUnsignedArray(1, vals))]);
+      expect([...osTyped.bytes()]).toEqual(expected);
 
+      // The same buffer, a source that cannot state its width — and the same path.
+      // Nothing asks it: a `number[]` is no longer second-class here.
       bulkCalls = 0;
       const plainOut = new Uint8Array(maxSize);
-      new OStream(plainOut).writeUnsignedArray(1, vals);
-      expect(
-        bulkCalls,
-        "a number[] cannot state its width, so the same buffer keeps it off the bulk path",
-      ).toBe(0);
+      const osPlain = new OStream(plainOut);
+      osPlain.writeUnsignedArray(1, vals);
+      expect(bulkCalls, "a plain array reaches it through the same buffer").toBe(1);
+      expect([...osPlain.bytes()]).toEqual(expected);
+    } finally {
+      setKernel(previous);
+    }
+  });
+
+  it("takes the element path when a chunk cannot hold the true worst case", () => {
+    // The streaming mode's buffer is a chunk, not the message: the kernel writes a
+    // whole array in one pass and cannot flush, so it runs only where every
+    // element's TRUE worst case (VARINT_MAX_BYTES) fits. A chunk sized to a `u16`
+    // source's width does not qualify — and must not, because the source's claim
+    // about its own width is not a fact the encoder can check.
+    const vals = Array.from({ length: 256 }, (_, i) => (i * 257) & 0xffff);
+
+    let bulkCalls = 0;
+    const counting: Kernel = {
+      ...jsKernel,
+      name: "counting",
+      encodeUnsignedVarints(v, out, pos) {
+        bulkCalls++;
+        return jsKernel.encodeUnsignedVarints(v, out, pos);
+      },
+    };
+    const previous = getKernel();
+    setKernel(counting);
+    try {
+      const chunks: number[] = [];
+      const os = new OStream(new Uint8Array(8 + vals.length * 3), 0, (buf, start, end) => {
+        for (let i = start; i < end; i++) chunks.push(buf[i]!);
+      });
+      os.writeUnsignedArray(1, new Uint16Array(vals));
+      os.flush();
+      expect(bulkCalls, "a chunk too small for the true bound takes the element path").toBe(0);
+      expect(chunks).toEqual([...wire((o) => o.writeUnsignedArray(1, vals))]);
     } finally {
       setKernel(previous);
     }
