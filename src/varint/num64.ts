@@ -14,6 +14,7 @@
  */
 
 import { argumentError } from "../errors.js";
+import { HI, LO } from "./bits64.js";
 
 // One 8-byte scratch, viewed two ways: the `DataView` performs the IEEE-754
 // conversion with an explicit little-endian flag (so the wire stays
@@ -23,6 +24,9 @@ import { argumentError } from "../errors.js";
 const SCRATCH_BUF = new ArrayBuffer(8);
 const SCRATCH = new DataView(SCRATCH_BUF);
 const SCRATCH_BYTES = new Uint8Array(SCRATCH_BUF);
+const SCRATCH_U32 = new Uint32Array(SCRATCH_BUF);
+const SCRATCH_F32 = new Float32Array(SCRATCH_BUF, 0, 1);
+const SCRATCH_F64 = new Float64Array(SCRATCH_BUF);
 
 /**
  * Coerce a `number | bigint` to a `bigint`, rejecting non-integers.
@@ -98,13 +102,17 @@ export function fp64BitsHi(value: number): number {
  * per-instance byte array.
  */
 export function fp32FromBits(bits: number): number {
-  SCRATCH.setUint32(0, bits, true);
-  return SCRATCH.getFloat32(0, true);
+  // Same-width aliases of one word: no byte order is involved, so a plain
+  // element store + load replaces two `DataView` method calls (which JSC in
+  // particular does not inline as well).
+  SCRATCH_U32[0] = bits;
+  return SCRATCH_F32[0]!;
 }
 
 /** Reinterpret the 8 little-endian wire bytes of an fp64, packed into two words. */
 export function fp64FromBits(lo: number, hi: number): number {
-  SCRATCH.setUint32(0, lo, true);
-  SCRATCH.setUint32(4, hi, true);
-  return SCRATCH.getFloat64(0, true);
+  // The two halves go to the host's own half order (`LO`/`HI`, probed once).
+  SCRATCH_U32[LO] = lo;
+  SCRATCH_U32[HI] = hi;
+  return SCRATCH_F64[0]!;
 }
