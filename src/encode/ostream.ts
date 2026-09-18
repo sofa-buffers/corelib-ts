@@ -554,10 +554,45 @@ export class OStream implements ByteSink {
 
   // --- arrays -------------------------------------------------------------
 
-  /** Write an array of unsigned integers (each a varint). */
+  /**
+   * Write an array of unsigned integers (each a varint).
+   *
+   * **The bulk kernel writes a whole array in one pass and cannot flush**, so it
+   * runs only where everything is known to fit. Three cases, and none of them
+   * asks the source how wide its elements are:
+   *
+   * * **block mode** (no sink) — the buffer is meant to hold the whole message,
+   *   so the kernel always runs and the buffer's length is the bound, checked
+   *   after the fact. A message that does not fit is `BUFFER_FULL`, which is
+   *   precisely this mode's answer.
+   * * **a stream with room** — `VARINT_MAX_BYTES` per element is the true
+   *   worst case for any 64-bit value, and a *growing* stream always satisfies
+   *   it because it grows to whatever is asked.
+   * * **a chunk too small for that** — fill it to the last byte, hand it over,
+   *   carry on, splitting an element where it falls. That is not a fallback but
+   *   the mode's contract: `MIN_OUTPUT_BUFFER` is 1.
+   *
+   * What is gone is the fourth case, which asked `values.constructor` for a
+   * narrower bound so the kernel would run on a tightly-sized chunk. `constructor`
+   * is an ordinary property, an `ArrayLike` can claim any width, and a wrong
+   * answer silently truncated the message — §5.1's "partial output handed back as
+   * complete". The block mode now reaches the kernel without needing the number
+   * at all, which is where a tightly-sized buffer actually lives.
+   */
   writeUnsignedArray(id: number, values: ArrayLike<number | bigint>): void {
     this.arrayHead(id, WireType.ArrayUnsigned, values.length);
-    if (this.reserveBulk(values.length * maxVarintBytes(values))) {
+    if (this.flushSink === undefined) {
+      // Block mode: the buffer is meant to hold the whole message, so the kernel
+      // always runs and the buffer's own length is the only bound — checked once,
+      // after, where a message that does not fit is exactly what BUFFER_FULL means.
+      this.pos = this.bulkEnd(
+        this.kernel.encodeUnsignedVarints(values, this.buf, this.pos),
+        values.length,
+      );
+    } else if (this.reserveBulk(values.length * VARINT_MAX_BYTES)) {
+      // A sink, but room for the element's TRUE worst case — which is what a
+      // growing stream always has, since it grows to whatever is asked. The bound
+      // is arithmetic, not a guess about the source.
       this.pos = this.kernel.encodeUnsignedVarints(values, this.buf, this.pos);
     } else {
       // Streaming (fixed caller buffer): each element is range-checked and
@@ -575,10 +610,21 @@ export class OStream implements ByteSink {
     }
   }
 
-  /** Write an array of signed integers (each zig-zag + varint). */
+  /** Write an array of signed integers (each zig-zag + varint). See {@link writeUnsignedArray}. */
   writeSignedArray(id: number, values: ArrayLike<number | bigint>): void {
     this.arrayHead(id, WireType.ArraySigned, values.length);
-    if (this.reserveBulk(values.length * maxVarintBytes(values))) {
+    if (this.flushSink === undefined) {
+      // Block mode: the buffer is meant to hold the whole message, so the kernel
+      // always runs and the buffer's own length is the only bound — checked once,
+      // after, where a message that does not fit is exactly what BUFFER_FULL means.
+      this.pos = this.bulkEnd(
+        this.kernel.encodeSignedVarints(values, this.buf, this.pos),
+        values.length,
+      );
+    } else if (this.reserveBulk(values.length * VARINT_MAX_BYTES)) {
+      // A sink, but room for the element's TRUE worst case — which is what a
+      // growing stream always has, since it grows to whatever is asked. The bound
+      // is arithmetic, not a guess about the source.
       this.pos = this.kernel.encodeSignedVarints(values, this.buf, this.pos);
     } else {
       // See writeUnsignedArray: range-check and split in one round-trip, halves
@@ -1154,6 +1200,32 @@ export class OStream implements ByteSink {
     if (this.flushSink === undefined) return false;
     this.drain(n);
     return this.buf.length - this.pos >= n;
+  }
+
+  /**
+   * Commit the position a bulk kernel returned, in the **block** mode.
+   *
+   * Nothing reserves room in front of that kernel, and nothing could: the bytes an
+   * array takes are only known once it is encoded, and the estimate that used to
+   * stand in — the source's own `constructor`, which any object can set — silently
+   * truncated the message when it was wrong (§5.1). Here the bound is the buffer's
+   * own length, applied afterwards. The varint kernels stop writing at
+   * `out.length` and keep counting (see {@link Kernel}), so a `pos` past the end
+   * is the exact shortfall and nothing was written outside the buffer.
+   *
+   * This is the block mode's error and only its: the buffer is meant to hold the
+   * whole message, so one that does not fit is exactly what `BUFFER_FULL` means.
+   * The streaming mode never gets here, and `BUFFER_FULL` is unreachable there by
+   * contract.
+   */
+  private bulkEnd(pos: number, count: number): number {
+    if (pos > this.buf.length) {
+      throw bufferFullError(
+        `output buffer full: an array of ${count} elements needs ` +
+          `${pos - this.buf.length} more bytes`,
+      );
+    }
+    return pos;
   }
 
   /**

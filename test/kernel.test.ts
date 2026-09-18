@@ -11,7 +11,10 @@ import {
   decode,
   getKernel,
   jsKernel,
-  setKernel, growingOStream } from "../src/index.js";
+  setKernel,
+  growingOStream,
+  SofabErrorCode,
+} from "../src/index.js";
 import { bytesToHex } from "./helpers/hex.js";
 
 /** The 8-byte header of a valid, empty WebAssembly module. */
@@ -152,5 +155,58 @@ describe("kernel parity: the inlined bulk writer matches the shared helper", () 
     const seen: (number | bigint)[] = [];
     decode(os.bytes(), { arrayBulk: () => ({ values: seen, ...{ minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff } }) });
     expect(seen.map((v) => BigInt(v))).toEqual(corpus);
+  });
+});
+
+describe("a varint kernel is bounded by out.length, and counts past it", () => {
+  // The block mode calls the varint kernels without knowing how many bytes the
+  // array will take — no caller can know that, and asking the source for its
+  // element width is the guess that truncated messages. So the kernel is handed
+  // the real buffer and two duties: stop at its end, and report where it would
+  // have got to. A native or WASM kernel must implement both deliberately.
+  const values = [0xffffffff, 0xffffffff, 0xffffffff]; // 5 varint bytes each
+
+  for (const [name, encode] of [
+    ["encodeUnsignedVarints", jsKernel.encodeUnsignedVarints],
+    ["encodeSignedVarints", jsKernel.encodeSignedVarints],
+  ] as const) {
+    it(`${name}: reports the shortfall and leaves the buffer's tail alone`, () => {
+      const need = encode(values, new Uint8Array(64), 0);
+      expect(need).toBeGreaterThan(0);
+
+      for (let size = 0; size < need; size++) {
+        // A guard byte behind the buffer: the kernel gets a view that ends at
+        // `size`, and the byte after it must still be untouched afterwards.
+        const backing = new Uint8Array(need + 8).fill(0xaa);
+        const out = backing.subarray(0, size);
+        const pos = encode(values, out, 0);
+
+        expect(pos, `${name} must count the bytes it could not write`).toBe(need);
+        expect(
+          [...backing.subarray(size)],
+          `${name} wrote past out.length at size ${size}`,
+        ).toEqual([...new Uint8Array(backing.length - size).fill(0xaa)]);
+      }
+    });
+  }
+
+  it("the same duty, seen through the encoder: BUFFER_FULL, never a short message", () => {
+    const exact = new OStream(new Uint8Array(64));
+    exact.writeUnsignedArray(1, values);
+    const size = exact.bytesUsed;
+
+    for (let n = 0; n < size; n++) {
+      const os = new OStream(new Uint8Array(n));
+      try {
+        os.writeUnsignedArray(1, values);
+        expect.unreachable(`a ${n}-byte buffer accepted a ${size}-byte message`);
+      } catch (e) {
+        expect((e as { code?: unknown }).code).toBe(SofabErrorCode.BufferFull);
+      }
+    }
+
+    const fits = new OStream(new Uint8Array(size));
+    fits.writeUnsignedArray(1, values);
+    expect(fits.bytesUsed).toBe(size);
   });
 });

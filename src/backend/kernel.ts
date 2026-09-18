@@ -17,11 +17,27 @@
 import { jsKernel } from "./js.js";
 
 /**
- * Bulk, capacity-guaranteed transforms used on the encoder's fast path.
+ * Bulk transforms used on the encoder's fast path.
  *
- * Every method writes into `out` starting at `pos`, assuming the caller has
- * already ensured enough room, and returns the position just past the last byte
- * written. Headers, counts and flushing stay in the stream classes; a kernel
+ * Every method writes into `out` starting at `pos` and returns the position just
+ * past the last byte written.
+ *
+ * **`out.length` is the bound, and the only one.** The two packers are handed a
+ * region the caller has already sized exactly (4 or 8 bytes an element, a number
+ * the caller can compute), so for them "enough room" is a guarantee. The two
+ * *varint* kernels are not: a varint's length depends on the value, so the caller
+ * cannot know the size without encoding it, and asking the source how wide its
+ * elements are is exactly the guess that silently truncated messages (§5.1). So a
+ * varint kernel must
+ *
+ * * **never write at or past `out.length`**, and
+ * * **keep counting anyway**, returning the position it *would* have reached.
+ *
+ * The caller compares that against `out.length`: past the end means the message
+ * does not fit, which in the block mode is `BUFFER_FULL` — the answer that mode
+ * exists to give. The JS kernel satisfies this for free (a typed-array store past
+ * the end is dropped while `pos` keeps advancing); a native or WebAssembly kernel
+ * must implement it deliberately, counting the remaining elements without storing. Headers, counts and flushing stay in the stream classes; a kernel
  * only moves bytes — with one obligation it cannot delegate, because it is the
  * only code that ever looks at the elements: **the integer kernels must reject
  * an element outside the 64-bit value domain** (CORELIB_PLAN §6.2 — `0 .. 2^64
