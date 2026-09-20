@@ -817,8 +817,9 @@ shared suite it actually executed, and a file that arrived truncated or a group
 gated out by `requires` shows up as a smaller number rather than as silence. This
 port compiles no feature out, so nothing is ever gated.
 
-`assets/test_vectors.json` carries four blocks and this port runs all four:
-`vectors`, `invalid_utf8`, `sequence_growth` and `header_limits`. The file is a
+`assets/test_vectors.json` carries six blocks, of which this port runs five:
+`vectors`, `invalid_utf8`, `sequence_growth`, `header_limits` and
+`boolean_tolerant` (`header_limits_nested` is the sixth, not yet adopted here). The file is a
 **verbatim** copy of the one in `corelib-c-cpp`, which authors it. A daily CI job (`.github/workflows/shared-vectors.yml`) compares this copy's sha256 against that file on `corelib-c-cpp@main`, so a copy left behind by an upstream change is reported rather than going unnoticed.
 
 `sequence_growth` holds the wrapper-array growth cases of §7.2 item 8, replayed by
@@ -841,6 +842,24 @@ word. Every rejection case is paired with an in-cap control that must still answ
 `incomplete`, and the block is also run with the ceilings lifted — where all six
 rejections fall back to `incomplete`, since this port's `FIXLEN_MAX` (`INT32_MAX`)
 sits above even the amplification case's 1 GiB claim.
+
+`boolean_tolerant` holds §4.4's decode half — bytes carrying `2`, `256` or `2^64-1`
+at a boolean position — replayed by `boolean-tolerant.test.ts`. No conforming
+*encoder* emits such a value, so the positive vectors cannot reach the rule at all:
+those bytes only ever arrive from someone else's encoder. A boolean carries no width
+bound, so every non-zero value is `true` — not `INVALID`, and not a truncation to
+`false` — and the decode is **normalized**, which only the re-encode makes visible.
+Each case is therefore asserted three ways: the outcome is `complete`, the
+destination holds exactly `0` / `1` (poisoned with `0xaa` first, so a decoder that
+never writes cannot pass), and the re-encode of *what was decoded* is byte-compared
+against the block's `reencoded_hex` — `0001`, never `0002`. An array decodes through
+the `bool` destination, which is where this library performs the normalization; a
+scalar boolean has no callback of its own and arrives on `unsigned` with its full 64
+bits, so the `!== 0` test there is the generated layer's and the test performs it,
+after asserting that the delivered value and its two halves agree. In this block an
+unsatisfied `requires` tag means the message must be **rejected**, not skipped
+(§4.4 lifts the width bound the *type* carries, never the one a narrowed *build*
+has) — a path this port never takes, since it compiles no feature out.
 
 CI type-checks, tests and builds on Node 20 / 22 / 24 / 26, smoke-tests the
 bundle on Node, Deno and Bun, and publishes coverage badges; a separate

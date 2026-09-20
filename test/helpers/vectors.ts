@@ -380,6 +380,79 @@ export function loadHeaderLimitCases(): HeaderLimitCase[] {
 }
 
 /**
+ * A boolean-tolerance case (top-level `boolean_tolerant`) — CORELIB_PLAN §4.4.
+ *
+ * "Canonical on encode, tolerant on decode": an encoder **must** write `true` as
+ * `1`, and a decoder **must** read *every* non-zero value as `true` — such a value
+ * is not `INVALID`, it is normalized away, and the re-encode emits `1`. A boolean
+ * is an unsigned integer on the wire (wire type `0b000`, or `0b011` for an array
+ * of them) and carries no width bound at all, unlike an `enum` or a `bitfield`
+ * (MESSAGE_SPEC §1), so `2`, `256` and `2^64-1` are all simply `true`.
+ *
+ * The positive {@link Vector}s cannot reach this half of §4.4: their bytes are
+ * produced by replaying `fields` through a conforming encoder, and a conforming
+ * encoder never emits a non-canonical boolean. Bytes carrying `256` at a boolean
+ * position only ever arrive from *someone else's* encoder — hence a hand-authored
+ * block, keyed by bytes and by the **re-encode** they must produce.
+ *
+ * So a case is decode-then-re-encode only: there is no `fields` op list and no
+ * `serialized_sparse` column.
+ */
+export interface BooleanTolerantCase {
+  name: string;
+  group: string;
+  description: string;
+  requires?: string[];
+  /** The field id the bytes carry — and the id the re-encode must write at. */
+  id: number;
+  /** Lowercase hex of the complete message to feed. */
+  serialized_hex: string;
+  expect: {
+    /** A *tolerated* value is not a *rejected* one: always `complete` here. */
+    outcome: "complete";
+    /** The NORMALIZED result, one entry per element (one entry ⇒ a scalar case). */
+    values: boolean[];
+    /** Lowercase hex of the dense re-encode of {@link values} at {@link id}. */
+    reencoded_hex: string;
+  };
+}
+
+/**
+ * Load the boolean-tolerance cases, or `[]` on a vector file that predates them.
+ *
+ * `id` indexes and is narrowed out of the bigint-fidelity parser like every other
+ * index here. The two hex columns and `values` are cross-checked on the way out:
+ * a case whose own columns contradict each other would otherwise assert something
+ * other than what it states, and an empty `values` would make the case run with
+ * neither a scalar nor an array destination and pass while testing nothing.
+ */
+export function loadBooleanTolerantCases(): BooleanTolerantCase[] {
+  const doc = readVectorFile() as unknown as { boolean_tolerant?: BooleanTolerantCase[] };
+  return (doc.boolean_tolerant ?? []).map((c, i) => {
+    const where = `boolean_tolerant ${c.name ?? `#${i}`}`;
+    for (const [key, hex] of [
+      ["serialized_hex", c.serialized_hex],
+      ["expect.reencoded_hex", c.expect.reencoded_hex],
+    ] as const) {
+      if (!/^([0-9a-f]{2})+$/.test(hex)) {
+        throw new Error(`${where}.${key}: ${hex} is not an even-length lowercase hex string`);
+      }
+    }
+    if (c.expect.values.length === 0) throw new Error(`${where}: expect.values is empty`);
+    // Left exactly as parsed — never coerced. A `1` where the file should carry
+    // `true` would pass every comparison below once coerced, which is the one
+    // thing this block must not do to a value (§4.4 normalization is the *port's*
+    // job to perform, not the loader's to paper over).
+    for (const [k, v] of c.expect.values.entries()) {
+      if (typeof v !== "boolean") {
+        throw new Error(`${where}.expect.values[${k}]: expected a JSON boolean, got ${String(v)}`);
+      }
+    }
+    return { ...c, id: asIndex(`${where}.id`, c.id) };
+  });
+}
+
+/**
  * The **profile** capability tags this port declares, beside the wire-construct
  * tags in {@link PORT_CAPABILITIES}.
  *
@@ -413,6 +486,14 @@ export const PROFILE_CAPABILITIES: ReadonlySet<string> = new Set([
  * that already asserts a rejection with a specific category must be **skipped** —
  * a build that cannot represent the construct would reject it for an unrelated
  * reason and appear to pass while testing nothing (test_vectors_README.md).
+ *
+ * **What the caller does with the answer is the block's to decide**, and the two
+ * blocks here differ: `header_limits` skips such a case, while `boolean_tolerant`
+ * narrows the rule back to the vectors' — an unsatisfied tag there means the
+ * message must be *rejected*, because those cases assert a positive outcome and a
+ * reduced build must answer `INVALID` rather than read a truncated value. This
+ * function only reports which tags are unsatisfied; it is empty here either way,
+ * since this port ships one full-featured profile.
  */
 export function missingBlockCapabilities(c: { requires?: string[] }): string[] {
   return (c.requires ?? []).filter(
