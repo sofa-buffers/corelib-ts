@@ -11,7 +11,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { elementsEqual } from "../src/index.js";
+import { Long, elementsEqual, longElementsEqual } from "../src/index.js";
 
 describe("elementsEqual compares contents, not identity", () => {
   it("is true for distinct objects holding the same values", () => {
@@ -73,5 +73,51 @@ describe("elementsEqual follows === at the IEEE-754 corners", () => {
 
   it("treats -0 and 0 as equal, exactly as === does", () => {
     expect(elementsEqual([-0], [0])).toBe(true);
+  });
+});
+
+describe("longElementsEqual compares the 64-bit value, not the Long identity", () => {
+  // The defect it exists to prevent: a `Long` is an object, so `elementsEqual`'s
+  // `===` reports two arrays holding the same 64-bit values as unequal and the
+  // ≠-default test emits a field that should have been omitted. The wire is
+  // supposed to be canonical, and no vector catches this — the vectors say what a
+  // GIVEN message encodes to, not which fields a defaulted one should carry.
+  const one = () => [Long.fromBits(1, 2), Long.fromBits(3, 4)];
+
+  it("is true for distinct Long objects holding the same halves", () => {
+    expect(longElementsEqual(one(), one())).toBe(true);
+    // …which is exactly the case elementsEqual gets wrong, and why this exists.
+    expect(elementsEqual(one(), one())).toBe(false);
+  });
+
+  it("is true for the same array, and for two empties", () => {
+    const a = one();
+    expect(longElementsEqual(a, a)).toBe(true);
+    expect(longElementsEqual([], [])).toBe(true);
+  });
+
+  it("is false on a different length", () => {
+    expect(longElementsEqual(one(), [Long.fromBits(1, 2)])).toBe(false);
+    expect(longElementsEqual([], one())).toBe(false);
+  });
+
+  it("is false when either half differs", () => {
+    expect(longElementsEqual(one(), [Long.fromBits(9, 2), Long.fromBits(3, 4)])).toBe(false);
+    expect(longElementsEqual(one(), [Long.fromBits(1, 9), Long.fromBits(3, 4)])).toBe(false);
+    expect(longElementsEqual(one(), [Long.fromBits(1, 2), Long.fromBits(3, 9)])).toBe(false);
+  });
+
+  it("holds for Long.ZERO against a freshly built zero", () => {
+    // The generated shape: a zero default compared against a decoded array that
+    // happens to hold zeros. Sharing `Long.ZERO` must not be what makes it equal.
+    expect(longElementsEqual([Long.ZERO, Long.ZERO], [Long.fromBits(0, 0), new Long(0, 0)])).toBe(
+      true,
+    );
+  });
+
+  it("normalizes the halves the way Long does — -1 and 0xFFFFFFFF are one value", () => {
+    expect(longElementsEqual([Long.fromBits(-1, -1)], [Long.fromBits(0xffffffff, 0xffffffff)])).toBe(
+      true,
+    );
   });
 });

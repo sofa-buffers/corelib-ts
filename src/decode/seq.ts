@@ -1,6 +1,8 @@
 /**
  * Generated-layer support: the element collectors for a **wrapper-sequence array**
- * of `string` or `blob` (MESSAGE_SPEC §5.1).
+ * (MESSAGE_SPEC §5.1) — {@link ElementSeq} and {@link FramedSeq} for the index
+ * rules of any element kind, {@link StringSeq} / {@link BlobSeq} for the two leaf
+ * kinds whose payload arrives here as well.
  *
  * Static helper layer, not codec (CORELIB_PLAN §6.6.1): these allocate — that is
  * their job — and no codec path reaches them. Generated code drives them from
@@ -133,6 +135,41 @@ function requireReceiverBound(
 }
 
 /**
+ * **The** element-index rule, in one place: the schema `count` as validity, or —
+ * where the schema left the array open — the receiver cap as policy.
+ *
+ * Never both (CORELIB_PLAN §6.2.1): where the schema declared a `count` its
+ * violation is `INVALID`, a statement about the message, and the receiver cap
+ * beside it is inert; where it declared none the cap governs alone and its
+ * violation is `LIMIT_EXCEEDED`, a policy rejection of well-formed bytes.
+ *
+ * Written once and shared by every collector in this file, because §6.2.1 is a
+ * rule about *which* verdict a caller gets and a second copy is a second chance
+ * to get it wrong. Throws or returns; it never touches a container, which is what
+ * lets a caller run it before allocating anything (§7.2 item 8).
+ *
+ * @param id The element index, which for a wrapper array is the child field's id.
+ * @param cap The schema `count` as an index capacity, or {@link UNBOUNDED} (`-1`).
+ * @param receiverCap The receiver index cap, consulted only when `cap` is
+ * {@link UNBOUNDED}; already known to be finite and non-negative, because
+ * {@link requireReceiverBound} refused anything else at construction.
+ * @param name The schema field name, used only in the rejection message.
+ */
+function overIndex(id: number, cap: number, receiverCap: number, name: string): void {
+  if (cap >= 0) {
+    if (id >= cap) {
+      throw invalidMsgError(`${name}: array index above schema capacity ${cap}`);
+    }
+  } else if (id >= receiverCap) {
+    // A plain `>=`, and it is exact: the constructor already refused a
+    // `receiverCap` that is not a finite non-negative number, so there is no NaN
+    // comparison to fall through here and no unstated cap to misreport as a
+    // policy rejection (`requireReceiverBound`, §6.2.1/§6.3).
+    throw limitExceededError(`${name}: array index ${id} exceeds the receiver cap ${receiverCap}`);
+  }
+}
+
+/**
  * The slots of a wrapper-sequence array: the index rules of MESSAGE_SPEC §5.1 and
  * the two bounds of CORELIB_PLAN §6.2.1, once, for any element type.
  *
@@ -196,24 +233,109 @@ export class ElementSeq<T> {
    * place ({@link StringSeq.begin}).
    */
   checkIndex(id: number): void {
-    if (this.cap >= 0) {
-      if (id >= this.cap) {
-        throw invalidMsgError(`${this.name}: array index above schema capacity ${this.cap}`);
-      }
-    } else if (id >= this.receiverCap) {
-      // A plain `>=`, and it is exact: the constructor already refused a
-      // `receiverCap` that is not a finite non-negative number, so there is no
-      // NaN comparison to fall through here and no unstated cap to misreport as
-      // a policy rejection (`requireReceiverBound`, §6.2.1/§6.3).
-      throw limitExceededError(
-        `${this.name}: array index ${id} exceeds the receiver cap ${this.receiverCap}`,
-      );
-    }
+    overIndex(id, this.cap, this.receiverCap, this.name);
   }
 
   /** {@link reserve} the slot, then write `value` into it. A repeat replaces (§7.4). */
   place(id: number, value: T): void {
     this.reserve(id);
+    this.out[id] = value;
+  }
+}
+
+/**
+ * The slots of a wrapper-sequence array whose element default is a **fresh
+ * object**: a framed element (`struct` / `union`) or a nested row.
+ *
+ * {@link ElementSeq}'s twin, and it differs in exactly one thing — the gap value
+ * comes from a **factory** instead of being shared. That single axis is why it is
+ * a second class rather than a second argument: a framed element's default is
+ * `new Elem()` and a row's is `[]`, both mutable and both reachable by the
+ * caller, so one shared instance would alias every gap of the array onto it and —
+ * since an arriving element decodes into the slot the reservation placed — would
+ * alias every *element* onto it too, which is not a near miss but a flatly wrong
+ * decode. {@link ElementSeq}'s `""` and zero-length `Uint8Array` have no state to
+ * share, which is what makes sharing right there and wrong here.
+ *
+ * Everything else is {@link ElementSeq}, deliberately: the same argument order
+ * with `make` in `def`'s slot, the same two exclusive index bounds through the
+ * same `overIndex`, the same growth geometry, the same construction-time refusal
+ * of a receiver cap that states no cap.
+ *
+ * Generated code calls {@link reserve} at the element's own `sequenceBegin` and
+ * then keeps routing the child's fields into `out[id]` itself. This class owns
+ * the bound and the growth; it never owns the routing, which is the part that has
+ * a different shape for every schema (ARCHITECTURE §8).
+ *
+ * @param out The destination array; grown to `id + 1` as elements arrive.
+ * @param make Builds one element default. Called once per gap slot, and once for
+ * the reserved slot itself in {@link reserve} — never for a slot already present,
+ * so a re-opened element keeps the object earlier fields decoded into.
+ * @param cap The schema `count` as an index capacity: `id >= cap` is `INVALID`
+ * (§7.1) — a statement about validity. Pass {@link UNBOUNDED} (`-1`) for an array
+ * the schema left open, where `receiverCap` governs instead.
+ * @param name The schema field name, used only in a rejection message.
+ * @param receiverCap The receiver-side index cap for a schema-unbounded array
+ * (§6.2.1): `id >= receiverCap` is `LIMIT_EXCEEDED`, a policy rejection, never
+ * `INVALID`, and never applied beside a `cap` the schema stated. **Required, with
+ * no default**; a value that states no cap at all is `Argument` at construction
+ * ({@link requireReceiverBound}).
+ */
+export class FramedSeq<T> {
+  constructor(
+    readonly out: T[],
+    readonly make: () => T,
+    readonly cap: number,
+    readonly name: string,
+    readonly receiverCap: number,
+  ) {
+    requireReceiverBound(cap, receiverCap, "the receiver array-index cap", name);
+  }
+
+  /**
+   * The two index bounds, without growing — see {@link ElementSeq.checkIndex}.
+   *
+   * Split out for the same reason it is there: a caller may have a second bound
+   * to take before anything is allocated. A native matrix row is that case in this
+   * port — its element `count` is rejected at the array header, and §7.2 item 8
+   * wants that rejection to leave the row container exactly as it was.
+   */
+  checkIndex(id: number): void {
+    overIndex(id, this.cap, this.receiverCap, this.name);
+  }
+
+  /**
+   * Bound-check `id`, **then** grow `out` to `id + 1`, each new slot its own
+   * `make()`.
+   *
+   * The order is §7.2 item 8's "after a rejected id the container is not left
+   * partially extended": a rejection leaves `out` exactly as it was, so a lower id
+   * delivered afterwards still lands at its own index. A slot already present is
+   * left alone — a re-opened `struct` / `union` element merges into the object it
+   * already built, which is what §7.4's last-occurrence-wins means for a scope
+   * whose value *is* the scope.
+   */
+  reserve(id: number): void {
+    this.checkIndex(id);
+    // Grow to at least id + 1 (ARCHITECTURE §9.5 shape B): `push` leaves the
+    // geometry to the engine's own amortised doubling, so a sparse array does not
+    // cost O(n²) copies.
+    while (this.out.length <= id) this.out.push(this.make());
+  }
+
+  /**
+   * Bound-check `id`, fill the gap below it, then write `value` into the slot —
+   * what a nested **row** needs, an array wrapper *replacing* whatever an earlier
+   * opening built at that index (§7.4) rather than merging into it.
+   *
+   * The gap fill stops one short of `id` on purpose: the slot is about to be
+   * overwritten, so calling `make()` for it would allocate an element default
+   * nobody ever reads. Assigning at `out.length` extends the array by exactly one,
+   * which is the same array a {@link reserve} would have left.
+   */
+  place(id: number, value: T): void {
+    this.checkIndex(id);
+    while (this.out.length < id) this.out.push(this.make());
     this.out[id] = value;
   }
 }

@@ -620,3 +620,65 @@ describe("what a collector must not treat as an element", () => {
     expect(strings(wire)).toStrictEqual(["a", "", "c"]);
   });
 });
+
+describe("the element maxlen, called directly at the length word", () => {
+  // The bound checks above go through real wire bytes, where the point is WHEN
+  // the verdict lands. Here the collector brings its own container and is called
+  // with nothing but a length word, where the point is that the verdict does not
+  // need a payload at all: §5.2 decides an element's length bound at its fixlen
+  // word, before a single payload byte, so a message that ends INSIDE an
+  // over-long element is still INVALID rather than degrading to INCOMPLETE.
+  const acc = () => new PayloadAcc();
+
+  /** The code thrown by `fn`, or `undefined` if it returned. */
+  function codeOf(fn: () => unknown): SofabErrorCode | undefined {
+    try {
+      fn();
+      return undefined;
+    } catch (e) {
+      expect(e).toBeInstanceOf(SofabError);
+      return (e as SofabError).code;
+    }
+  }
+
+  it("rejects a schema-bounded element over maxlen as INVALID, with nothing placed", () => {
+    const out: string[] = [];
+    const ss = new StringSeq(out, acc(), NONE, 4, "tags", WIDE_INDEX, WIDE_LEN);
+    ss.begin(0, FixlenSubtype.String, 4); // at the bound: accepted
+    expect(codeOf(() => ss.begin(0, FixlenSubtype.String, 5))).toBe(SofabErrorCode.InvalidMsg);
+    expect(out).toStrictEqual([]); // the length word alone places nothing
+
+    const bs = new BlobSeq([], acc(), NONE, 4, "chunks", WIDE_INDEX, WIDE_LEN);
+    expect(codeOf(() => bs.begin(0, FixlenSubtype.Blob, 5))).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  it("rejects a schema-unbounded element over the receiver cap as LIMIT_EXCEEDED", () => {
+    // §6.2.1's other half: where the schema declared no maxlen the receiver's cap
+    // governs, and its breach is a policy rejection of well-formed bytes.
+    const ss = new StringSeq([], acc(), NONE, NONE, "tags", WIDE_INDEX, 4);
+    expect(codeOf(() => ss.begin(0, FixlenSubtype.String, 4))).toBeUndefined();
+    expect(codeOf(() => ss.begin(0, FixlenSubtype.String, 5))).toBe(SofabErrorCode.LimitExceeded);
+
+    const bs = new BlobSeq([], acc(), NONE, NONE, "chunks", WIDE_INDEX, 4);
+    expect(codeOf(() => bs.begin(0, FixlenSubtype.Blob, 5))).toBe(SofabErrorCode.LimitExceeded);
+  });
+
+  it("never applies the receiver cap beside a maxlen the schema stated", () => {
+    // A cap is exclusive with its schema sibling, not additive.
+    const ss = new StringSeq([], acc(), NONE, 64, "tags", WIDE_INDEX, 4);
+    expect(codeOf(() => ss.begin(0, FixlenSubtype.String, 64))).toBeUndefined();
+    expect(codeOf(() => ss.begin(0, FixlenSubtype.String, 65))).toBe(SofabErrorCode.InvalidMsg);
+  });
+
+  it("checks the index at the length word too, before any payload arrives", () => {
+    const out: string[] = [];
+    const ss = new StringSeq(out, acc(), 2, 16, "tags", WIDE_INDEX, WIDE_LEN);
+    expect(codeOf(() => ss.begin(2, FixlenSubtype.String, 1))).toBe(SofabErrorCode.InvalidMsg);
+    expect(out).toStrictEqual([]);
+  });
+
+  it("leaves an element of the wrong fixlen subtype alone — §7.3 skips, not rejects", () => {
+    const ss = new StringSeq([], acc(), NONE, 1, "tags", WIDE_INDEX, WIDE_LEN);
+    expect(codeOf(() => ss.begin(0, FixlenSubtype.Blob, 9_999))).toBeUndefined();
+  });
+});
