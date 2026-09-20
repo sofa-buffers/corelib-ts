@@ -347,3 +347,61 @@ describe("the rejection names the field", () => {
     );
   });
 });
+
+describe("a native matrix row: the shape that SHOULD share its gap value", () => {
+  // The twin of the first describe, and the reason there are two classes rather
+  // than one. A native matrix row is a typed array, and the module-level
+  // zero-length instance generated code pads with holds nothing, drops an indexed
+  // store and cannot be grown — so one instance may fill every gap, and
+  // `ElementSeq` is what a row like that takes.
+  //
+  // Generated code drives it in two steps rather than one, because a row has a
+  // SECOND bound — its element count, announced in the array header — and §7.2
+  // item 8 wants a rejection by either bound to leave the matrix exactly as it
+  // was. So the index is checked first (`checkIndex`), the count next, and only
+  // then is the row allocated and placed (`place`).
+  const EMPTY = new Uint32Array(0);
+
+  it("fills every gap with the one shared instance", () => {
+    const rows: Uint32Array[] = [];
+    const seq = new ElementSeq<Uint32Array>(rows, EMPTY, 4, "cells", WIDE_INDEX);
+    seq.place(2, Uint32Array.of(7, 8));
+
+    expect(rows).toHaveLength(3);
+    expect(rows[0]).toBe(EMPTY); // identity, not structure: sharing is intended here
+    expect(rows[1]).toBe(EMPTY);
+    expect(Array.from(rows[2]!)).toStrictEqual([7, 8]);
+  });
+
+  it("replaces a row a second header opens at the same index (§7.4)", () => {
+    const rows: Uint32Array[] = [];
+    const seq = new ElementSeq<Uint32Array>(rows, EMPTY, 4, "cells", WIDE_INDEX);
+    seq.place(0, Uint32Array.of(1));
+    seq.place(0, Uint32Array.of(2, 3));
+
+    expect(rows).toHaveLength(1);
+    expect(Array.from(rows[0]!)).toStrictEqual([2, 3]);
+  });
+
+  it("checkIndex takes the index verdict without touching the matrix", () => {
+    const rows: Uint32Array[] = [];
+    const seq = new ElementSeq<Uint32Array>(rows, EMPTY, 2, "cells", WIDE_INDEX);
+
+    expect(codeOf(() => seq.checkIndex(1))).toBeUndefined();
+    expect(rows).toStrictEqual([]); // accepted, and STILL nothing placed
+    expect(codeOf(() => seq.checkIndex(2))).toBe(SofabErrorCode.InvalidMsg);
+    expect(rows).toStrictEqual([]);
+
+    // ...so a row rejected by the count bound that runs between checkIndex and
+    // place leaves the matrix empty too, and a lower row id still lands.
+    seq.place(0, Uint32Array.of(9));
+    expect(rows).toHaveLength(1);
+  });
+
+  it("gives the two calls the same verdict, from the same rule", () => {
+    const seq = new ElementSeq<Uint32Array>([], EMPTY, UNBOUNDED, "cells", 3);
+    expect(codeOf(() => seq.checkIndex(3))).toBe(SofabErrorCode.LimitExceeded);
+    expect(codeOf(() => seq.place(3, EMPTY))).toBe(SofabErrorCode.LimitExceeded);
+    expect(codeOf(() => seq.reserve(3))).toBe(SofabErrorCode.LimitExceeded);
+  });
+});
