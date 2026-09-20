@@ -14,6 +14,8 @@
  * into every generated package (ARCHITECTURE §8).
  */
 
+import type { Long } from "../long.js";
+
 /**
  * Element-wise equality for two array-likes: same length, and `===` at every
  * index. Covers what a leaf array field can hold — `Uint8Array` (blob), and
@@ -32,5 +34,30 @@
 export function elementsEqual(a: ArrayLike<unknown>, b: ArrayLike<unknown>): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/**
+ * The {@link Long} flavour of {@link elementsEqual}: same length, and the same
+ * 64-bit value at every index.
+ *
+ * A separate function rather than an argument to the one above, because the
+ * comparison itself is different. A `Long` is an *object identity* — two
+ * instances holding the same 64 bits are `!==` — so `elementsEqual`'s `===` would
+ * report every `Long`-backed array as unequal to its schema default and the
+ * ≠-default test (MESSAGE_SPEC §2) would emit a field that should have been
+ * omitted. Comparing the `(low, high)` halves is what "same value" means for this
+ * representation, and it is the only 64-bit representation that needs it:
+ * `bigint` and `number` elements are values already and go through
+ * {@link elementsEqual}.
+ *
+ * Which arrays are handed over is the declared type's business, so there is no
+ * schema in here either (ARCHITECTURE §8).
+ */
+export function longElementsEqual(a: ArrayLike<Long>, b: ArrayLike<Long>): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i]!.low !== b[i]!.low || a[i]!.high !== b[i]!.high) return false;
+  }
   return true;
 }

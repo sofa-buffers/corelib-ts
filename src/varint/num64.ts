@@ -109,6 +109,39 @@ export function fp32FromBits(bits: number): number {
   return SCRATCH_F32[0]!;
 }
 
+/**
+ * Write the four little-endian wire bytes of an fp32's 32-bit word (byte `k` in
+ * bits `8*k`) to `out[off .. off+3]`.
+ *
+ * Generated-layer support, not a codec path: an `fp32` field whose value is a
+ * `NaN` cannot be re-encoded from the `number` a JS host stored it in — the host
+ * normalizes the payload bits — so the generated message keeps the four raw wire
+ * bytes beside the value and re-emits those (MESSAGE_SPEC §6.5). What the decoder
+ * hands over is the 32-bit *word*, because a number costs nothing to pass where
+ * the byte view it replaced was an allocation per value and a borrowed slice
+ * §6.7 forbids; turning that word back into bytes is this function, and it is the
+ * same four shifts for every schema (ARCHITECTURE §8).
+ *
+ * The caller owns `out` and its bounds: this writes four bytes and reads nothing.
+ */
+export function fp32RawInto(out: Uint8Array, off: number, bits: number): void {
+  out[off] = bits & 0xff;
+  out[off + 1] = (bits >>> 8) & 0xff;
+  out[off + 2] = (bits >>> 16) & 0xff;
+  out[off + 3] = (bits >>> 24) & 0xff;
+}
+
+/**
+ * The scalar flavour of {@link fp32RawInto}: a fresh 4-byte companion holding one
+ * fp32 word's wire image. Built only for the value that needs one, so the
+ * allocation is per `NaN` and not per field.
+ */
+export function fp32RawBytes(bits: number): Uint8Array {
+  const out = new Uint8Array(4);
+  fp32RawInto(out, 0, bits);
+  return out;
+}
+
 /** Reinterpret the 8 little-endian wire bytes of an fp64, packed into two words. */
 export function fp64FromBits(lo: number, hi: number): number {
   // The two halves go to the host's own half order (`LO`/`HI`, probed once).

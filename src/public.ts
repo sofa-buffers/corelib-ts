@@ -43,8 +43,9 @@ export type {
 // knows a schema — a capacity, a maxlen or a payload length is an argument.
 export { decodeUtf8 } from "./decode/text.js";
 export { PayloadAcc } from "./decode/acc.js";
-export { BlobSeq, ElementSeq, StringSeq, UNBOUNDED } from "./decode/seq.js";
-export { elementsEqual } from "./encode/equal.js";
+export { BlobSeq, ElementSeq, FramedSeq, StringSeq, UNBOUNDED } from "./decode/seq.js";
+export { elementsEqual, longElementsEqual } from "./encode/equal.js";
+export { fp32RawBytes, fp32RawInto } from "./varint/num64.js";
 
 export { getKernel, setKernel } from "./backend/kernel.js";
 export type { Kernel } from "./backend/kernel.js";

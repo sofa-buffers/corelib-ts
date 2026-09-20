@@ -19,6 +19,8 @@ import {
   IStream,
   OStream,
   decode,
+  fp32RawBytes,
+  fp32RawInto,
   type Visitor, growingOStream } from "../src/index.js";
 import { bytesToHex } from "./helpers/hex.js";
 import { TranscodeVisitor } from "./helpers/recording-visitor.js";
@@ -227,4 +229,53 @@ describe("the fp32 bits survive encoder use during the callback", () => {
       expect(bytesToHex(out.bytes()).endsWith("0100807f")).toBe(true);
     });
   }
+});
+
+describe("fp32RawInto / fp32RawBytes — the generated layer's raw companion (§6.5)", () => {
+  // The other half of the same story. A generated message stores an `fp32` in a
+  // JS `number`, which cannot hold a signaling NaN's payload, so it keeps the
+  // four raw wire bytes beside the value and re-emits those. What the visitor
+  // hands over is the 32-bit WORD — a number costs nothing to pass, where the
+  // byte view it replaced was an allocation per value and a borrowed slice §6.7
+  // forbids — so turning that word back into bytes is this pair.
+
+  it("writes the word little-endian, byte k in bits 8*k", () => {
+    const out = new Uint8Array(4);
+    fp32RawInto(out, 0, 0x7f800001);
+    expect([...out]).toStrictEqual([...FP32_SNAN]);
+  });
+
+  it("writes at the offset and touches nothing else", () => {
+    const out = new Uint8Array(8).fill(0xaa);
+    fp32RawInto(out, 2, 0x40490fd0);
+    expect([...out]).toStrictEqual([0xaa, 0xaa, 0xd0, 0x0f, 0x49, 0x40, 0xaa, 0xaa]);
+  });
+
+  it("keeps the sign bit — the word arrives as a signed 32-bit number", () => {
+    // `Visitor.fp32`'s `bits` is an int32, so 0xFFC00000 arrives as a negative
+    // number. `>>> 8` on a negative operand is the unsigned shift for exactly
+    // this reason; a signed `>>` would smear the sign into bytes 1..3.
+    const out = new Uint8Array(4);
+    fp32RawInto(out, 0, 0xffc00000 | 0);
+    expect([...out]).toStrictEqual([...FP32_NEG_QNAN]);
+    expect([...fp32RawBytes(-1)]).toStrictEqual([0xff, 0xff, 0xff, 0xff]);
+  });
+
+  it("gives each call its own 4 bytes — no shared scratch", () => {
+    // A shared buffer would make two companions in one message alias each other,
+    // and §6.7 forbids handing out a view into anything the library reuses.
+    const a = fp32RawBytes(0x7f800001);
+    const b = fp32RawBytes(0x40490fd0);
+    expect(a).not.toBe(b);
+    expect(a).toHaveLength(4);
+    expect([...a]).toStrictEqual([...FP32_SNAN]);
+    expect([...b]).toStrictEqual([0xd0, 0x0f, 0x49, 0x40]);
+  });
+
+  it("round-trips every fp32 bit pattern this file names", () => {
+    for (const wire of [FP32_SNAN, FP32_QNAN, FP32_NEG_QNAN, FP32_NORMAL]) {
+      const bits = new DataView(wire.buffer, wire.byteOffset, 4).getInt32(0, true);
+      expect([...fp32RawBytes(bits)]).toStrictEqual([...wire]);
+    }
+  });
 });

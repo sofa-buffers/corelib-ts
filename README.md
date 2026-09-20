@@ -680,9 +680,10 @@ Who owns the bytes:
   it is written, it and everything after it are not. This is the only reference the
   decoder keeps into your storage between calls.
 - **The static helper layer allocates, on your behalf.** `PayloadAcc`,
-  `ElementSeq`, `StringSeq`, `BlobSeq`, `decodeUtf8` and `elementsEqual` are the
-  generated layer's code shipped here for reuse (ARCHITECTURE §8), not part of the
-  codec: the codec never calls them, and they allocate the values they build.
+  `ElementSeq`, `FramedSeq`, `StringSeq`, `BlobSeq`, `decodeUtf8`, `elementsEqual`,
+  `longElementsEqual` and `fp32RawInto` / `fp32RawBytes` are the generated layer's
+  code shipped here for reuse (ARCHITECTURE §8), not part of the codec: the codec
+  never calls them, and they allocate the values they build.
 - **String validity is checked where a string is materialized** (§6.4.5).
   JavaScript strings are a Unicode type, so this port is always strict — but a
   `string` payload piece is *raw wire bytes* and is not validated (it may end
@@ -699,9 +700,15 @@ Who owns the bytes:
   one accumulator per decoder, since only one payload is ever in flight — and
   returns storage of its own that aliases nothing, on the whole-payload path exactly
   as on the split one. `StringSeq` / `BlobSeq` collect the elements of a `string` /
-  `blob` wrapper array and `ElementSeq` holds the index rules for any element kind
-  (index bound, gap fill, last-write-wins); `elementsEqual` is the array form of the
-  omit-if-default test an encoder applies before writing a field.
+  `blob` wrapper array; `ElementSeq` holds the index rules for any element kind
+  (index bound, gap fill, last-write-wins) and `FramedSeq` is its twin for an element
+  whose default is a fresh object — a `struct`, a `union`, a nested row — where one
+  shared default would alias every gap of the array onto a single instance;
+  `elementsEqual` (and `longElementsEqual`, for `Long`-backed 64-bit arrays, whose
+  elements are object identities) is the array form of the omit-if-default test an
+  encoder applies before writing a field; `fp32RawInto` / `fp32RawBytes` turn the
+  32-bit word `Visitor.fp32` hands over back into the four wire bytes a generated
+  message keeps beside an `fp32` it cannot re-encode from a `number` (§6.5).
 
 ### Receiver limits
 
@@ -728,7 +735,7 @@ raised against ceilings nobody had configured.
 |---|---|---|
 | `max_dyn_array_count` on an array field | generated code | its own `arrayBegin` |
 | `max_dyn_string_len` / `max_dyn_blob_len` on a `string` / `blob` field | generated code | its own `fixlenBegin` |
-| the element **index** of a wrapper array | generated code | `StringSeq` / `BlobSeq` / `ElementSeq`, from `receiverCap` |
+| the element **index** of a wrapper array | generated code | `StringSeq` / `BlobSeq` / `ElementSeq` / `FramedSeq`, from `receiverCap` |
 | the element **byte length** of a wrapper array | generated code | `StringSeq` / `BlobSeq`, from `receiverElemMax` |
 
 §6.2.1 permits the comparison to run inside the corelib — "A corelib **MAY** take a
@@ -743,6 +750,8 @@ go to the collector, never to the generated visitor. Every one of their bounds i
 new StringSeq(  out, new PayloadAcc(), UNBOUNDED, UNBOUNDED, "tags", 65_536, 1 << 20);
 new BlobSeq(    out, new PayloadAcc(), 8,         4096,      "parts", 65_536, 1 << 20);
 new ElementSeq( out, defaultElem,      UNBOUNDED, "rows",   65_536);
+//              out, make,             count,     name,     receiverCap
+new FramedSeq(  out, () => new Elem(), 8,         "codes",  65_536);
 ```
 
 Each pair is **exclusive**, never additive (§6.2.1: a cap "**MUST NOT** be applied to
