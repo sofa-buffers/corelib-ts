@@ -817,9 +817,9 @@ shared suite it actually executed, and a file that arrived truncated or a group
 gated out by `requires` shows up as a smaller number rather than as silence. This
 port compiles no feature out, so nothing is ever gated.
 
-`assets/test_vectors.json` carries six blocks, of which this port runs five:
-`vectors`, `invalid_utf8`, `sequence_growth`, `header_limits` and
-`boolean_tolerant` (`header_limits_nested` is the sixth, not yet adopted here). The file is a
+`assets/test_vectors.json` carries six blocks and this port runs all six:
+`vectors`, `invalid_utf8`, `sequence_growth`, `header_limits`,
+`header_limits_nested` and `boolean_tolerant`. The file is a
 **verbatim** copy of the one in `corelib-c-cpp`, which authors it. A daily CI job (`.github/workflows/shared-vectors.yml`) compares this copy's sha256 against that file on `corelib-c-cpp@main`, so a copy left behind by an upstream change is reported rather than going unnoticed.
 
 `sequence_growth` holds the wrapper-array growth cases of §7.2 item 8, replayed by
@@ -842,6 +842,18 @@ word. Every rejection case is paired with an in-cap control that must still answ
 `incomplete`, and the block is also run with the ceilings lifted — where all six
 rejections fall back to `incomplete`, since this port's `FIXLEN_MAX` (`INT32_MAX`)
 sits above even the amplification case's 1 GiB claim.
+
+`header_limits_nested` is that same assertion one or two sequence frames deeper,
+replayed by `header-limits-nested.test.ts` — the axis the flat block leaves
+untested, since every case there sits at the top level. Its cases open a sequence,
+declare the over-ceiling word inside it and end with the frame **still open**, so a
+decoder has a second, independent reason to answer `incomplete` and a port that
+binds its ceiling to the top-level scope looks plausible while capping nothing. The
+runner descends the `frames` chain outermost first, applies the **same leaf** the
+flat block uses (`test/helpers/header-limits.ts`) at the innermost depth, and runs a
+negative control over every rejection with that case's own kind of ceiling lifted to
+65536: all four then answer `incomplete` instead, which is what shows the verdict was
+the ceiling's rather than an unclosed frame's. All 8 cases run, none gated.
 
 `boolean_tolerant` holds §4.4's decode half — bytes carrying `2`, `256` or `2^64-1`
 at a boolean position — replayed by `boolean-tolerant.test.ts`. No conforming
