@@ -41,6 +41,11 @@
  * stand-in, and what the block actually pins is the enforcement *point*: delay
  * either event past the payload and every case in this file fails.
  *
+ * **The leaf is shared.** The ceiling comparison itself lives in
+ * `helpers/header-limits.ts`, because `header-limits-nested.test.ts` runs the same
+ * assertion one or two sequence frames deeper and the two blocks are required to
+ * differ in *where the field arrives* and in nothing else.
+ *
  * The wrapper-array twin of the same rule — where the bound is the element index,
  * which has no header word — is `sequence-growth.test.ts`.
  */
@@ -48,14 +53,23 @@
 import { describe, expect, it } from "vitest";
 import {
   DecodeStatus,
-  FixlenSubtype,
   IStream,
   SofabError,
   SofabErrorCode,
   type FeedStatus,
-  type Visitor,
 } from "../src/index.js";
-import { hexToBytes } from "./helpers/hex.js";
+import {
+  CODE,
+  ceilingLeaf,
+  ceilingOf,
+  chunksOf,
+  emptyDestination,
+  isEmpty,
+  promisedPayload,
+  type Ceiling,
+  type Destination,
+  type Event,
+} from "./helpers/header-limits.js";
 import { reportingTally } from "./helpers/vector-tally.js";
 import {
   loadHeaderLimitCases,
@@ -67,128 +81,24 @@ import {
 const cases = loadHeaderLimitCases();
 const tally = reportingTally("header-limits");
 
-/** The error code each stated outcome must arrive under (§6.3 keeps the two apart). */
-const CODE = {
-  limit_exceeded: SofabErrorCode.LimitExceeded,
-  invalid: SofabErrorCode.InvalidMsg,
-} as const;
-
-/**
- * The ceiling a case configures, in the shape the generated layer would hold it:
- * a receiver cap on one declared quantity, or the schema's own bound.
- */
-type Ceiling =
-  | { kind: "cap"; on: "string" | "blob" | "array"; limit: number }
-  | { kind: "schema"; limit: number };
-
-/** Read the case's stated ceiling — exactly one, which the loader already enforced. */
-function ceilingOf(c: HeaderLimitCase): Ceiling {
-  if (c.schema !== undefined) return { kind: "schema", limit: c.schema.maxlen! };
-  const l = c.limits!;
-  if (l.max_dyn_string_len !== undefined) {
-    return { kind: "cap", on: "string", limit: l.max_dyn_string_len };
-  }
-  if (l.max_dyn_blob_len !== undefined) return { kind: "cap", on: "blob", limit: l.max_dyn_blob_len };
-  if (l.max_dyn_array_count !== undefined) {
-    return { kind: "cap", on: "array", limit: l.max_dyn_array_count };
-  }
-  throw new Error(`${c.name}: limits states no cap this reader knows`);
-}
-
-/** What the visitor was told, in order — the header word first, payload after it. */
-type Event =
-  | { at: "fixlenBegin"; id: number; subtype: FixlenSubtype; declared: number }
-  | { at: "arrayBegin"; id: number; declared: number }
-  | { at: "payload" };
-
-/**
- * The generated layer's stand-in: the case's ceiling, compared where §6.2.1 puts
- * the comparison — inside the visitor, at the header word.
- *
- * `ceiling` is `null` for the **negative control**, which runs the identical bytes
- * with no ceiling configured at all. A schema bound is applied only to a subtype
- * that carries a byte length (§7.3: a field whose subtype contradicts the schema is
- * skipped, not rejected), and a receiver cap only to the quantity it names — a port
- * can wire the string cap and miss the blob one, which is why §6.2.1 keeps them
- * separate and why the block asserts both.
- */
-function generatedGuard(c: HeaderLimitCase, log: Event[], ceiling: Ceiling | null): Visitor {
-  const payload = (): void => void log.push({ at: "payload" });
-  return {
-    fixlenBegin(id, subtype, total) {
-      log.push({ at: "fixlenBegin", id, subtype, declared: total });
-      if (id !== c.field_id || ceiling === null) return;
-      const isBytes = subtype === FixlenSubtype.String || subtype === FixlenSubtype.Blob;
-      if (ceiling.kind === "schema") {
-        if (isBytes && total > ceiling.limit) {
-          throw new SofabError(
-            SofabErrorCode.InvalidMsg,
-            `field ${id}: declared length ${total} above schema maxlen ${ceiling.limit}`,
-          );
-        }
-        return;
-      }
-      const capped =
-        (ceiling.on === "string" && subtype === FixlenSubtype.String) ||
-        (ceiling.on === "blob" && subtype === FixlenSubtype.Blob);
-      if (capped && total > ceiling.limit) {
-        throw new SofabError(
-          SofabErrorCode.LimitExceeded,
-          `field ${id}: declared length ${total} exceeds the receiver cap ${ceiling.limit}`,
-        );
-      }
-    },
-    arrayBegin(id, _kind, count) {
-      log.push({ at: "arrayBegin", id, declared: count });
-      if (id !== c.field_id || ceiling === null) return;
-      if (ceiling.kind === "cap" && ceiling.on === "array" && count > ceiling.limit) {
-        throw new SofabError(
-          SofabErrorCode.LimitExceeded,
-          `field ${id}: declared count ${count} exceeds the receiver cap ${ceiling.limit}`,
-        );
-      }
-    },
-    string: payload,
-    blob: payload,
-    // An array's elements reach a visitor only through the hand-off, which is
-    // offered *after* `arrayBegin` — so being offered it at all is this log's
-    // "the payload was entered", and a cap that fired above must prevent it.
-    arrayBulk: () => {
-      payload();
-      return null;
-    },
-  };
-}
-
-/** The case's bytes, as the chunks it asks to be fed in (one chunk by default). */
-function chunksOf(c: HeaderLimitCase): Uint8Array[] {
-  return (c.chunks ?? [c.serialized]).map(hexToBytes);
-}
-
 /** Feed one case and report what came back — a status, or the rejection it threw. */
 function run(
   c: HeaderLimitCase,
   ceiling: Ceiling | null,
   log: Event[],
-): { stream: IStream; status?: FeedStatus; error?: SofabError } {
-  const stream = new IStream(generatedGuard(c, log, ceiling));
+  dest: Destination = emptyDestination(),
+): { stream: IStream; dest: Destination; status?: FeedStatus; error?: SofabError } {
+  const stream = new IStream(ceilingLeaf(c, log, ceiling, dest));
   const chunks = chunksOf(c);
   if (chunks.length === 0) throw new Error(`${c.name}: nothing to feed`);
   try {
     let status = stream.feed(chunks[0]!);
     for (let i = 1; i < chunks.length; i++) status = stream.feed(chunks[i]!);
-    return { stream, status };
+    return { stream, dest, status };
   } catch (e) {
-    if (e instanceof SofabError) return { stream, error: e };
+    if (e instanceof SofabError) return { stream, dest, error: e };
     throw e;
   }
-}
-
-/** The payload the header promised, for the further feed a terminal rejection must refuse. */
-function promisedPayload(c: HeaderLimitCase): Uint8Array {
-  // Capped: `header_string_amplification` claims a gibibyte, and the assertion is
-  // that not one byte of it is consumed — a few of them prove that as well as 2^30.
-  return new Uint8Array(Math.min(c.declared, 64)).fill(0x61);
 }
 
 const rejections = cases.filter((c) => c.expect.outcome !== "incomplete");
@@ -272,7 +182,7 @@ describe("header ceilings (§6.2.1, §6.3)", () => {
         // byte consumed and no visitor method driven — which is what makes the
         // verdict a statement about the message rather than about this chunk.
         const log: Event[] = [];
-        const { stream, error } = run(c, ceilingOf(c), log);
+        const { stream, dest, error } = run(c, ceilingOf(c), log);
         expect(error).toBeInstanceOf(SofabError);
         const before = log.length;
 
@@ -282,6 +192,10 @@ describe("header ceilings (§6.2.1, §6.3)", () => {
           );
         }
         expect(log).toHaveLength(before);
+        // §6.2.1 is "rejected, never clamped": a decoder that truncated to the
+        // ceiling and reported the error anyway would pass every assertion above.
+        // Checked *after* the further feed, so a late materialization is caught.
+        expect(isEmpty(dest), `${c.name}: materialized past a rejected ceiling`).toBe(true);
         tally.check();
       });
     });

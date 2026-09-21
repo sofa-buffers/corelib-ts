@@ -344,38 +344,102 @@ export interface HeaderLimitCase {
  */
 export function loadHeaderLimitCases(): HeaderLimitCase[] {
   const doc = readVectorFile() as unknown as { header_limits?: HeaderLimitCase[] };
-  return (doc.header_limits ?? []).map((c, i) => {
-    const where = `header_limits ${c.name ?? `#${i}`}`;
-    const out: HeaderLimitCase = {
-      ...c,
-      field_id: asIndex(`${where}.field_id`, c.field_id),
-      declared: asIndex(`${where}.declared`, c.declared),
-    };
-    if (c.limits !== undefined) {
-      const limits: HeaderLimitCase["limits"] = {};
-      for (const key of ["max_dyn_string_len", "max_dyn_blob_len", "max_dyn_array_count"] as const) {
-        const v = c.limits[key];
-        if (v !== undefined) limits[key] = asIndex(`${where}.limits.${key}`, v);
-      }
-      // An unrecognised cap key would leave the case running with no ceiling at
-      // all and passing on the fallback outcome, so it is a load failure.
-      if (Object.keys(limits).length !== Object.keys(c.limits).length) {
-        throw new Error(`${where}: unknown receiver cap in limits (${Object.keys(c.limits).join(", ")})`);
-      }
-      out.limits = limits;
+  return (doc.header_limits ?? []).map((c, i) =>
+    normalizeHeaderLimitCase(c, `header_limits ${c.name ?? `#${i}`}`),
+  );
+}
+
+/**
+ * Narrow one header-ceiling case's numbers and check the invariants both blocks
+ * share — shared by {@link loadHeaderLimitCases} and
+ * {@link loadNestedHeaderLimitCases}, because `header_limits_nested` differs from
+ * `header_limits` in exactly one key and must not drift in any other.
+ */
+function normalizeHeaderLimitCase<T extends HeaderLimitCase>(c: T, where: string): T {
+  const out: T = {
+    ...c,
+    field_id: asIndex(`${where}.field_id`, c.field_id),
+    declared: asIndex(`${where}.declared`, c.declared),
+  };
+  if (c.limits !== undefined) {
+    const limits: HeaderLimitCase["limits"] = {};
+    for (const key of ["max_dyn_string_len", "max_dyn_blob_len", "max_dyn_array_count"] as const) {
+      const v = c.limits[key];
+      if (v !== undefined) limits[key] = asIndex(`${where}.limits.${key}`, v);
     }
-    if (c.schema !== undefined) {
-      if (c.schema.maxlen === undefined) {
-        throw new Error(`${where}: schema states no maxlen`);
-      }
-      out.schema = { maxlen: asIndex(`${where}.schema.maxlen`, c.schema.maxlen) };
+    // An unrecognised cap key would leave the case running with no ceiling at
+    // all and passing on the fallback outcome, so it is a load failure.
+    if (Object.keys(limits).length !== Object.keys(c.limits).length) {
+      throw new Error(`${where}: unknown receiver cap in limits (${Object.keys(c.limits).join(", ")})`);
     }
-    // "Never both" is §6.2.1's rule, and a case that broke it would quietly test
-    // whichever ceiling the reader happened to consult first.
-    if ((out.limits === undefined) === (out.schema === undefined)) {
-      throw new Error(`${where}: exactly one of limits / schema must be stated`);
+    out.limits = limits;
+  }
+  if (c.schema !== undefined) {
+    if (c.schema.maxlen === undefined) {
+      throw new Error(`${where}: schema states no maxlen`);
     }
-    return out;
+    out.schema = { maxlen: asIndex(`${where}.schema.maxlen`, c.schema.maxlen) };
+  }
+  // "Never both" is §6.2.1's rule, and a case that broke it would quietly test
+  // whichever ceiling the reader happened to consult first.
+  if ((out.limits === undefined) === (out.schema === undefined)) {
+    throw new Error(`${where}: exactly one of limits / schema must be stated`);
+  }
+  return out;
+}
+
+/**
+ * A **nested** header-ceiling case (top-level `header_limits_nested`) — the flat
+ * {@link HeaderLimitCase} with one key added, and asserting one axis more.
+ *
+ * Every case in `header_limits` puts its field at the top level, so the identical
+ * over-ceiling header delivered **inside an open sequence** goes untested there.
+ * This block is that axis and only that axis: same key set, same outcome
+ * vocabulary, same terminality rule, same pairing of each rejection with an in-cap
+ * control — one or two frames deeper.
+ *
+ * It is a separate top-level block deliberately. Its byte strings begin with a
+ * sequence header, so a runner that does not read {@link frames} would bind its
+ * ceiling at the top level, cap nothing, and answer `incomplete` where the case
+ * demands `limit_exceeded`; folding these into `header_limits` would turn every
+ * port red before it could act, where an unknown top-level block is simply ignored
+ * by an older consumer.
+ *
+ * The cases also close no frame and deliver no payload, which gives a decoder a
+ * **second, independent reason** to answer `incomplete` — so the negative control
+ * in `header-limits-nested.test.ts` is not a nicety here: it is the only thing that
+ * separates "the ceiling fired" from "something else refused an unclosed frame".
+ */
+export interface NestedHeaderLimitCase extends HeaderLimitCase {
+  /**
+   * The chain of **sequence field ids** the target field is nested in, outermost
+   * first and never empty: `[7]` is a sequence opened at id 7 in the top-level
+   * scope with the field directly inside it, `[7, 3]` a sequence at id 3 inside
+   * that one. {@link HeaderLimitCase.field_id} is the field's id in the
+   * **innermost** frame, and that innermost frame is where the ceiling binds.
+   */
+  frames: number[];
+}
+
+/**
+ * Load the nested header-ceiling cases, or `[]` on a vector file that predates
+ * them.
+ *
+ * Shares {@link normalizeHeaderLimitCase} with the flat block and adds the one
+ * check `frames` brings: present, non-empty, and every entry a real field id. An
+ * empty chain would silently degrade every case in the block to the flat
+ * top-level assertion the flat block already makes — passing, and testing nothing
+ * this block exists for.
+ */
+export function loadNestedHeaderLimitCases(): NestedHeaderLimitCase[] {
+  const doc = readVectorFile() as unknown as { header_limits_nested?: NestedHeaderLimitCase[] };
+  return (doc.header_limits_nested ?? []).map((c, i) => {
+    const where = `header_limits_nested ${c.name ?? `#${i}`}`;
+    if (!Array.isArray(c.frames) || c.frames.length === 0) {
+      throw new Error(`${where}: frames is missing or empty`);
+    }
+    const frames = c.frames.map((id, k) => asIndex(`${where}.frames[${k}]`, id));
+    return normalizeHeaderLimitCase({ ...c, frames }, where);
   });
 }
 
