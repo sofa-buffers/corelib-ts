@@ -20,7 +20,6 @@ import {
   OStream,
   decode,
   fp32RawBytes,
-  fp32RawInto,
   type Visitor, growingOStream } from "../src/index.js";
 import { bytesToHex } from "./helpers/hex.js";
 import { TranscodeVisitor } from "./helpers/recording-visitor.js";
@@ -231,33 +230,24 @@ describe("the fp32 bits survive encoder use during the callback", () => {
   }
 });
 
-describe("fp32RawInto / fp32RawBytes — the generated layer's raw companion (§6.5)", () => {
+describe("fp32RawBytes — the generated layer's raw companion (§6.5)", () => {
   // The other half of the same story. A generated message stores an `fp32` in a
   // JS `number`, which cannot hold a signaling NaN's payload, so it keeps the
   // four raw wire bytes beside the value and re-emits those. What the visitor
   // hands over is the 32-bit WORD — a number costs nothing to pass, where the
   // byte view it replaced was an allocation per value and a borrowed slice §6.7
-  // forbids — so turning that word back into bytes is this pair.
+  // forbids — so turning that word back into bytes is this function.
 
   it("writes the word little-endian, byte k in bits 8*k", () => {
-    const out = new Uint8Array(4);
-    fp32RawInto(out, 0, 0x7f800001);
-    expect([...out]).toStrictEqual([...FP32_SNAN]);
-  });
-
-  it("writes at the offset and touches nothing else", () => {
-    const out = new Uint8Array(8).fill(0xaa);
-    fp32RawInto(out, 2, 0x40490fd0);
-    expect([...out]).toStrictEqual([0xaa, 0xaa, 0xd0, 0x0f, 0x49, 0x40, 0xaa, 0xaa]);
+    expect([...fp32RawBytes(0x7f800001)]).toStrictEqual([...FP32_SNAN]);
+    expect([...fp32RawBytes(0x40490fd0)]).toStrictEqual([0xd0, 0x0f, 0x49, 0x40]);
   });
 
   it("keeps the sign bit — the word arrives as a signed 32-bit number", () => {
     // `Visitor.fp32`'s `bits` is an int32, so 0xFFC00000 arrives as a negative
     // number. `>>> 8` on a negative operand is the unsigned shift for exactly
     // this reason; a signed `>>` would smear the sign into bytes 1..3.
-    const out = new Uint8Array(4);
-    fp32RawInto(out, 0, 0xffc00000 | 0);
-    expect([...out]).toStrictEqual([...FP32_NEG_QNAN]);
+    expect([...fp32RawBytes(0xffc00000 | 0)]).toStrictEqual([...FP32_NEG_QNAN]);
     expect([...fp32RawBytes(-1)]).toStrictEqual([0xff, 0xff, 0xff, 0xff]);
   });
 

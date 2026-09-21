@@ -681,7 +681,7 @@ Who owns the bytes:
   decoder keeps into your storage between calls.
 - **The static helper layer allocates, on your behalf.** `PayloadAcc`,
   `ElementSeq`, `FramedSeq`, `StringSeq`, `BlobSeq`, `decodeUtf8`, `elementsEqual`,
-  `longElementsEqual` and `fp32RawInto` / `fp32RawBytes` are the generated layer's
+  `longElementsEqual` and `fp32RawBytes` are the generated layer's
   code shipped here for reuse (ARCHITECTURE §8), not part of the codec: the codec
   never calls them, and they allocate the values they build.
 - **String validity is checked where a string is materialized** (§6.4.5).
@@ -706,7 +706,7 @@ Who owns the bytes:
   shared default would alias every gap of the array onto a single instance;
   `elementsEqual` (and `longElementsEqual`, for `Long`-backed 64-bit arrays, whose
   elements are object identities) is the array form of the omit-if-default test an
-  encoder applies before writing a field; `fp32RawInto` / `fp32RawBytes` turn the
+  encoder applies before writing a field; `fp32RawBytes` turns the
   32-bit word `Visitor.fp32` hands over back into the four wire bytes a generated
   message keeps beside an `fp32` it cannot re-encode from a `number` (§6.5).
 

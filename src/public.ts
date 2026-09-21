@@ -45,7 +45,7 @@ export { decodeUtf8 } from "./decode/text.js";
 export { PayloadAcc } from "./decode/acc.js";
 export { BlobSeq, ElementSeq, FramedSeq, StringSeq, UNBOUNDED } from "./decode/seq.js";
 export { elementsEqual, longElementsEqual } from "./encode/equal.js";
-export { fp32RawBytes, fp32RawInto } from "./varint/num64.js";
+export { fp32RawBytes } from "./varint/num64.js";
 
 export { getKernel, setKernel } from "./backend/kernel.js";
 export type { Kernel } from "./backend/kernel.js";
