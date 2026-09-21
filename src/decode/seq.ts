@@ -135,38 +135,56 @@ function requireReceiverBound(
 }
 
 /**
- * **The** element-index rule, in one place: the schema `count` as validity, or —
- * where the schema left the array open — the receiver cap as policy.
+ * **The** element-index rule, in one place — split into the number it compares
+ * against and the verdict a breach of it gets.
  *
  * Never both (CORELIB_PLAN §6.2.1): where the schema declared a `count` its
  * violation is `INVALID`, a statement about the message, and the receiver cap
  * beside it is inert; where it declared none the cap governs alone and its
  * violation is `LIMIT_EXCEEDED`, a policy rejection of well-formed bytes.
  *
+ * "Never both" means exactly one of the pair is ever compared against, so there
+ * is exactly one number in force and it is known at construction. This picks it
+ * once per collector and every check below is then the single `id >= this.bound`
+ * that remains — the whole §6.2.1 choice, made once rather than re-made per
+ * element. That matters beyond tidiness: the `ts` bench rows measure the V8
+ * **baseline** tier, where nothing is inlined and a call is the expensive thing,
+ * so a per-element call into a shared checker is a cost the shared checker does
+ * not have to pay in order to stay shared.
+ *
+ * @param cap The schema `count` as an index capacity, or {@link UNBOUNDED} (`-1`).
+ * @param receiverCap The receiver index cap, in force only when `cap` is
+ * {@link UNBOUNDED}; already known to be finite and non-negative, because
+ * {@link requireReceiverBound} refused anything else at construction — so the
+ * bound this returns is always a finite non-negative number and the comparison
+ * against it is exact, with no NaN to fall through.
+ */
+function indexBound(cap: number, receiverCap: number): number {
+  return cap >= 0 ? cap : receiverCap;
+}
+
+/**
+ * Which verdict an index that has already failed `indexBound` gets: the
+ * schema `count` is validity, the receiver cap is policy (CORELIB_PLAN §6.2.1).
+ *
  * Written once and shared by every collector in this file, because §6.2.1 is a
  * rule about *which* verdict a caller gets and a second copy is a second chance
- * to get it wrong. Throws or returns; it never touches a container, which is what
- * lets a caller run it before allocating anything (§7.2 item 8).
+ * to get it wrong. It always throws — the caller has already established that the
+ * bound is breached — and it never touches a container, which is what lets a
+ * caller run its check before allocating anything (§7.2 item 8).
  *
  * @param id The element index, which for a wrapper array is the child field's id.
  * @param cap The schema `count` as an index capacity, or {@link UNBOUNDED} (`-1`).
- * @param receiverCap The receiver index cap, consulted only when `cap` is
- * {@link UNBOUNDED}; already known to be finite and non-negative, because
- * {@link requireReceiverBound} refused anything else at construction.
+ * `cap >= 0` is what makes the breach `INVALID` rather than `LIMIT_EXCEEDED`.
+ * @param receiverCap The receiver index cap, named in the rejection message when
+ * it is the bound that was breached.
  * @param name The schema field name, used only in the rejection message.
  */
-function overIndex(id: number, cap: number, receiverCap: number, name: string): void {
+function rejectIndex(id: number, cap: number, receiverCap: number, name: string): never {
   if (cap >= 0) {
-    if (id >= cap) {
-      throw invalidMsgError(`${name}: array index above schema capacity ${cap}`);
-    }
-  } else if (id >= receiverCap) {
-    // A plain `>=`, and it is exact: the constructor already refused a
-    // `receiverCap` that is not a finite non-negative number, so there is no NaN
-    // comparison to fall through here and no unstated cap to misreport as a
-    // policy rejection (`requireReceiverBound`, §6.2.1/§6.3).
-    throw limitExceededError(`${name}: array index ${id} exceeds the receiver cap ${receiverCap}`);
+    throw invalidMsgError(`${name}: array index above schema capacity ${cap}`);
   }
+  throw limitExceededError(`${name}: array index ${id} exceeds the receiver cap ${receiverCap}`);
 }
 
 /**
@@ -195,6 +213,13 @@ function overIndex(id: number, cap: number, receiverCap: number, name: string): 
  * construction, never `LIMIT_EXCEEDED` ({@link requireReceiverBound}).
  */
 export class ElementSeq<T> {
+  /**
+   * The one index bound in force, picked once by `indexBound`: the schema
+   * `count` where the schema stated one, the receiver cap where it did not. Which
+   * of the two it is decides the verdict, which is `rejectIndex`'s job.
+   */
+  private readonly bound: number;
+
   constructor(
     readonly out: T[],
     readonly def: T,
@@ -202,7 +227,10 @@ export class ElementSeq<T> {
     readonly name: string,
     readonly receiverCap: number,
   ) {
-    requireReceiverBound(cap, receiverCap, "the receiver array-index cap", name);
+    // §6.2.1: where the schema stated a bound, the receiver cap beside it is inert
+    // — so an unbounded array is the only one that HAS a receiver cap to validate.
+    if (cap < 0) requireReceiverBound(cap, receiverCap, "the receiver array-index cap", name);
+    this.bound = indexBound(cap, receiverCap);
   }
 
   /**
@@ -215,7 +243,7 @@ export class ElementSeq<T> {
    * still lands at its own index.
    */
   reserve(id: number): void {
-    this.checkIndex(id);
+    if (id >= this.bound) rejectIndex(id, this.cap, this.receiverCap, this.name);
     // Grow to at least id + 1 (ARCHITECTURE §9.5 shape B): `push` leaves the
     // geometry to the engine's own amortised doubling, so a sparse array does not
     // cost O(n²) copies.
@@ -226,19 +254,27 @@ export class ElementSeq<T> {
    * The two index bounds, without growing: the schema `count` as validity
    * (`INVALID`) or, where the schema left the array open, the receiver cap as
    * capacity (`LIMIT_EXCEEDED`). Never both — §6.2.1 keeps a cap off a field the
-   * schema already bounds.
+   * schema already bounds, which is why one `bound` can stand for both.
    *
    * Split out from {@link reserve} because a leaf element is bound-checked at its
    * length word, before its payload has arrived and so before there is anything to
    * place ({@link StringSeq.begin}).
    */
   checkIndex(id: number): void {
-    overIndex(id, this.cap, this.receiverCap, this.name);
+    if (id >= this.bound) rejectIndex(id, this.cap, this.receiverCap, this.name);
   }
 
-  /** {@link reserve} the slot, then write `value` into it. A repeat replaces (§7.4). */
+  /**
+   * What {@link reserve} does, then `value` written into the slot. A repeat
+   * replaces (§7.4).
+   *
+   * Written out rather than delegating to {@link reserve}: on the baseline tier a
+   * call is not free, and this is the per-element path. The check still precedes
+   * the growth, which is the property §7.2 item 8 asks for.
+   */
   place(id: number, value: T): void {
-    this.reserve(id);
+    if (id >= this.bound) rejectIndex(id, this.cap, this.receiverCap, this.name);
+    while (this.out.length <= id) this.out.push(this.def);
     this.out[id] = value;
   }
 }
@@ -259,8 +295,8 @@ export class ElementSeq<T> {
  *
  * Everything else is {@link ElementSeq}, deliberately: the same argument order
  * with `make` in `def`'s slot, the same two exclusive index bounds through the
- * same `overIndex`, the same growth geometry, the same construction-time refusal
- * of a receiver cap that states no cap.
+ * same `indexBound` / `rejectIndex` pair, the same growth geometry, the same
+ * construction-time refusal of a receiver cap that states no cap.
  *
  * Generated code calls {@link reserve} at the element's own `sequenceBegin` and
  * then keeps routing the child's fields into `out[id]` itself. This class owns
@@ -282,6 +318,9 @@ export class ElementSeq<T> {
  * ({@link requireReceiverBound}).
  */
 export class FramedSeq<T> {
+  /** The one index bound in force, picked once by `indexBound` — see {@link ElementSeq}. */
+  private readonly bound: number;
+
   constructor(
     readonly out: T[],
     readonly make: () => T,
@@ -289,7 +328,8 @@ export class FramedSeq<T> {
     readonly name: string,
     readonly receiverCap: number,
   ) {
-    requireReceiverBound(cap, receiverCap, "the receiver array-index cap", name);
+    if (cap < 0) requireReceiverBound(cap, receiverCap, "the receiver array-index cap", name);
+    this.bound = indexBound(cap, receiverCap);
   }
 
   /**
@@ -301,7 +341,7 @@ export class FramedSeq<T> {
    * wants that rejection to leave the row container exactly as it was.
    */
   checkIndex(id: number): void {
-    overIndex(id, this.cap, this.receiverCap, this.name);
+    if (id >= this.bound) rejectIndex(id, this.cap, this.receiverCap, this.name);
   }
 
   /**
@@ -316,7 +356,7 @@ export class FramedSeq<T> {
    * whose value *is* the scope.
    */
   reserve(id: number): void {
-    this.checkIndex(id);
+    if (id >= this.bound) rejectIndex(id, this.cap, this.receiverCap, this.name);
     // Grow to at least id + 1 (ARCHITECTURE §9.5 shape B): `push` leaves the
     // geometry to the engine's own amortised doubling, so a sparse array does not
     // cost O(n²) copies.
@@ -334,7 +374,7 @@ export class FramedSeq<T> {
    * which is the same array a {@link reserve} would have left.
    */
   place(id: number, value: T): void {
-    this.checkIndex(id);
+    if (id >= this.bound) rejectIndex(id, this.cap, this.receiverCap, this.name);
     while (this.out.length < id) this.out.push(this.make());
     this.out[id] = value;
   }

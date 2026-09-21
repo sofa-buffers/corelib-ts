@@ -271,6 +271,8 @@ describe("where the schema left the array open, the receiver cap governs (§6.2.
 
   it("answers LIMIT_EXCEEDED, not INVALID — a policy rejection of well-formed bytes", () => {
     expect(codeOf(() => seq([]).reserve(RCAP))).toBe(SofabErrorCode.LimitExceeded);
+    expect(codeOf(() => seq([]).place(RCAP, new Elem()))).toBe(SofabErrorCode.LimitExceeded);
+    expect(codeOf(() => seq([]).checkIndex(RCAP))).toBe(SofabErrorCode.LimitExceeded);
     expect(codeOf(() => seq([]).reserve(RCAP - 1))).toBeUndefined();
   });
 
@@ -296,14 +298,51 @@ describe("where the schema left the array open, the receiver cap governs (§6.2.
   it("has one implementation of the rule, shared with ElementSeq", () => {
     // The two classes differ in the gap value and in nothing else. A second copy
     // of §6.2.1's which-verdict rule would be a second chance to get it wrong, so
-    // the verdicts are pinned to be identical for both bound shapes.
+    // the verdicts are pinned to be identical for both bound shapes — and for
+    // every entry point, because each of the six compares the bound itself and
+    // only the verdict behind it is shared. An entry point that forgot the check,
+    // or took the other branch of §6.2.1, shows up here as a differing code.
     for (const [cap, rcap, id] of [
       [3, WIDE_INDEX, 3],
       [UNBOUNDED, 4, 4],
     ] as const) {
       const a = new ElementSeq<number>([], 0, cap, "x", rcap);
       const b = new FramedSeq<number[]>([], () => [], cap, "x", rcap);
-      expect(codeOf(() => b.checkIndex(id))).toBe(codeOf(() => a.checkIndex(id)));
+      const want = codeOf(() => a.checkIndex(id));
+      expect(want).not.toBeUndefined(); // the id is over the bound in force
+      for (const over of [
+        () => a.reserve(id),
+        () => a.place(id, 1),
+        () => b.checkIndex(id),
+        () => b.reserve(id),
+        () => b.place(id, []),
+      ]) {
+        expect(codeOf(over)).toBe(want);
+      }
+    }
+  });
+
+  it("accepts the last index each bound admits, at every entry point", () => {
+    // The twin of the assertion above: the six compares must not be off by one
+    // in the other direction either, and `count` is a CAPACITY — so the index
+    // one below it is still good.
+    for (const [cap, rcap] of [
+      [3, WIDE_INDEX],
+      [UNBOUNDED, 4],
+    ] as const) {
+      const id = (cap >= 0 ? cap : rcap) - 1;
+      const a = new ElementSeq<number>([], 0, cap, "x", rcap);
+      const b = new FramedSeq<number[]>([], () => [], cap, "x", rcap);
+      for (const ok of [
+        () => a.checkIndex(id),
+        () => a.reserve(id),
+        () => a.place(id, 1),
+        () => b.checkIndex(id),
+        () => b.reserve(id),
+        () => b.place(id, []),
+      ]) {
+        expect(codeOf(ok)).toBeUndefined();
+      }
     }
   });
 });
