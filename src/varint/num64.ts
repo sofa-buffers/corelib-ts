@@ -110,8 +110,8 @@ export function fp32FromBits(bits: number): number {
 }
 
 /**
- * Write the four little-endian wire bytes of an fp32's 32-bit word (byte `k` in
- * bits `8*k`) to `out[off .. off+3]`.
+ * A fresh 4-byte companion holding one fp32 word's wire image: the four
+ * little-endian bytes of its 32-bit word, byte `k` in bits `8*k`.
  *
  * Generated-layer support, not a codec path: an `fp32` field whose value is a
  * `NaN` cannot be re-encoded from the `number` a JS host stored it in — the host
@@ -122,23 +122,19 @@ export function fp32FromBits(bits: number): number {
  * §6.7 forbids; turning that word back into bytes is this function, and it is the
  * same four shifts for every schema (ARCHITECTURE §8).
  *
- * The caller owns `out` and its bounds: this writes four bytes and reads nothing.
- */
-export function fp32RawInto(out: Uint8Array, off: number, bits: number): void {
-  out[off] = bits & 0xff;
-  out[off + 1] = (bits >>> 8) & 0xff;
-  out[off + 2] = (bits >>> 16) & 0xff;
-  out[off + 3] = (bits >>> 24) & 0xff;
-}
-
-/**
- * The scalar flavour of {@link fp32RawInto}: a fresh 4-byte companion holding one
- * fp32 word's wire image. Built only for the value that needs one, so the
- * allocation is per `NaN` and not per field.
+ * One function and not two. An `into(out, off, bits)` flavour beside it would be
+ * the natural companion — it is what the fp32 *array* path would want — but that
+ * path was retired before this one moved here (§6.7 killed the view), so the
+ * whole family builds this companion per `NaN` scalar and nothing else calls it.
+ * Public API with no consumer drifts, so there is exactly one entry point and it
+ * allocates: the allocation is per `NaN`, not per field.
  */
 export function fp32RawBytes(bits: number): Uint8Array {
   const out = new Uint8Array(4);
-  fp32RawInto(out, 0, bits);
+  out[0] = bits & 0xff;
+  out[1] = (bits >>> 8) & 0xff;
+  out[2] = (bits >>> 16) & 0xff;
+  out[3] = (bits >>> 24) & 0xff;
   return out;
 }
 
