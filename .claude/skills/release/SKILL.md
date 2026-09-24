@@ -19,7 +19,7 @@ Both must be right.
 | Update `CHANGELOG.md` | **you** |
 | Release PR + merge to `main` | **you** |
 | Push tag `vX.Y.Z` | **you** |
-| Verify tag == manifests (`version-consistency.yml`) | CI, on tag push |
+| Verify tag == `package.json` + lockfile + CHANGELOG (`version-consistency.yml`) | CI, on tag push |
 | Create GitHub Release | **you** (`gh release create`) |
 | typecheck → test → build → `npm publish` | CI (`release.yml`), on release *published* |
 | npm auth | none needed — OIDC Trusted Publishing, no `NPM_TOKEN` |
@@ -102,6 +102,10 @@ If the lockfile is somehow untouched, `npm install --package-lock-only` fixes it
 Normal flow: rename the `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`
 (today's date) and open a fresh empty `## [Unreleased]` above it. Format is
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+`version-consistency.yml` enforces this on the tag push: the file must exist,
+its topmost released section must be exactly the tag's version, and the heading
+must carry an ISO date. An `## [Unreleased]` heading above it is fine.
 
 ### 6. Commit
 
@@ -196,8 +200,18 @@ so a bare `npm i` keeps getting `latest`.
 3. That version is already on npm — versions are immutable, bump and re-cut.
 4. GitHub release flagged prerelease but the tag is stable.
 
-`version-consistency.yml` additionally checks the lockfile's `name` and
-`license` against `package.json`.
+`version-consistency.yml` runs on the tag push and checks every place the
+version is written by hand against the tag:
+
+1. `package.json` `version`.
+2. `package-lock.json` — `.version` and `.packages."".version`, plus `name` and
+   `license` against `package.json`.
+3. `CHANGELOG.md` — present, topmost released section == the tag, ISO-dated.
+
+Each is its own step, so one run reports every mismatch rather than the first.
+Nothing else in the repo stores the version: `typedoc.json` reads it from
+`package.json` (`includeVersion`), the README pins no version, and
+`API_VERSION` is the spec's.
 
 ## If it goes wrong
 
