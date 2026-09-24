@@ -85,27 +85,20 @@ If the lockfile is somehow untouched, `npm install --package-lock-only` fixes it
 
 ### 5. CHANGELOG.md
 
-> ⚠️ **`CHANGELOG.md` is currently missing from `main`.** It was dropped in
-> commit `6112092` (`refactor(codec)!: one visitor surface…`, PR #161) with no
-> mention of the removal in the commit message — it looks accidental.
-> `package.json` still ships it via `files`, and the `0.9.0`/`0.10.0` releases
-> both updated it. **Restore it before the next release:**
->
-> ```bash
-> git show v0.10.0:CHANGELOG.md > CHANGELOG.md
-> ```
->
-> Then write the entries for everything merged since `v0.10.0` under a new
-> `## [Unreleased]` heading. Once it is back, this warning can be deleted from
-> this skill.
-
 Normal flow: rename the `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`
 (today's date) and open a fresh empty `## [Unreleased]` above it. Format is
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+Add the release's link reference at the bottom of the file alongside the others:
+
+```
+[X.Y.Z]: https://github.com/sofa-buffers/corelib-ts/releases/tag/vX.Y.Z
+```
+
 `version-consistency.yml` enforces this on the tag push: the file must exist,
 its topmost released section must be exactly the tag's version, and the heading
-must carry an ISO date. An `## [Unreleased]` heading above it is fine.
+must carry an ISO date. An `## [Unreleased]` heading above it is fine. The link
+reference is not checked.
 
 ### 6. Commit
 
@@ -129,13 +122,20 @@ git push -u origin release/vX.Y.Z
 
 ```bash
 gh pr create --base main --title "chore(release): X.Y.Z" --body "..."
-# wait for CI, then:
-gh pr merge --merge          # previous releases used a merge commit
+gh pr checks <n> --watch      # all of CI must pass
+gh pr merge <n> --rebase --delete-branch
 ```
+
+**Rebase, not merge.** The repository allows only rebase merges
+(`allow_merge_commit` and `allow_squash_merge` are both false), so `--merge`
+fails with *"Merge commits are not allowed on this repository"*. Releases up to
+`v0.10.0` were merge commits and predate that setting. Rebase rewrites the SHA,
+so read the new commit off `main` before tagging rather than reusing the
+branch's.
 
 ### 8. Tag
 
-Tag the **merge commit on `main`**, not the branch:
+Tag the release commit **as it landed on `main`**, not the branch's own SHA — the rebase gave it a new one:
 
 ```bash
 git checkout main && git pull -p
