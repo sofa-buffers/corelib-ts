@@ -1,6 +1,6 @@
 ---
 name: release
-description: Cut a release of @sofa-buffers/corelib (corelib-ts) — pick the version, bump every manifest, update the CHANGELOG, merge the release PR, tag it, and publish via the GitHub Release. Use when the user asks to release, cut a version, bump the version, tag a release, or publish to npm.
+description: Cut a release of @sofa-buffers/corelib (corelib-ts) — pick the version, bump every manifest, merge the release PR, tag it, and publish via the GitHub Release. Use when the user asks to release, cut a version, bump the version, tag a release, or publish to npm.
 ---
 
 # Release @sofa-buffers/corelib
@@ -16,10 +16,9 @@ Both must be right.
 | Step | Who |
 | --- | --- |
 | Bump `package.json` + `package-lock.json` | **you** |
-| Update `CHANGELOG.md` | **you** |
 | Release PR + merge to `main` | **you** |
 | Push tag `vX.Y.Z` | **you** |
-| Verify tag == `package.json` + lockfile + CHANGELOG (`version-consistency.yml`) | CI, on tag push |
+| Verify tag == `package.json` + lockfile (`version-consistency.yml`) | CI, on tag push |
 | Create GitHub Release | **you** (`gh release create`) |
 | typecheck → test → build → `npm publish` | CI (`release.yml`), on release *published* |
 | npm auth | none needed — OIDC Trusted Publishing, no `NPM_TOKEN` |
@@ -30,8 +29,8 @@ is **published**.
 ## Versioning rule
 
 Pre-`1.0.0`: **a breaking API or wire-format change bumps the MINOR version,
-never the patch.** Patch is for non-breaking fixes only. This is stated in the
-CHANGELOG header and was applied for `0.10.0`.
+never the patch.** Patch is for non-breaking fixes only. This was applied for
+`0.10.0`.
 
 Tags are always `vX.Y.Z` — lowercase `v`, then plain semver (`v1.2.3`,
 `v0.11.0-rc.1`). See step 8.
@@ -83,22 +82,20 @@ jq -r '.version, .packages."".version' package-lock.json
 
 If the lockfile is somehow untouched, `npm install --package-lock-only` fixes it.
 
-### 5. CHANGELOG.md
+### 5. Draft the release notes
 
-Normal flow: rename the `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`
-(today's date) and open a fresh empty `## [Unreleased]` above it. Format is
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+There is no `CHANGELOG.md` — the GitHub Release is the changelog. Draft its
+notes now, from the commits the tag will cover, so step 9 is a paste rather
+than a fresh write:
 
-Add the release's link reference at the bottom of the file alongside the others:
-
-```
-[X.Y.Z]: https://github.com/sofa-buffers/corelib-ts/releases/tag/vX.Y.Z
+```bash
+git log --oneline "$(git describe --tags --abbrev=0)"..HEAD
 ```
 
-`version-consistency.yml` enforces this on the tag push: the file must exist,
-its topmost released section must be exactly the tag's version, and the heading
-must carry an ISO date. An `## [Unreleased]` heading above it is fine. The link
-reference is not checked.
+Group them the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) way —
+Added / Changed / Fixed / Removed — and call out breaking changes explicitly:
+under the pre-1.0 rule they are what forces the minor bump. Keep the draft in
+the release PR body, which is where step 9 reads it from.
 
 ### 6. Commit
 
@@ -163,10 +160,11 @@ and re-cut the tag.
 
 ### 9. Publish the GitHub Release
 
-This is what triggers `npm publish`.
+This is what triggers `npm publish`, and it is the only changelog the
+project keeps — the notes must stand on their own.
 
 ```bash
-gh release create vX.Y.Z --title "vX.Y.Z" --notes "<changelog section for X.Y.Z>"
+gh release create vX.Y.Z --title "vX.Y.Z" --notes "<the notes drafted in step 5>"
 ```
 
 For a prerelease tag (`vX.Y.Z-rc.1`) add `--prerelease`.
@@ -206,7 +204,6 @@ version is written by hand against the tag:
 1. `package.json` `version`.
 2. `package-lock.json` — `.version` and `.packages."".version`, plus `name` and
    `license` against `package.json`.
-3. `CHANGELOG.md` — present, topmost released section == the tag, ISO-dated.
 
 Each is its own step, so one run reports every mismatch rather than the first.
 Nothing else in the repo stores the version: `typedoc.json` reads it from
