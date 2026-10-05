@@ -45,7 +45,7 @@ export { decodeUtf8 } from "./decode/text.js";
 export { PayloadAcc } from "./decode/acc.js";
 export { BlobSeq, ElementSeq, FramedSeq, StringSeq, UNBOUNDED } from "./decode/seq.js";
 export { elementsEqual, longElementsEqual } from "./encode/equal.js";
-export { floatArrayBitsEqual } from "./encode/float-bits-equal.js";
+export { floatArrayBitsEqual, fp32ArrayBitsEqual, fp64ArrayBitsEqual } from "./encode/float-bits-equal.js";
 export { fp32RawBytes } from "./varint/num64.js";
 
 export { getKernel, setKernel } from "./backend/kernel.js";

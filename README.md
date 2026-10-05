@@ -681,7 +681,7 @@ Who owns the bytes:
   decoder keeps into your storage between calls.
 - **The static helper layer allocates, on your behalf.** `PayloadAcc`,
   `ElementSeq`, `FramedSeq`, `StringSeq`, `BlobSeq`, `decodeUtf8`, `elementsEqual`,
-  `longElementsEqual`, `floatArrayBitsEqual` and `fp32RawBytes` are the generated layer's
+  `longElementsEqual`, `floatArrayBitsEqual`, `fp32ArrayBitsEqual`, `fp64ArrayBitsEqual` and `fp32RawBytes` are the generated layer's
   code shipped here for reuse (ARCHITECTURE §8), not part of the codec: the codec
   never calls them, and they allocate the values they build.
 - **String validity is checked where a string is materialized** (§6.4.5).
@@ -707,7 +707,10 @@ Who owns the bytes:
   `elementsEqual` (and `longElementsEqual`, for `Long`-backed 64-bit arrays, whose
   elements are object identities) is the array form of the omit-if-default test an
   encoder applies before writing a field, and `floatArrayBitsEqual` is its float form
-  (same bits, so `-0` differs from `+0` and an identical `NaN` equals itself); `fp32RawBytes` turns the
+  (same bits, so `-0` differs from `+0` and an identical `NaN` equals itself);
+  `fp32ArrayBitsEqual` and `fp64ArrayBitsEqual` are the same compare for a
+  `Float32Array` and a `Float64Array` pair, one function per container so the loop
+  stays monomorphic (what generated code calls); `fp32RawBytes` turns the
   32-bit word `Visitor.fp32` hands over back into the four wire bytes a generated
   message keeps beside an `fp32` it cannot re-encode from a `number` (§6.5).
 
