@@ -81,6 +81,17 @@ import type { FlushSink } from "./sink.js";
 const SIGNED_FAST_MAX = 0x10_0000_0000_0000; // 2^52
 
 /**
+ * The `ARGUMENT` refusal of {@link OStream.writeString}: a string `len` UTF-8
+ * bytes long is over the caller's `maxlen`, or over the wire's `FIXLEN_MAX`.
+ * Out of line so the hot path carries one call site, not the message building.
+ */
+function stringLengthError(len: number, maxlen: number): Error {
+  return len > maxlen
+    ? argumentError(`string length ${len} bytes exceeds maxlen ${maxlen}`)
+    : argumentError(`fixlen length ${len} exceeds ${FIXLEN_MAX}`);
+}
+
+/**
  * Validate a caller-supplied output buffer *where it is handed over* — at
  * construction and at every mid-stream {@link OStream.setBuffer} (CORELIB_PLAN
  * §5.1). The offset must land inside the buffer, and, **only** when a flush sink
@@ -451,8 +462,19 @@ export class OStream implements ByteSink {
     this.putFp64(value);
   }
 
-  /** Write a UTF-8 string field. */
-  writeString(id: number, text: string): void {
+  /**
+   * Write a UTF-8 string field.
+   *
+   * `maxlen` is the field's bound in UTF-8 bytes, passed by the caller (a
+   * generated encoder hands in its schema's `maxlen`; this codec holds none). A
+   * string whose UTF-8 encoding is longer is refused with `ARGUMENT` (§6.3)
+   * before a byte of the field is written: the length is the one the writer
+   * computes anyway to size the header, so the check costs no second pass and
+   * no allocation. A JS string knows only its UTF-16 length, which is why the
+   * bound is checked here and not by the caller. Omitted, only the wire's own
+   * `FIXLEN_MAX` applies.
+   */
+  writeString(id: number, text: string, maxlen: number = FIXLEN_MAX): void {
     // Fast path: scan the UTF-8 byte length, write the fixlen header, then encode
     // the characters straight into the output buffer. This skips
     // `TextEncoder.encode`'s per-call setup + throwaway array + second copy — the
@@ -472,9 +494,7 @@ export class OStream implements ByteSink {
     let a = 0;
     while (a < n && text.charCodeAt(a) < 0x80) a++;
     if (a === n) {
-      if (n > FIXLEN_MAX) {
-        throw argumentError(`fixlen length ${n} exceeds ${FIXLEN_MAX}`);
-      }
+      if (n > maxlen || n > FIXLEN_MAX) throw stringLengthError(n, maxlen);
       this.fixlenHead(id, n, FixlenSubtype.String);
       if (this.reserveBulk(n)) {
         const buf = this.buf;
@@ -490,9 +510,7 @@ export class OStream implements ByteSink {
     // Sized (and surrogate-validated) before the header goes out, so an
     // unencodable string still throws with nothing written.
     const byteLen = utf8Length(text);
-    if (byteLen > FIXLEN_MAX) {
-      throw argumentError(`fixlen length ${byteLen} exceeds ${FIXLEN_MAX}`);
-    }
+    if (byteLen > maxlen || byteLen > FIXLEN_MAX) throw stringLengthError(byteLen, maxlen);
     this.fixlenHead(id, byteLen, FixlenSubtype.String);
     if (this.reserveBulk(byteLen)) {
       this.pos = utf8Write(text, this.buf, this.pos);
