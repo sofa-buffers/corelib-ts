@@ -135,6 +135,13 @@ byte is written. `String` and `Blob` still take any length up to `FIXLEN_MAX`
 (`0x7fffffff`); the typed `writeFp32` / `writeFp64` / `writeString` are correct
 by construction.
 
+`writeString(id, text, maxlen)` takes an optional bound in UTF-8 bytes — a
+generated encoder passes its schema's `maxlen`, the codec holds none. A string
+whose UTF-8 encoding is longer throws `ARGUMENT` before a byte of the field is
+written. The length is the one the writer computes anyway to size the header,
+so the check adds no pass over the string and no allocation; without `maxlen`
+only `FIXLEN_MAX` applies.
+
 ### Serialize stream
 
 Constructed over a caller-owned buffer with a `FlushSink`, `OStream` drains that
