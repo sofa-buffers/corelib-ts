@@ -20,7 +20,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { PayloadAcc } from "../src/index.js";
+import { PayloadAcc, SofabError, SofabErrorCode } from "../src/index.js";
 
 /** `n` distinct bytes, so a mis-ordered join cannot pass by accident. */
 function payload(n: number): Uint8Array {
@@ -163,5 +163,141 @@ describe("PayloadAcc keeps consecutive payloads apart", () => {
     // fragment claiming one must return null rather than reserve the buffer.
     const acc = new PayloadAcc();
     expect(acc.take(2 ** 31 - 1, 1, Uint8Array.of(1, 2, 3), 0, 3)).toBeNull();
+  });
+});
+
+/**
+ * `takeInto` — the same join, into a buffer the caller already holds, for a decode
+ * into a reused destination (ARCHITECTURE §8).
+ *
+ * Two things make it worth its own block. The buffer is the **caller's**, so
+ * identity is the assertion that matters: a method that quietly allocated after
+ * all would pass every structural check and lose the whole point. And the split
+ * path is the one a caller cannot write for itself, so it gets the same treatment
+ * `take` gets above — cut at every offset, one answer.
+ */
+describe("PayloadAcc.takeInto writes into a buffer the caller owns", () => {
+  const p = payload(11);
+
+  /** `feedSplit`'s twin: the pieces go into `dst`, which must come back. */
+  function feedSplitInto(dst: Uint8Array, src: Uint8Array, cuts: number[]): Uint8Array {
+    const acc = new PayloadAcc();
+    const bounds = [0, ...cuts, src.length];
+    const done: Uint8Array[] = [];
+    for (let i = 0; i < bounds.length - 1; i++) {
+      const from = bounds[i]!;
+      const got = acc.takeInto(dst, src.length, from, src, from, bounds[i + 1]!);
+      if (got !== null) done.push(got);
+    }
+    expect(done, `cuts at ${cuts.join(",")}`).toHaveLength(1);
+    return done[0]!;
+  }
+
+  it("returns the destination itself, not a copy of it", () => {
+    const acc = new PayloadAcc();
+    const dst = new Uint8Array(p.length);
+    const got = acc.takeInto(dst, p.length, 0, p, 0, p.length);
+    expect(got).toBe(dst);
+    expect([...dst]).toStrictEqual([...p]);
+  });
+
+  it("is unaffected by where the payload is cut — every offset 0..n", () => {
+    for (let cut = 0; cut <= p.length; cut++) {
+      const dst = new Uint8Array(p.length);
+      expect(feedSplitInto(dst, p, [cut]), `cut at ${cut}`).toBe(dst);
+      expect([...dst], `cut at ${cut}`).toStrictEqual([...p]);
+    }
+  });
+
+  it("joins a byte-at-a-time feed into the same buffer", () => {
+    const acc = new PayloadAcc();
+    const dst = new Uint8Array(p.length);
+    const seen: (Uint8Array | null)[] = [];
+    for (let i = 0; i < p.length; i++) seen.push(acc.takeInto(dst, p.length, i, p, i, i + 1));
+    expect(seen.slice(0, -1).every((x) => x === null)).toBe(true);
+    expect(seen[seen.length - 1]).toBe(dst);
+    expect([...dst]).toStrictEqual([...p]);
+  });
+
+  it("copies out of the fed chunk, so a reused chunk cannot corrupt the join", () => {
+    const acc = new PayloadAcc();
+    const dst = new Uint8Array(p.length);
+    const scratch = new Uint8Array(4);
+    scratch.set(p.subarray(0, 4));
+    expect(acc.takeInto(dst, p.length, 0, scratch, 0, scratch.length)).toBeNull();
+    scratch.fill(0xee);
+    expect(acc.takeInto(dst, p.length, 4, p, 4, p.length)).toBe(dst);
+    expect([...dst]).toStrictEqual([...p]);
+  });
+
+  it("refuses a destination that is not the payload's length — ARGUMENT, nothing copied", () => {
+    // §6.6.3 / §6.3's third row: a destination that does not fit the value is a
+    // caller mistake, not a verdict about the message. `!==` rather than `<`,
+    // because the buffer's length *is* the payload's length — a longer one handed
+    // back would overstate it, and a view of it would alias storage the caller
+    // still owns.
+    const acc = new PayloadAcc();
+    for (const size of [p.length - 1, p.length + 1]) {
+      const dst = new Uint8Array(size);
+      let code: SofabErrorCode | undefined;
+      try {
+        acc.takeInto(dst, p.length, 0, p, 0, p.length);
+      } catch (e) {
+        expect(e).toBeInstanceOf(SofabError);
+        code = (e as SofabError).code;
+      }
+      expect(code, `destination of ${size}`).toBe(SofabErrorCode.Argument);
+      expect([...dst].every((b) => b === 0), `destination of ${size}`).toBe(true);
+    }
+    // …and the accumulator is still usable afterwards: nothing was started.
+    const dst = new Uint8Array(p.length);
+    expect(acc.takeInto(dst, p.length, 0, p, 0, p.length)).toBe(dst);
+  });
+
+  it("ignores a fragment with no payload in progress, leaving the destination alone", () => {
+    const acc = new PayloadAcc();
+    const dst = new Uint8Array(8);
+    expect(acc.takeInto(dst, 8, 4, payload(4), 0, 4)).toBeNull();
+    expect([...dst].every((b) => b === 0)).toBe(true);
+  });
+
+  it("starts clean after a payload was abandoned part-way, in either direction", () => {
+    // What an INVALID field or a declined subtree leaves behind, now that two
+    // entry points share the accumulator: `offset === 0` adopts a buffer and
+    // resets, whichever of the two started the payload that was dropped.
+    const acc = new PayloadAcc();
+    const abandoned = new Uint8Array(9);
+    expect(acc.takeInto(abandoned, 9, 0, payload(9), 0, 5)).toBeNull();
+    const next = payload(4);
+    expect([...acc.take(4, 0, next, 0, next.length)!]).toStrictEqual([...next]);
+
+    expect(acc.take(9, 0, payload(9), 0, 5)).toBeNull();
+    const dst = new Uint8Array(4);
+    expect(acc.takeInto(dst, 4, 0, next, 0, next.length)).toBe(dst);
+    expect([...dst]).toStrictEqual([...next]);
+  });
+
+  it("trims a chunk that runs past the declared total", () => {
+    const acc = new PayloadAcc();
+    const dst = new Uint8Array(4);
+    expect(acc.takeInto(dst, 4, 0, p, 0, p.length)).toBe(dst);
+    expect([...dst]).toStrictEqual([...p.subarray(0, 4)]);
+  });
+
+  it("does not clobber a finished payload with the next one", () => {
+    const acc = new PayloadAcc();
+    const first = new Uint8Array(6);
+    const bytes = payload(6);
+    expect(acc.takeInto(first, 6, 0, bytes, 0, 3)).toBeNull();
+    expect(acc.takeInto(first, 6, 3, bytes, 3, 6)).toBe(first);
+    const second = new Uint8Array(6);
+    acc.takeInto(second, 6, 0, payload(6).map((b) => b ^ 0xff), 0, 6);
+    expect([...first]).toStrictEqual([...bytes]);
+  });
+
+  it("returns a zero-length payload as the empty destination", () => {
+    const acc = new PayloadAcc();
+    const dst = new Uint8Array(0);
+    expect(acc.takeInto(dst, 0, 0, new Uint8Array(0), 0, 0)).toBe(dst);
   });
 });

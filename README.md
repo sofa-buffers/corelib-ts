@@ -699,7 +699,9 @@ Who owns the bytes:
   `feed` calls. `PayloadAcc.take(total, offset, src, start, end)` joins the pieces —
   one accumulator per decoder, since only one payload is ever in flight — and
   returns storage of its own that aliases nothing, on the whole-payload path exactly
-  as on the split one. `StringSeq` / `BlobSeq` collect the elements of a `string` /
+  as on the split one. `takeInto(dst, total, offset, src, start, end)` is that same
+  join into a buffer **you** hold, on the split path too; `dst.length` must be the
+  payload's `total`, or it is `ARGUMENT`, and what comes back is `dst` itself. `StringSeq` / `BlobSeq` collect the elements of a `string` /
   `blob` wrapper array; `ElementSeq` holds the index rules for any element kind
   (index bound, gap fill, last-write-wins) and `FramedSeq` is its twin for an element
   whose default is a fresh object — a `struct`, a `union`, a nested row — where one
@@ -709,6 +711,21 @@ Who owns the bytes:
   encoder applies before writing a field; `fp32RawBytes` turns the
   32-bit word `Visitor.fp32` hands over back into the four wire bytes a generated
   message keeps beside an `fp32` it cannot re-encode from a `number` (§6.5).
+
+- **Decoding into a destination that already holds a message overwrites that
+  message's storage.** Each of the four collectors takes a `reuse()` before its
+  first element, and an armed collector claims the slots the destination already
+  has instead of building new ones: `ElementSeq` / `StringSeq` / `BlobSeq` write the
+  element default over one, `FramedSeq` runs the `reset` you hand it on the object
+  that is there, and `BlobSeq` writes the payload into the `Uint8Array` the last
+  decode left when its length matches. `end()`, at the wrapper sequence's end, cuts
+  the array to this decode's length, so a shorter message leaves none of the
+  previous one's tail. The consequence is the one to plan for: an element object, a
+  nested row and a blob buffer an earlier decode handed out are rewritten in place,
+  so a reference you kept into an earlier message becomes a reference into the one
+  being decoded now — copy out what must outlive the next decode. A decode that is
+  refused before `end()` leaves the elements it decoded and, past them, the
+  previous message's.
 
 ### Receiver limits
 
