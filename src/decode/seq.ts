@@ -39,6 +39,37 @@
  *   destination grows, so a rejection leaves the array exactly as it was and a
  *   lower id delivered afterwards still lands correctly.
  *
+ * **Reuse mode** ({@link ElementSeq.reuse} and its three twins), for a decode into
+ * a destination that already holds an earlier message (ARCHITECTURE §8). Armed, a
+ * collector claims the slots that are already there instead of building new ones —
+ * `def` written over them, or the caller's `reset` run on them — and
+ * {@link ElementSeq.end} cuts the array to the length *this* decode gave it, so a
+ * shorter message cannot leave the previous one's tail behind to be read as
+ * elements of this one.
+ *
+ * The rules above are untouched by it: the same two bounds, checked at the same
+ * moment, the same gap fill, the same last-occurrence-wins. What changes is only
+ * where a slot's storage comes from. One number keeps the three states of a slot
+ * apart — the length this decode has claimed, which is also the length `end`
+ * truncates to: below it the slot is this decode's own and is never reset twice (a
+ * re-opened element still merges into what it already built, §7.4); at or above it
+ * a slot an earlier decode filled is claimed in place; past that it is pushed,
+ * exactly as a fresh collector does.
+ *
+ * **What the mode costs a caller who never asked for it**, since every line of it
+ * sits on the per-element path: the claim-in-place loop is one comparison against
+ * `0`, and {@link BlobSeq.element}'s arm is one field test. Measured against the
+ * same collectors before the mode existed (Callgrind rep-subtraction, 2000 → 22000
+ * reps, fresh collectors): a 64-element `string` wrapper array +0.6 % on the V8
+ * optimizing tier and −0.4 % on the baseline tier, a 32-element framed array
+ * +0.3 % / +0.2 %, and a 16-element `blob` array +0.4 % on the baseline tier but
+ * **+4.5 %** on the optimizing tier (30,997 against 29,663 Ir/op). That last one
+ * is `element`'s field test, not the loops: 70 % of it goes away if the arm is
+ * removed, because the branch is what pushes `element` past what V8 will inline
+ * into the visitor callback. It is the price of serving both modes from one
+ * object; splitting `element` in two is what would buy it back, and that is the
+ * generated layer's call to make, with its own numbers (sofa-buffers/generator#760).
+ *
  * **Two bounds, never both** (§6.2.1). Index and element length each carry a
  * schema bound and a receiver cap, and exactly one of the pair applies: where the
  * schema declared a bound its violation is `INVALID` — a statement about validity
@@ -220,6 +251,27 @@ export class ElementSeq<T> {
    */
   private readonly bound: number;
 
+  /**
+   * How many leading slots **this** decode has claimed: the highest id it placed
+   * or reserved, plus one — the array's length as §5.1 defines it, and the length
+   * {@link end} cuts `out` back to.
+   *
+   * Equal to `out.length` except in reuse mode, where the slots an earlier decode
+   * left past this point are still there, waiting to be claimed or cut. It
+   * therefore starts at `out.length`, not at zero: a collector that was *not*
+   * armed treats a destination that already holds slots as its own, which is what
+   * it did before reuse mode existed and what a re-opened wrapper sequence needs
+   * (§7.4).
+   */
+  private len: number;
+
+  /**
+   * How many leading slots arrived already filled, by an **earlier** decode into
+   * the same destination: `0` unless {@link reuse} armed this collector, which is
+   * what makes every branch below inert in the fresh case.
+   */
+  private prev = 0;
+
   constructor(
     readonly out: T[],
     readonly def: T,
@@ -231,6 +283,69 @@ export class ElementSeq<T> {
     // — so an unbounded array is the only one that HAS a receiver cap to validate.
     if (cap < 0) requireReceiverBound(cap, receiverCap, "the receiver array-index cap", name);
     this.bound = indexBound(cap, receiverCap);
+    this.len = out.length;
+  }
+
+  /**
+   * Arm **reuse mode**: the slots `out` already holds are this decode's to claim
+   * in place, and {@link end} will cut the array back to the length this decode
+   * gives it.
+   *
+   * For a destination that already holds an earlier decode (ARCHITECTURE §8) — a
+   * receive loop decoding message after message into one object. The only state it
+   * takes is how many slots were already there, so it belongs before the first
+   * element, which is where generated code builds its collectors anyway. Nothing
+   * else about the collector changes: the same bounds, the same verdicts, the same
+   * `out`.
+   *
+   * A gap is still the element default, so a slot an earlier decode filled and
+   * this one does not mention is **overwritten** with `def`, never kept: the value
+   * of an absent element is its default, whatever the destination happened to hold.
+   *
+   * @returns this collector, so it can be armed where it is built.
+   */
+  reuse(): this {
+    this.prev = this.out.length;
+    this.len = 0;
+    return this;
+  }
+
+  /**
+   * The array has ended: cut `out` to the length *this* decode gave it.
+   *
+   * A wrapper array's length is its highest present id + 1 (§5.1), and in reuse
+   * mode that can be **shorter** than what the destination already held — so
+   * without this cut the previous message's tail would read as elements of this
+   * one. It is the same cut the decoder itself makes for a plain bulk destination
+   * at `arrayEnd`, for the same reason.
+   *
+   * A no-op on a fresh collector, whose array is that length already, so generated
+   * code can call it unconditionally at the wrapper sequence's end. Afterwards the
+   * array and this collector agree again: a further element appends, and a second
+   * `end()` changes nothing.
+   */
+  end(): void {
+    if (this.out.length > this.len) this.out.length = this.len;
+    this.prev = 0;
+  }
+
+  /**
+   * What an **earlier** decode left at `out[id]`, or `null` if there is nothing
+   * there this decode may take over — the slot is already this decode's own, or
+   * past the end of the array, or this collector is not in reuse mode at all.
+   *
+   * The hook for reusing an **element's** storage, one level below the slot's: a
+   * `Uint8Array` that is the right size for the payload now arriving
+   * ({@link PayloadAcc.takeInto}, which is what {@link BlobSeq} does with this), a
+   * typed matrix row that still holds the right element count, a nested row's
+   * array. Whether the old storage fits is the caller's test, since what "fits"
+   * means belongs to the type; this hands over the candidate and nothing else.
+   *
+   * It reports a slot **before** it is claimed, and claiming it is what replaces
+   * the contents — so the value is taken from here first and placed afterwards.
+   */
+  staleAt(id: number): T | null {
+    return id >= this.len && id < this.prev ? this.out[id]! : null;
   }
 
   /**
@@ -244,10 +359,21 @@ export class ElementSeq<T> {
    */
   reserve(id: number): void {
     if (id >= this.bound) rejectIndex(id, this.cap, this.receiverCap, this.name);
+    const out = this.out;
+    const stale = this.prev;
+    let i = this.len;
+    // Reuse mode's half: a slot an earlier decode filled is already there, so it
+    // is written rather than pushed. `stale` is `0` on a fresh collector, which is
+    // what keeps this loop to one comparison for every other caller.
+    while (i < stale && i <= id) out[i++] = this.def;
     // Grow to at least id + 1 (ARCHITECTURE §9.5 shape B): `push` leaves the
     // geometry to the engine's own amortised doubling, so a sparse array does not
     // cost O(n²) copies.
-    while (this.out.length <= id) this.out.push(this.def);
+    while (i <= id) {
+      out.push(this.def);
+      i++;
+    }
+    this.len = i;
   }
 
   /**
@@ -274,8 +400,16 @@ export class ElementSeq<T> {
    */
   place(id: number, value: T): void {
     if (id >= this.bound) rejectIndex(id, this.cap, this.receiverCap, this.name);
-    while (this.out.length <= id) this.out.push(this.def);
-    this.out[id] = value;
+    const out = this.out;
+    const stale = this.prev;
+    let i = this.len;
+    while (i < stale && i <= id) out[i++] = this.def;
+    while (i <= id) {
+      out.push(this.def);
+      i++;
+    }
+    this.len = i;
+    out[id] = value;
   }
 }
 
@@ -321,6 +455,19 @@ export class FramedSeq<T> {
   /** The one index bound in force, picked once by `indexBound` — see {@link ElementSeq}. */
   private readonly bound: number;
 
+  /** The length this decode has claimed, as in {@link ElementSeq} — `out.length` until armed. */
+  private len: number;
+
+  /** The slots an earlier decode left behind, as in {@link ElementSeq}. */
+  private prev = 0;
+
+  /**
+   * How a slot an earlier decode built is brought back to the element default,
+   * set by {@link reuse}: `make`'s counterpart for storage that already exists.
+   * `null` on a fresh collector, which never reaches it.
+   */
+  private resetSlot: ((slot: T) => void) | null = null;
+
   constructor(
     readonly out: T[],
     readonly make: () => T,
@@ -330,6 +477,54 @@ export class FramedSeq<T> {
   ) {
     if (cap < 0) requireReceiverBound(cap, receiverCap, "the receiver array-index cap", name);
     this.bound = indexBound(cap, receiverCap);
+    this.len = out.length;
+  }
+
+  /**
+   * Arm **reuse mode** — {@link ElementSeq.reuse}, plus the one thing a framed
+   * element needs that a shared `def` does not: how to bring a slot that already
+   * holds an object back to the element default.
+   *
+   * `reset` is `make`'s counterpart for storage that exists: it must leave the
+   * object it is handed exactly as `make()` would have built it, because that
+   * object becomes either a gap — whose value is the element default — or the
+   * destination an arriving element decodes into, which starts from the default
+   * and merges. A generated element's own field-clearing step is that function; a
+   * nested row's is `(row) => { row.length = 0 }`. Reusing the object is the whole
+   * point, so it is reset, never replaced.
+   *
+   * It runs once per slot per decode, on the slots an earlier decode filled, and
+   * never on a slot this decode has already claimed — a re-opened element keeps
+   * what its first opening decoded (§7.4).
+   *
+   * @returns this collector, so it can be armed where it is built.
+   */
+  reuse(reset: (slot: T) => void): this {
+    this.prev = this.out.length;
+    this.len = 0;
+    this.resetSlot = reset;
+    return this;
+  }
+
+  /** The array has ended: cut `out` to this decode's length — {@link ElementSeq.end}. */
+  end(): void {
+    if (this.out.length > this.len) this.out.length = this.len;
+    this.prev = 0;
+  }
+
+  /**
+   * The object an **earlier** decode left at `out[id]`, or `null` — see
+   * {@link ElementSeq.staleAt}.
+   *
+   * {@link reuse}'s `reset` covers the slot whose element decodes **in place**. A
+   * slot whose element is *replaced* — a nested row, which {@link place} assigns —
+   * is where this is needed instead: the generated code builds the row's storage
+   * itself, so it asks here for the array the last decode left and keeps it when it
+   * is still the right length (a typed matrix row with the same element count), or
+   * allocates when it is not.
+   */
+  staleAt(id: number): T | null {
+    return id >= this.len && id < this.prev ? this.out[id]! : null;
   }
 
   /**
@@ -357,10 +552,21 @@ export class FramedSeq<T> {
    */
   reserve(id: number): void {
     if (id >= this.bound) rejectIndex(id, this.cap, this.receiverCap, this.name);
+    const out = this.out;
+    const stale = this.prev;
+    let i = this.len;
+    // Reuse mode's half: the object an earlier decode built here is reset and kept,
+    // which is the allocation this mode exists to avoid. `stale` is `0` on a fresh
+    // collector, so this costs one comparison there.
+    while (i < stale && i <= id) this.resetSlot!(out[i++]!);
     // Grow to at least id + 1 (ARCHITECTURE §9.5 shape B): `push` leaves the
     // geometry to the engine's own amortised doubling, so a sparse array does not
     // cost O(n²) copies.
-    while (this.out.length <= id) this.out.push(this.make());
+    while (i <= id) {
+      out.push(this.make());
+      i++;
+    }
+    this.len = i;
   }
 
   /**
@@ -375,8 +581,16 @@ export class FramedSeq<T> {
    */
   place(id: number, value: T): void {
     if (id >= this.bound) rejectIndex(id, this.cap, this.receiverCap, this.name);
-    while (this.out.length < id) this.out.push(this.make());
-    this.out[id] = value;
+    const out = this.out;
+    const stale = this.prev;
+    let i = this.len;
+    while (i < stale && i < id) this.resetSlot!(out[i++]!);
+    while (i < id) {
+      out.push(this.make());
+      i++;
+    }
+    out[id] = value;
+    if (id >= this.len) this.len = id + 1;
   }
 }
 
@@ -423,6 +637,23 @@ export class StringSeq {
     // The index bound is validated by `ElementSeq`; this is the length bound's half.
     requireReceiverBound(elemMax, receiverElemMax, "the receiver element-length cap", name);
     this.slots = new ElementSeq(out, "", cap, name, receiverCap);
+  }
+
+  /**
+   * Arm **reuse mode** — see {@link ElementSeq.reuse}. A `string` is immutable, so
+   * an element has no storage of its own to take over and this is the slots' half
+   * alone: a gap written back to `""`, and {@link end}'s cut.
+   *
+   * @returns this collector, so it can be armed where it is built.
+   */
+  reuse(): this {
+    this.slots.reuse();
+    return this;
+  }
+
+  /** The array has ended: cut `out` to this decode's length — {@link ElementSeq.end}. */
+  end(): void {
+    this.slots.end();
   }
 
   /**
@@ -490,8 +721,9 @@ export class StringSeq {
  * than decoded, and gaps are filled with an empty {@link Uint8Array}.
  *
  * Each element is storage of its own — what {@link PayloadAcc} returns is a buffer
- * it allocated and handed over, never a view into the fed chunk (§6.7) — so a
- * stored element cannot rot when the caller reuses its input.
+ * it allocated and handed over, or in reuse mode one the destination already held,
+ * never a view into the fed chunk (§6.7) — so a stored element cannot rot when the
+ * caller reuses its input.
  *
  * @param out The destination, placed at `out[id]`.
  * @param acc The decoder's shared {@link PayloadAcc}.
@@ -509,6 +741,13 @@ export class BlobSeq {
   /** The index rules and both index bounds, shared with every other element kind. */
   private readonly slots: ElementSeq<Uint8Array>;
 
+  /**
+   * Whether {@link reuse} armed this collector — the one thing {@link element}
+   * has to know, since a fresh decode must not pay for the lookup that finds the
+   * previous decode's buffer.
+   */
+  private reusing = false;
+
   constructor(
     readonly out: Uint8Array[],
     readonly acc: PayloadAcc,
@@ -521,6 +760,31 @@ export class BlobSeq {
     // The index bound is validated by `ElementSeq`; this is the length bound's half.
     requireReceiverBound(elemMax, receiverElemMax, "the receiver element-length cap", name);
     this.slots = new ElementSeq(out, NO_BYTES, cap, name, receiverCap);
+  }
+
+  /**
+   * Arm **reuse mode** — see {@link ElementSeq.reuse}, and here it reaches the
+   * element's own storage too: where the previous decode left a `Uint8Array` at
+   * this index and the payload now arriving is exactly its length, the payload is
+   * written into that buffer ({@link PayloadAcc.takeInto}) instead of into a new
+   * one. A length that does not match allocates, as always — the buffer's length
+   * *is* the element's length, so there is nothing to trim it with.
+   *
+   * The buffer the previous decode handed out is therefore **overwritten**: a
+   * caller that kept a reference to an element of an earlier message sees it
+   * change. That is what decoding into a reused destination means, one level down.
+   *
+   * @returns this collector, so it can be armed where it is built.
+   */
+  reuse(): this {
+    this.slots.reuse();
+    this.reusing = true;
+    return this;
+  }
+
+  /** The array has ended: cut `out` to this decode's length — {@link ElementSeq.end}. */
+  end(): void {
+    this.slots.end();
   }
 
   /** See {@link StringSeq.begin} — the early bound check, for subtype `blob`. */
@@ -539,9 +803,41 @@ export class BlobSeq {
     end: number,
   ): void {
     this.check(id, total);
-    const payload = this.acc.take(total, offset, src, start, end);
+    const payload = this.reusing
+      ? this.takeReusing(id, total, offset, src, start, end)
+      : this.acc.take(total, offset, src, start, end);
     if (payload === null) return;
     this.slots.place(id, payload);
+  }
+
+  /**
+   * The reuse arm of {@link element}, one level below the slot: the buffer the
+   * previous decode left at this index is this payload's destination when it is
+   * exactly the right size, so a steady-state receive loop allocates no payload
+   * storage at all.
+   *
+   * A method of its own rather than a branch spliced into `element`, because
+   * `element` is the per-piece path and its *size* is a budget there —
+   * `DecoderState.fpDrain`'s lever. It does not buy the field test above back
+   * (measured: the two shapes read the same), it keeps the body that every caller
+   * runs from growing by the body only reuse callers run.
+   *
+   * The slot is read **before** it is claimed — `place` overwrites it — and the
+   * same buffer is found again for every piece of a split payload, because nothing
+   * claims the slot until the last piece completes.
+   */
+  private takeReusing(
+    id: number,
+    total: number,
+    offset: number,
+    src: Uint8Array,
+    start: number,
+    end: number,
+  ): Uint8Array | null {
+    const dst = this.slots.staleAt(id);
+    return dst !== null && dst.length === total
+      ? this.acc.takeInto(dst, total, offset, src, start, end)
+      : this.acc.take(total, offset, src, start, end);
   }
 
   /** Every bound for one element. Rejects **before** the destination grows. */
