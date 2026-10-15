@@ -298,6 +298,13 @@ export class ElementSeq<T> {
    * else about the collector changes: the same bounds, the same verdicts, the same
    * `out`.
    *
+   * **Once per destination, not once per opening.** A wrapper sequence may be
+   * opened twice in one message, and the second opening continues the array the
+   * first one built (§7.4) — so {@link end} is the per-opening hook and this is
+   * not: arming again at the second opening would file the first opening's own
+   * elements as an earlier decode's, and `end()` would then cut them off. One
+   * collector, armed once, for the whole decode.
+   *
    * A gap is still the element default, so a slot an earlier decode filled and
    * this one does not mention is **overwritten** with `def`, never kept: the value
    * of an absent element is its default, whatever the destination happened to hold.
@@ -463,10 +470,11 @@ export class FramedSeq<T> {
 
   /**
    * How a slot an earlier decode built is brought back to the element default,
-   * set by {@link reuse}: `make`'s counterpart for storage that already exists.
-   * `null` on a fresh collector, which never reaches it.
+   * set by {@link reuse}: `make`'s counterpart for storage that already exists,
+   * returning the value the slot should hold. `null` on a fresh collector, which
+   * never reaches it.
    */
-  private resetSlot: ((slot: T) => void) | null = null;
+  private resetSlot: ((slot: T) => T) | null = null;
 
   constructor(
     readonly out: T[],
@@ -481,25 +489,46 @@ export class FramedSeq<T> {
   }
 
   /**
-   * Arm **reuse mode** — {@link ElementSeq.reuse}, plus the one thing a framed
-   * element needs that a shared `def` does not: how to bring a slot that already
-   * holds an object back to the element default.
+   * Arm **reuse mode** — {@link ElementSeq.reuse}, including its once-per-destination
+   * rule, plus the one thing a framed element needs that a shared `def` does not:
+   * how a slot that already holds an object gets back to the element default.
    *
-   * `reset` is `make`'s counterpart for storage that exists: it must leave the
-   * object it is handed exactly as `make()` would have built it, because that
-   * object becomes either a gap — whose value is the element default — or the
-   * destination an arriving element decodes into, which starts from the default
-   * and merges. A generated element's own field-clearing step is that function; a
-   * nested row's is `(row) => { row.length = 0 }`. Reusing the object is the whole
-   * point, so it is reset, never replaced.
+   * `reset` is `make`'s counterpart for storage that already exists. Handed the
+   * object the last decode left in a slot, it returns **the value that slot should
+   * now hold**, which must be what `make()` would have built — because that value
+   * becomes either a gap, whose value is the element default, or the destination an
+   * arriving element decodes into, which starts from the default and merges.
+   *
+   * Returning the object it was handed is the point of the mode and the common
+   * case: a generated element's own field-clearing step, `(e) => { e.clear();
+   * return e; }`, or a nested row's `(row) => { row.length = 0; return row; }`.
+   * It **returns** a value rather than mutating in place because not every element
+   * type can be emptied in place — a `Float32Array` row's length is read-only, so
+   * its only honest reset is `() => new Float32Array(0)`, and a `reset` that could
+   * not say so would leave the previous message's row standing in a gap, which is
+   * exactly what §5.1 says a gap is not. (For that shape {@link ElementSeq} with
+   * one shared zero-length default is the lighter answer: an empty typed array has
+   * no state to share. {@link FramedSeq} is for the elements that do.)
    *
    * It runs once per slot per decode, on the slots an earlier decode filled, and
    * never on a slot this decode has already claimed — a re-opened element keeps
-   * what its first opening decoded (§7.4).
+   * what its first opening decoded (§7.4) — and never on a slot {@link place} is
+   * about to overwrite.
+   *
+   * A `reset` that is not a function is refused here, with `Argument`, rather than
+   * from inside the first element's `reserve`: §6.3's third row, and the same
+   * reasoning as {@link requireReceiverBound}'s — a caller mistake is reported
+   * before anything is decoded, not half way through a destination.
    *
    * @returns this collector, so it can be armed where it is built.
    */
-  reuse(reset: (slot: T) => void): this {
+  reuse(reset: (slot: T) => T): this {
+    if (typeof reset !== "function") {
+      throw argumentError(
+        `${this.name}: reuse() needs a reset function that returns the slot's ` +
+          `value, got ${typeof reset}`,
+      );
+    }
     this.prev = this.out.length;
     this.len = 0;
     this.resetSlot = reset;
@@ -516,12 +545,13 @@ export class FramedSeq<T> {
    * The object an **earlier** decode left at `out[id]`, or `null` — see
    * {@link ElementSeq.staleAt}.
    *
-   * {@link reuse}'s `reset` covers the slot whose element decodes **in place**. A
-   * slot whose element is *replaced* — a nested row, which {@link place} assigns —
-   * is where this is needed instead: the generated code builds the row's storage
-   * itself, so it asks here for the array the last decode left and keeps it when it
-   * is still the right length (a typed matrix row with the same element count), or
-   * allocates when it is not.
+   * {@link reuse}'s `reset` is what a slot's **own** value goes through, gap or
+   * not. This is for the slot whose element is *replaced* rather than decoded into
+   * — a row, which {@link place} assigns: the generated code builds the row's
+   * storage itself, so it asks here for the array the last decode left and keeps it
+   * when it is still the right length (a typed matrix row with the same element
+   * count), or allocates when it is not. A slot `place` overwrites is never passed
+   * to `reset`, so this is the only way to see what was there.
    */
   staleAt(id: number): T | null {
     return id >= this.len && id < this.prev ? this.out[id]! : null;
@@ -558,7 +588,10 @@ export class FramedSeq<T> {
     // Reuse mode's half: the object an earlier decode built here is reset and kept,
     // which is the allocation this mode exists to avoid. `stale` is `0` on a fresh
     // collector, so this costs one comparison there.
-    while (i < stale && i <= id) this.resetSlot!(out[i++]!);
+    while (i < stale && i <= id) {
+      out[i] = this.resetSlot!(out[i]!);
+      i++;
+    }
     // Grow to at least id + 1 (ARCHITECTURE §9.5 shape B): `push` leaves the
     // geometry to the engine's own amortised doubling, so a sparse array does not
     // cost O(n²) copies.
@@ -584,7 +617,10 @@ export class FramedSeq<T> {
     const out = this.out;
     const stale = this.prev;
     let i = this.len;
-    while (i < stale && i < id) this.resetSlot!(out[i++]!);
+    while (i < stale && i < id) {
+      out[i] = this.resetSlot!(out[i]!);
+      i++;
+    }
     while (i < id) {
       out.push(this.make());
       i++;
@@ -774,6 +810,17 @@ export class BlobSeq {
    * caller that kept a reference to an element of an earlier message sees it
    * change. That is what decoding into a reused destination means, one level down.
    *
+   * And it is overwritten **as the pieces arrive**, which is what buys the chunked
+   * path. So a decode abandoned part-way through an element's payload — a chunk
+   * boundary that never gets its continuation, an `INVALID` later in the message —
+   * leaves that one element holding a *mix* of the new payload's leading bytes and
+   * the old one's tail: not the value that was there, and not a value that was ever
+   * on the wire. Every other element of the retained message is untouched, and the
+   * ones this decode completed are complete. A caller that falls back to the last
+   * good message on a refusal cannot rely on the element a refused decode had
+   * already started; nothing short of buffering the payload elsewhere would change
+   * that, and buffering it is the allocation this mode exists to remove.
+   *
    * @returns this collector, so it can be armed where it is built.
    */
   reuse(): this {
@@ -782,9 +829,13 @@ export class BlobSeq {
     return this;
   }
 
-  /** The array has ended: cut `out` to this decode's length — {@link ElementSeq.end}. */
+  /**
+   * The array has ended: cut `out` to this decode's length — {@link ElementSeq.end}
+   * — and disarm, so an element after it costs nothing for a window that is gone.
+   */
   end(): void {
     this.slots.end();
+    this.reusing = false;
   }
 
   /** See {@link StringSeq.begin} — the early bound check, for subtype `blob`. */

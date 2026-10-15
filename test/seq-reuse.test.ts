@@ -261,6 +261,7 @@ describe("FramedSeq in reuse mode resets the object it already built", () => {
       reset++;
       e.n = 0;
       e.tag = "";
+      return e;
     });
     return { slots, built: () => built, reset: () => reset };
   }
@@ -321,6 +322,7 @@ describe("FramedSeq in reuse mode resets the object it already built", () => {
     const rows = new FramedSeq<number[]>(out, () => [], 8, "matrix", WIDE_INDEX).reuse((r) => {
       reset++;
       r.length = 0;
+      return r;
     });
     const fresh = [9];
     rows.place(1, fresh);
@@ -376,6 +378,47 @@ describe("FramedSeq in reuse mode resets the object it already built", () => {
     rows.end();
     expect(out[0]).toBe(row);
     expect(out).toHaveLength(1);
+  });
+
+  it("puts the element default in a gap whose storage cannot be emptied in place", () => {
+    // Why `reset` returns a value instead of mutating: a `Float32Array`'s length is
+    // read-only, so a void reset would have no legal body for this shape and the
+    // slot would keep the *previous message's* row — which is precisely what §5.1
+    // says a gap is not. The default comes from the same place a fresh decode's
+    // would, and the rows that are present are still reused.
+    const kept = Float32Array.of(1, 2, 3);
+    const out = [kept, Float32Array.of(7, 7), Float32Array.of(9)];
+    const rows = new FramedSeq<Float32Array>(
+      out,
+      () => new Float32Array(0),
+      UNBOUNDED,
+      "matrix",
+      16,
+    ).reuse(() => new Float32Array(0));
+
+    // The storage of a row that IS present is kept the way a typed row has to keep
+    // it — the caller compares the length and hands the old array back through
+    // `place` — so the only slot `reset` decides is the gap.
+    const old = rows.staleAt(0);
+    rows.place(0, old !== null && old.length === 3 ? old : new Float32Array(3));
+    rows.place(2, Float32Array.of(6));
+    rows.end(); // id 1 was never mentioned
+
+    expect(out[0]).toBe(kept);
+    expect(out[1]).toHaveLength(0);
+    expect([...out[2]!]).toStrictEqual([6]);
+    expect(out).toHaveLength(3);
+  });
+
+  it("refuses a reset that is not a function, before anything is claimed", () => {
+    // The file's own rule for a caller mistake (§6.3's third row): `Argument` at
+    // construction, not a platform TypeError from inside the first element.
+    const out = [new Elem()];
+    const build = (): unknown =>
+      new FramedSeq<Elem>(out, () => new Elem(), 8, "rows", WIDE_INDEX).reuse(
+        undefined as unknown as (slot: Elem) => Elem,
+      );
+    expect(codeOf(build)).toBe(SofabErrorCode.Argument);
   });
 });
 
@@ -641,6 +684,40 @@ describe("BlobSeq writes the payload into the buffer that is already there", () 
         expect(bytes(out)).toStrictEqual(bytes(fresh));
       }
     }
+  });
+
+  it("leaves the element it had started torn when the decode never finishes", () => {
+    // Documented, not desirable: the payload lands in the destination's own buffer
+    // as the pieces arrive, so a decode cut off inside an element leaves that one
+    // element holding the new payload's leading bytes over the old one's tail. The
+    // elements this decode completed are complete, and every element it never
+    // reached still holds the previous message's value.
+    const out: Uint8Array[] = [];
+    const first = wrapper((os) => {
+      os.writeBlob(0, Uint8Array.of(1, 1, 1, 1, 1, 1, 1, 1));
+      os.writeBlob(1, Uint8Array.of(2, 2));
+    });
+    reuseBlobs(first, out);
+    const kept = out[0]!;
+
+    const second = wrapper((os) => os.writeBlob(0, Uint8Array.of(9, 9, 9, 9, 9, 9, 9, 9)));
+    const seq = new BlobSeq(
+      out,
+      new PayloadAcc(),
+      UNBOUNDED,
+      UNBOUNDED,
+      "chunks",
+      WIDE_INDEX,
+      WIDE_LEN,
+    ).reuse();
+    const is = new IStream(router(seq, FixlenSubtype.Blob));
+    expect(is.feed(second.subarray(0, second.length - 4))).toBe(DecodeStatus.Incomplete);
+
+    expect(out[0]).toBe(kept);
+    expect([...kept].some((b) => b === 9)).toBe(true);
+    expect([...kept].some((b) => b === 1)).toBe(true);
+    // …and the element the cut-off decode never reached is still the first message's.
+    expect([...out[1]!]).toStrictEqual([2, 2]);
   });
 
   it("copies out of the fed chunk, into the buffer it is reusing", () => {
