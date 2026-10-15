@@ -120,8 +120,12 @@ export class PayloadAcc {
    * without re-implementing the join: `dst` is adopted at `offset === 0` and the
    * pieces land in it as they arrive, so a payload split across `feed` calls costs
    * no more than one that arrived whole. The pieces of **one** payload must all be
-   * offered the same `dst`; what comes back is the buffer the payload was actually
-   * assembled in, which is the one adopted at offset 0.
+   * offered the same `dst`, and a continuation piece offered a buffer the payload
+   * in progress did **not** start in is ignored — `null`, like any other late
+   * fragment with nothing to append to. That is what keeps the copy below exact:
+   * the buffer being filled is always this `dst`, so the room left in it is
+   * `total - len` and a piece can never run past its end as a platform
+   * `RangeError`.
    *
    * **A destination of the wrong size is a caller mistake**, not a verdict about
    * the message: `Argument` (CORELIB_PLAN §6.3's third row, §6.6.3 — "a
@@ -154,23 +158,29 @@ export class PayloadAcc {
     if (offset === 0) {
       this.buf = dst;
       this.len = 0;
+    } else if (this.buf !== dst) {
+      // No payload in progress *in this buffer*: either nothing is in flight, or
+      // what is in flight is assembling somewhere else — a payload an earlier
+      // `take` started and abandoned, say, whose buffer is a different size. The
+      // piece is dropped rather than appended to a stranger, which is also what
+      // leaves `dst` as the only buffer written below.
+      return null;
     }
-    const b = this.buf;
-    if (b === null) return null;
     // Clamped to the room that is left. Unreachable from this library's decoder —
     // a piece never runs past the payload it belongs to — and cheap: an over-long
     // piece would otherwise leave the corelib as a platform `RangeError` from
     // `set`, which is not one of the outcomes a caller's
-    // `catch (e) { if (e instanceof SofabError) … }` handles.
+    // `catch (e) { if (e instanceof SofabError) … }` handles. The room is exact
+    // here: `dst.length` is `total`, checked above.
     let n = end - start;
     const room = total - this.len;
     if (n > room) n = room;
     if (n > 0) {
-      b.set(src.subarray(start, start + n), this.len);
+      dst.set(src.subarray(start, start + n), this.len);
       this.len += n;
     }
     if (this.len < total) return null;
     this.buf = null;
-    return b;
+    return dst;
   }
 }

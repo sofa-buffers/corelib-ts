@@ -277,6 +277,27 @@ describe("PayloadAcc.takeInto writes into a buffer the caller owns", () => {
     expect([...dst]).toStrictEqual([...next]);
   });
 
+  it("ignores a continuation piece offered a buffer its payload did not start in", () => {
+    // The payload in progress belongs to the buffer it was started in. A piece
+    // offered a different `dst` is a late fragment with nothing to append to —
+    // `null`, not a copy into a stranger, and not the platform `RangeError` that
+    // appending to a shorter leftover buffer would raise.
+    const acc = new PayloadAcc();
+    const src = Uint8Array.from({ length: 8 }, (_, i) => i + 1);
+    expect(acc.take(4, 0, src, 0, 2)).toBeNull(); // started, then abandoned
+    const dst8 = new Uint8Array(8);
+    expect(acc.takeInto(dst8, 8, 4, src, 0, 4)).toBeNull();
+    expect([...dst8].every((b) => b === 0)).toBe(true);
+    // The same, with two `takeInto` destinations of the same size.
+    const a = new Uint8Array(6);
+    const b = new Uint8Array(6);
+    expect(acc.takeInto(a, 6, 0, src, 0, 3)).toBeNull();
+    expect(acc.takeInto(b, 6, 3, src, 3, 6)).toBeNull();
+    expect([...b].every((x) => x === 0)).toBe(true);
+    expect(acc.takeInto(a, 6, 3, src, 3, 6)).toBe(a);
+    expect([...a]).toStrictEqual([...src.subarray(0, 6)]);
+  });
+
   it("trims a chunk that runs past the declared total", () => {
     const acc = new PayloadAcc();
     const dst = new Uint8Array(4);

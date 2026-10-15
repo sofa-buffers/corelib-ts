@@ -716,8 +716,8 @@ Who owns the bytes:
   message's storage.** Each of the four collectors takes a `reuse()` before its
   first element, and an armed collector claims the slots the destination already
   has instead of building new ones: `ElementSeq` / `StringSeq` / `BlobSeq` write the
-  element default over one, `FramedSeq` runs the `reset` you hand it on the object
-  that is there, and `BlobSeq` writes the payload into the `Uint8Array` the last
+  element default over one, `FramedSeq` puts what the `reset` you hand it returns
+  for the object that is there, and `BlobSeq` writes the payload into the `Uint8Array` the last
   decode left when its length matches. `end()`, at the wrapper sequence's end, cuts
   the array to this decode's length, so a shorter message leaves none of the
   previous one's tail. The consequence is the one to plan for: an element object, a
@@ -725,7 +725,8 @@ Who owns the bytes:
   so a reference you kept into an earlier message becomes a reference into the one
   being decoded now — copy out what must outlive the next decode. A decode that is
   refused before `end()` leaves the elements it decoded and, past them, the
-  previous message's.
+  previous message's — except for the one element whose payload it had started,
+  which holds the new payload's leading bytes over the old one's tail.
 
 ### Receiver limits
 
