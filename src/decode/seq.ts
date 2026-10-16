@@ -812,14 +812,16 @@ export class BlobSeq {
    *
    * And it is overwritten **as the pieces arrive**, which is what buys the chunked
    * path. So a decode abandoned part-way through an element's payload — a chunk
-   * boundary that never gets its continuation, an `INVALID` later in the message —
-   * leaves that one element holding a *mix* of the new payload's leading bytes and
-   * the old one's tail: not the value that was there, and not a value that was ever
-   * on the wire. Every other element of the retained message is untouched, and the
-   * ones this decode completed are complete. A caller that falls back to the last
-   * good message on a refusal cannot rely on the element a refused decode had
-   * already started; nothing short of buffering the payload elsewhere would change
-   * that, and buffering it is the allocation this mode exists to remove.
+   * boundary that never gets its continuation, an `INVALID` later in the message, a
+   * one-shot buffer that ends inside the payload — leaves that one element holding
+   * a *mix* of the new payload's leading bytes and the old one's tail: not the value
+   * that was there, and not a value that was ever on the wire. Every other element
+   * of the retained message is untouched, and the ones this decode completed are
+   * complete. A caller that falls back to the last good message cannot rely on the
+   * element the abandoned decode had already started — whether it was abandoned by
+   * a refusal or by a truncation `tryDecode` reported as a returned `Incomplete`;
+   * nothing short of buffering the payload elsewhere would change that, and
+   * buffering it is the allocation this mode exists to remove.
    *
    * @returns this collector, so it can be armed where it is built.
    */

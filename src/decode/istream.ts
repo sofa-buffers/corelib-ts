@@ -611,6 +611,19 @@ export function decode(bytes: Uint8Array, visitor: Visitor): void {
  * `LIMIT_EXCEEDED` from a visitor enforcing a receiver cap, `ARGUMENT` for a
  * caller mistake. The return type is {@link FeedStatus} for that reason: a
  * caller switching on it has no `Invalid` arm to write.
+ *
+ * **An `Incomplete` is an abandoned decode, not a decode that did nothing.** Every
+ * field the bytes did reach has already been reported, and a visitor decoding into
+ * a *reused* destination ({@link BlobSeq.reuse}, {@link PayloadAcc.takeReusing})
+ * has already written into it: the element a truncated payload was landing in is
+ * left holding the new payload's leading bytes over the old one's tail — not the
+ * value that was there, and not a value that was ever on the wire. {@link decode}
+ * delivered that case as a throw, which is hard to mistake for "nothing happened";
+ * a returned status is easy to, so it is said here. A caller that falls back to its
+ * last good message on an `Incomplete` must treat the destination exactly as it
+ * treats one after a refusal — the element a truncated decode had already started
+ * is not recoverable from the destination, which is {@link BlobSeq.reuse}'s own
+ * terms and the allocation that mode exists to remove.
  */
 export function tryDecode(bytes: Uint8Array, visitor: Visitor): FeedStatus {
   const state = pooled ?? new DecoderState();

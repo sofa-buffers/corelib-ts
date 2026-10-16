@@ -854,9 +854,10 @@ fed one byte at a time), `skip-ids.test.ts` (every vector that carries
 `skip_ids`, decoded by a receiver that ignores those ids at every nesting level —
 contiguous, one byte at a time, and split in two at every byte boundary),
 `heap-free-codec.test.ts` (no allocation primitive on a codec path, a flat heap
-over encode and decode, no view into a fed or one-shot buffer) and `pooled-decoder-state.test.ts` (a decode aborted at every cut point
-leaves nothing behind for the next one) and `try-decode.test.ts` (`tryDecode`
-answers every prefix as one `IStream.feed` does, on the same pooled machine).
+over encode and decode, no view into a fed or one-shot buffer),
+`pooled-decoder-state.test.ts` (a decode aborted at every cut point leaves nothing
+behind for the next one) and `try-decode.test.ts` (`tryDecode` answers every
+prefix as one `IStream.feed` does, on the same pooled machine).
 
 The vector-driven suites each print one summary line — `[vectors] 131
 vectors, none gated out by requires, 524 checks` — so a run says how much of the

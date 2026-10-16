@@ -197,6 +197,17 @@ export class PayloadAcc {
    *
    * What comes back is the buffer the payload was assembled in — `kept` or a new
    * one — once the last piece lands, and `null` before.
+   *
+   * **`kept` is written as the pieces arrive**, which is what buys the chunked path
+   * and is also the price of it: a decode that never finishes the payload — a chunk
+   * boundary whose continuation does not come, a refusal later in the message, a
+   * one-shot buffer that ends mid-payload — leaves `kept` holding the new payload's
+   * leading bytes over the old one's tail. That is a value that was never on the
+   * wire, and the caller still holds the only reference to it. Whoever fell back to
+   * the previous message cannot read this buffer: nothing short of assembling the
+   * payload elsewhere would change that, and that allocation is what reuse removes.
+   * Note that the failure need not arrive as a throw — `tryDecode` reports a
+   * buffer that ends mid-payload by *returning* `Incomplete`.
    */
   takeReusing(
     kept: Uint8Array | null,

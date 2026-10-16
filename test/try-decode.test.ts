@@ -22,6 +22,9 @@
  */
 
 import { describe, expect, it } from "vitest";
+import v8 from "node:v8";
+import vm from "node:vm";
+import { FP64_HANDLE_MIN } from "../src/constants.js";
 import {
   DecodeStatus,
   IStream,
@@ -33,6 +36,18 @@ import {
   tryDecode,
   type Visitor,
 } from "../src/index.js";
+
+/**
+ * `WeakRef` is ES2021 and this project's `lib` is ES2020 — the floor the library
+ * itself compiles against, which one test has no business raising. Node has had it
+ * since 14, so the retention check below reaches it through the runtime global.
+ */
+interface Weak<T extends object> {
+  deref(): T | undefined;
+}
+const WeakRef = (
+  globalThis as unknown as { WeakRef: new <T extends object>(target: T) => Weak<T> }
+).WeakRef;
 
 /** A message touching every construct the decoder keeps state for. */
 function reference(): Uint8Array {
@@ -143,7 +158,9 @@ describe("tryDecode", () => {
     const expected: string[] = [];
     decode(REFERENCE, logger(expected));
     for (let cut = 1; cut < REFERENCE.length; cut++) {
-      tryDecode(REFERENCE.subarray(0, cut), {});
+      // Aborted with a *real* visitor: `{}` installs no array destination and no
+      // chunk handle, so a machine that kept them would still pass this sweep.
+      tryDecode(REFERENCE.subarray(0, cut), logger([]));
       const log: string[] = [];
       expect(tryDecode(REFERENCE, logger(log)), `after a cut at ${cut}`).toBe(DecodeStatus.Complete);
       expect(log, `after a cut at ${cut}`).toStrictEqual(expected);
@@ -155,6 +172,56 @@ describe("tryDecode", () => {
     const after: string[] = [];
     decode(REFERENCE, logger(after));
     expect(after).toStrictEqual(expected);
+  });
+
+  it("keeps nothing of the caller's alive in the pool after an abort", async () => {
+    // What `release()` is *for*, and the only part of it an outside observer can
+    // see: the machine goes back to the pool holding no reference to the visitor,
+    // to the chunk it was fed, or to the destination an array hand-off gave it.
+    // The sweep above cannot pin this — `begin()` clears `bulk` and re-points the
+    // visitor on the next decode, and a stale chunk handle is rebuilt the moment a
+    // different buffer arrives, so a machine that released nothing decodes exactly
+    // the same. It would merely hold the last caller's message alive for the life
+    // of the process (§6.6/§6.7), which is a liveness fact and is measured as one.
+    //
+    // An abort *inside* a bulk float array is the case that installs all three:
+    // the hand-off destination, and — past FP64_HANDLE_MIN elements in the chunk —
+    // the `DataView` over the fed buffer that the run takes.
+    v8.setFlagsFromString("--expose-gc");
+    const gc = vm.runInNewContext("gc") as () => void;
+    v8.setFlagsFromString("--no-expose-gc");
+
+    let status: string = DecodeStatus.Complete;
+    const held = (() => {
+      const os = growingOStream();
+      os.writeFp64Array(1, Array.from({ length: 4 * FP64_HANDLE_MIN }, (_, i) => i + 0.5));
+      // Cut a quarter of the elements short: the run left in the chunk is still
+      // well past the handle threshold, and the array is open when the bytes end.
+      const chunk = os.bytes().slice().subarray(0, os.bytes().length - FP64_HANDLE_MIN * 8);
+      const dest = new Float64Array(4 * FP64_HANDLE_MIN);
+      const visitor: Visitor = { arrayBulk: () => ({ f64: dest }) };
+      status = tryDecode(chunk, visitor);
+      return { visitor: new WeakRef(visitor), chunk: new WeakRef(chunk), dest: new WeakRef(dest) };
+    })();
+    expect(status).toBe(DecodeStatus.Incomplete);
+
+    // A `WeakRef` made in this job keeps its target alive until the end of it, by
+    // specification, so the collection has to happen on the other side of a turn.
+    const settle = async (): Promise<void> => {
+      await new Promise((r) => setTimeout(r, 0));
+      gc();
+    };
+    const alive = (): boolean =>
+      held.visitor.deref() !== undefined ||
+      held.chunk.deref() !== undefined ||
+      held.dest.deref() !== undefined;
+    for (let i = 0; i < 10 && alive(); i++) await settle();
+
+    expect({
+      visitor: held.visitor.deref(),
+      chunk: held.chunk.deref(),
+      dest: held.dest.deref(),
+    }).toStrictEqual({ visitor: undefined, chunk: undefined, dest: undefined });
   });
 
   it("is re-entrant: a decode started inside a callback runs on its own machine", () => {
