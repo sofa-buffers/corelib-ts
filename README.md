@@ -856,7 +856,7 @@ contiguous, one byte at a time, and split in two at every byte boundary),
 `heap-free-codec.test.ts` (no allocation primitive on a codec path, a flat heap
 over encode and decode, no view into a fed or one-shot buffer),
 `pooled-decoder-state.test.ts` (a decode aborted at every cut point leaves nothing
-behind for the next one) and `try-decode.test.ts` (`tryDecode` answers every
+behind for the next one, and keeps none of the caller's objects alive in the pool) and `try-decode.test.ts` (`tryDecode` answers every
 prefix as one `IStream.feed` does, on the same pooled machine).
 
 The vector-driven suites each print one summary line — `[vectors] 131

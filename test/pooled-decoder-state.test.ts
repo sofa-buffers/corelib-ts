@@ -21,6 +21,7 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { FP64_HANDLE_MIN } from "../src/constants.js";
 import {
   ArrayKind,
   SofabError,
@@ -30,6 +31,7 @@ import {
   growingOStream,
   type Visitor,
 } from "../src/index.js";
+import { survivors } from "./helpers/retention.js";
 
 /**
  * A generated-layer stand-in that holds the receiver caps and compares them
@@ -49,6 +51,27 @@ function capped(caps: { array?: number; fixlen?: number }): Visitor {
         throw new SofabError(SofabErrorCode.LimitExceeded, `length ${total} over cap`);
       }
     },
+  };
+}
+
+/**
+ * A visitor that takes the array hand-off and nothing else: an abort inside an
+ * array then leaves a destination on the machine, which the empty visitor `{}`
+ * never installs. The values are not read here — the transcript after the abort is
+ * what this file asserts on.
+ */
+function holding(): Visitor {
+  let values: (number | bigint)[] = [];
+  let bits = new Uint32Array(0);
+  return {
+    arrayBegin: (_id, kind: ArrayKind, count) => {
+      if (kind === ArrayKind.Fp32) bits = new Uint32Array(count);
+      else values = [];
+    },
+    arrayBulk: (_id, kind) =>
+      kind === ArrayKind.Fp32
+        ? { bits }
+        : { values, minLo: 0, minHi: 0, maxLo: 0xffffffff, maxHi: 0xffffffff },
   };
 }
 
@@ -157,7 +180,7 @@ describe("a pooled decoder carries nothing from the decode before it", () => {
     // changes: a cut that lands on a field boundary simply completes.
     let aborted = 0;
     for (let cut = 1; cut < REFERENCE.length; cut++) {
-      if (codeOf(() => decode(REFERENCE.subarray(0, cut), {})) !== "none") aborted++;
+      if (codeOf(() => decode(REFERENCE.subarray(0, cut), holding())) !== "none") aborted++;
       expect(transcript(REFERENCE), `after a cut at ${cut}`).toStrictEqual(EXPECTED);
     }
     // Most cuts land mid-field; if that stopped being true the loop above would
@@ -175,7 +198,7 @@ describe("a pooled decoder carries nothing from the decode before it", () => {
 
   it("survives every abort back to back, in one pass", () => {
     for (let cut = 1; cut < REFERENCE.length; cut++) {
-      codeOf(() => decode(REFERENCE.subarray(0, cut), {}));
+      codeOf(() => decode(REFERENCE.subarray(0, cut), holding()));
     }
     for (const [, abort] of ABORTS) abort();
     expect(transcript(REFERENCE)).toStrictEqual(EXPECTED);
@@ -199,6 +222,33 @@ describe("a pooled decoder carries nothing from the decode before it", () => {
     expect(codeOf(() => decode(REFERENCE, capped({ fixlen: 1 })))).toBe(
       SofabErrorCode.LimitExceeded,
     );
+  });
+
+  it("keeps nothing of the caller's alive in the pool after an abort", async () => {
+    // Every case above asks what the next decode *reads*, and `release()` drops
+    // nothing that is readable — see `helpers/retention.ts` for why that makes the
+    // whole sweep blind to it, and §6.6 / §6.7 for what it costs. `tryDecode` has
+    // the same pair of tests, on the same pooled machine.
+    //
+    // The abort is a truncated bulk fp64 array, which installs all three things
+    // `release()` drops: the visitor, the hand-off destination, and — past
+    // FP64_HANDLE_MIN elements in the chunk — the `DataView` over the fed buffer.
+    let code = "none";
+    expect(
+      await survivors(() => {
+        const os = growingOStream();
+        os.writeFp64Array(1, Array.from({ length: 4 * FP64_HANDLE_MIN }, (_, i) => i + 0.5));
+        // A quarter of the elements short: the run left in the chunk still clears
+        // the handle threshold, and the array is open when the bytes end.
+        const chunk = os.bytes().slice().subarray(0, os.bytes().length - FP64_HANDLE_MIN * 8);
+        const dest = new Float64Array(4 * FP64_HANDLE_MIN);
+        const visitor: Visitor = { arrayBulk: () => ({ f64: dest }) };
+        code = codeOf(() => decode(chunk, visitor));
+        return { visitor, chunk, dest };
+      }),
+    ).toStrictEqual([]);
+    // The abort has to have happened, or there was nothing to leave behind.
+    expect(code).toBe(SofabErrorCode.Incomplete);
   });
 
   it("keeps a re-entrant decode independent of the one it runs inside", () => {
