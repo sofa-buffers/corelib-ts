@@ -233,6 +233,14 @@ class My implements Visitor {
 decode(bytes, new My());
 ```
 
+`decode()` treats the buffer as the whole message, so bytes that end inside a field
+throw `INCOMPLETE`. `tryDecode(bytes, visitor)` is the same decode, on the same
+pooled decoder, that **returns** that outcome instead: `Complete`, or `Incomplete`
+where the bytes end inside a field or an open sequence. It is exactly one
+`IStream.feed` of the buffer, so a refusal still throws a `SofabError` —
+`INVALID_MSG` for malformed bytes, `LIMIT_EXCEEDED` from a receiver cap your visitor
+enforces — and is never returned. It is what a generated `tryDecode` calls.
+
 There are exactly two things to do with a field — **read** it or **skip** it
 (§6.7.2) — and not implementing a callback is how you say the second.
 
@@ -632,8 +640,8 @@ Who owns the bytes:
   accumulator for a payload that straddles a chunk — a decoder's whole memory is
   fixed-size state sized from this format's constants (a `MAX_DEPTH` scope stack, a
   partial varint, an 8-byte float landing zone). Constructing an `OStream` /
-  `IStream` is the one allocating step, and `decode()` reuses one decoder across
-  calls so a one-shot caller does not pay it per message. A `bigint` for an integer
+  `IStream` is the one allocating step, and `decode()` / `tryDecode()` reuse one
+  decoder across calls so a one-shot caller does not pay it per message. A `bigint` for an integer
   past `2^53` is not an exception: it is a *value*, not storage, and the `lo` / `hi`
   halves beside it are there for a consumer that would rather not have one. A `Long`
   written into a `longs` or `typed` bulk destination is the same kind of thing — a value, placed
@@ -847,7 +855,8 @@ fed one byte at a time), `skip-ids.test.ts` (every vector that carries
 contiguous, one byte at a time, and split in two at every byte boundary),
 `heap-free-codec.test.ts` (no allocation primitive on a codec path, a flat heap
 over encode and decode, no view into a fed or one-shot buffer) and `pooled-decoder-state.test.ts` (a decode aborted at every cut point
-leaves nothing behind for the next one).
+leaves nothing behind for the next one) and `try-decode.test.ts` (`tryDecode`
+answers every prefix as one `IStream.feed` does, on the same pooled machine).
 
 The vector-driven suites each print one summary line — `[vectors] 131
 vectors, none gated out by requires, 524 checks` — so a run says how much of the
