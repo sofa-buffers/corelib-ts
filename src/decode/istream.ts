@@ -592,5 +592,38 @@ export function decode(bytes: Uint8Array, visitor: Visitor): void {
   }
 }
 
-/** The machine {@link decode} reuses; `null` while a decode is running on it. */
+/**
+ * {@link decode}, reporting truncation as a **value** instead of a throw: the
+ * outcome of one {@link IStream.feed} of the whole buffer, on {@link decode}'s
+ * pooled machine.
+ *
+ * It is for a generated `tryDecode` (CORELIB_PLAN §6.1.1's fallible twin of
+ * `decode`), which a receive loop calls once per message. {@link IStream} returns
+ * the same outcome, but constructing one builds a decoder, which is the
+ * allocation {@link decode} pools away; and catching {@link decode}'s
+ * `INCOMPLETE` to turn it back into a status would build an `Error` — a stack
+ * capture — per truncated message, in a block that is the same for every schema
+ * and so belongs here rather than in generated code.
+ *
+ * The channels are {@link IStream.feed}'s, unchanged — one fact, one channel:
+ * `Complete` and `Incomplete` are returned, and every refusal is thrown as a
+ * {@link SofabError} whose `code` names it — `INVALID_MSG` for malformed input,
+ * `LIMIT_EXCEEDED` from a visitor enforcing a receiver cap, `ARGUMENT` for a
+ * caller mistake. The return type is {@link FeedStatus} for that reason: a
+ * caller switching on it has no `Invalid` arm to write.
+ */
+export function tryDecode(bytes: Uint8Array, visitor: Visitor): FeedStatus {
+  const state = pooled ?? new DecoderState();
+  pooled = null;
+  try {
+    state.begin(visitor);
+    state.push(bytes);
+    return state.outcome();
+  } finally {
+    state.release(); // keep nothing of the caller's alive in the pool
+    pooled = state;
+  }
+}
+
+/** The machine {@link decode} and {@link tryDecode} reuse; `null` while a decode is running on it. */
 let pooled: DecoderState | null = null;

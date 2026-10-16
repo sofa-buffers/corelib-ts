@@ -183,4 +183,31 @@ export class PayloadAcc {
     this.buf = null;
     return dst;
   }
+
+  /**
+   * {@link takeInto} where `kept` fits, {@link take} where it does not: the one
+   * choice a decode into a reused destination makes per payload.
+   *
+   * `kept` is the buffer the previous decode left where this payload lands — a
+   * `blob` field, or a `blob` array element ({@link BlobSeq} asks here) — or `null`
+   * when there is none. It is written over when it is exactly the payload's length
+   * and passed over otherwise, never refused: a length that differs is the common
+   * case, not a mistake, and a new buffer is the answer to it. The pieces of a split
+   * payload must all be offered the same `kept`, as for {@link takeInto}.
+   *
+   * What comes back is the buffer the payload was assembled in — `kept` or a new
+   * one — once the last piece lands, and `null` before.
+   */
+  takeReusing(
+    kept: Uint8Array | null,
+    total: number,
+    offset: number,
+    src: Uint8Array,
+    start: number,
+    end: number,
+  ): Uint8Array | null {
+    return kept !== null && kept.length === total
+      ? this.takeInto(kept, total, offset, src, start, end)
+      : this.take(total, offset, src, start, end);
+  }
 }

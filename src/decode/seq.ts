@@ -885,10 +885,7 @@ export class BlobSeq {
     start: number,
     end: number,
   ): Uint8Array | null {
-    const dst = this.slots.staleAt(id);
-    return dst !== null && dst.length === total
-      ? this.acc.takeInto(dst, total, offset, src, start, end)
-      : this.acc.take(total, offset, src, start, end);
+    return this.acc.takeReusing(this.slots.staleAt(id), total, offset, src, start, end);
   }
 
   /** Every bound for one element. Rejects **before** the destination grows. */
