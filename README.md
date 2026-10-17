@@ -696,7 +696,9 @@ Who owns the bytes:
   decoder keeps into your storage between calls.
 - **The static helper layer allocates, on your behalf.** `PayloadAcc`,
   `ElementSeq`, `FramedSeq`, `StringSeq`, `BlobSeq`, `decodeUtf8`, `elementsEqual`,
-  `longElementsEqual`, `floatArrayBitsEqual`, `fp32ArrayBitsEqual`, `fp64ArrayBitsEqual` and `fp32RawBytes` are the generated layer's
+  `longElementsEqual`, `floatArrayBitsEqual`, `fp32ArrayBitsEqual`,
+  `fp64ArrayBitsEqual`, `fp32RawBytes` and the `reuseU8` … `reuseFp64` family are
+  the generated layer's
   code shipped here for reuse (ARCHITECTURE §8), not part of the codec: the codec
   never calls them, and they allocate the values they build.
 - **String validity is checked where a string is materialized** (§6.4.5).
@@ -746,6 +748,15 @@ Who owns the bytes:
   refused before `end()` leaves the elements it decoded and, past them, the
   previous message's — except for the one element whose payload it had started,
   which holds the new payload's leading bytes over the old one's tail.
+  A **native** array's exact-width destination is reused through one function per
+  width — `reuseU8(kept, count)` … `reuseFp64(kept, count)` — and the ownership
+  there splits on the length: a destination that is exactly the wire count is zeroed
+  and refilled **in place**, so a reference you kept into it becomes a reference into
+  the message being decoded now, while a destination of any other length is left
+  untouched and a new one is built instead. The zero is not cosmetic: a typed array's
+  `length` cannot be cut the way `ElementSeq` cuts a plain array's, so without it a
+  decode that stopped early would leave the previous message's elements past the ones
+  it wrote.
 
 ### Receiver limits
 
