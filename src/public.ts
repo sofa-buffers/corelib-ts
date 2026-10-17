@@ -44,6 +44,18 @@ export type {
 export { decodeUtf8 } from "./decode/text.js";
 export { PayloadAcc } from "./decode/acc.js";
 export { BlobSeq, ElementSeq, FramedSeq, StringSeq, UNBOUNDED } from "./decode/seq.js";
+export {
+  reuseFp32,
+  reuseFp64,
+  reuseI8,
+  reuseI16,
+  reuseI32,
+  reuseU8,
+  reuseU16,
+  reuseU32,
+  reuseI64,
+  reuseU64,
+} from "./decode/reuse.js";
 export { elementsEqual, longElementsEqual } from "./encode/equal.js";
 export { floatArrayBitsEqual, fp32ArrayBitsEqual, fp64ArrayBitsEqual } from "./encode/float-bits-equal.js";
 export { fp32RawBytes } from "./varint/num64.js";
