@@ -28,6 +28,7 @@ import { describe, expect, it } from "vitest";
 import {
   DecodeStatus,
   OStream,
+  WireType,
   SofabErrorCode,
   decode,
   tryDecode,
@@ -79,6 +80,38 @@ describe("a destination the decode stopped inside (§7.1, #210)", () => {
       DecodeStatus.Incomplete,
     );
     expect([...out]).toStrictEqual([11, 22, 0, 0, 0]);
+  });
+
+  it("keeps the prefix when the refusal comes from inside the fill, not from the bound", () => {
+    // The regression this file nearly missed. The fill loops keep their index in
+    // a local and publish it once per drain, so a refusal raised INSIDE the loop
+    // left the field at the value it had when the drain began — and the zeroing
+    // then wiped the elements the decode had already delivered. The out-of-bound
+    // case above publishes it; this is the other way out of those loops, an
+    // over-long varint, which `varintFull` and the inline readers refuse
+    // themselves.
+    const bytes = Uint8Array.from([
+      (1 << 3) | WireType.ArrayUnsigned,
+      5,
+      11,
+      22,
+      ...Array(10).fill(0x80), // an 11-byte varint: INVALID at element 2
+      0x00,
+      44,
+      55,
+    ]);
+    const out = new Uint16Array(5).fill(0xbeef);
+    expect(() => decode(bytes, handing({ typed: out, ...U16 }))).toThrow(
+      expect.objectContaining({ code: SofabErrorCode.InvalidMsg }),
+    );
+    expect([...out]).toStrictEqual([11, 22, 0, 0, 0]);
+
+    // …and the plain-array destination is cut to the same prefix, not emptied.
+    const values: (number | bigint)[] = [0xbeef, 0xbeef, 0xbeef, 0xbeef, 0xbeef];
+    expect(() => decode(bytes, handing({ values, ...U16 }))).toThrow(
+      expect.objectContaining({ code: SofabErrorCode.InvalidMsg }),
+    );
+    expect(values).toStrictEqual([11, 22]);
   });
 
   it("leaves a completed array's destination alone — every slot of it was written", () => {
