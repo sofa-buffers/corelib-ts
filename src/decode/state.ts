@@ -532,7 +532,11 @@ export class DecoderState {
             const hi = this.vHi >>> 0;
             this.cur.unsigned?.(
               id,
-              hi <= 0x1fffff ? hi * TWO32 + lo : joinU64(lo, hi),
+              // `lo` IS the value when no high half arrived, which is every
+              // u8..u32 field and most u64s — and it is already a small integer,
+              // where `hi * TWO32 + lo` is double arithmetic whose result is
+              // boxed on the way into the callback.
+              hi === 0 ? lo : hi <= 0x1fffff ? hi * TWO32 + lo : joinU64(lo, hi),
               lo,
               hi,
             );
@@ -2153,6 +2157,9 @@ export class DecoderState {
     // Unsigned: vHi's bit 31 must not read as negative. vHi ≤ 0x1fffff (2^21-1)
     // ⇔ vHi*2^32 + lo ≤ 2^53-1.
     const hi = this.vHi >>> 0;
+    // No high half: the low one is the value, and a small integer rather than
+    // the double `hi * TWO32 + lo` produces (see the fast lane in `run`).
+    if (hi === 0) return this.vLo >>> 0;
     return hi <= 0x1fffff
       ? hi * TWO32 + (this.vLo >>> 0)
       : joinU64(this.vLo >>> 0, hi); // one bigint, not four (bits64)
@@ -2161,6 +2168,12 @@ export class DecoderState {
   /** The accumulated zig-zag varint as a signed value, number-first (see {@link vUnsigned}). */
   private vSigned(): number | bigint {
     const hi = this.vHi >>> 0;
+    // The whole word in the low half: undo the zig-zag by shifts, which keeps
+    // the result a small integer (see {@link vUnsigned}).
+    if (hi === 0) {
+      const raw = this.vLo >>> 0;
+      return (raw & 1) === 0 ? raw >>> 1 : -((raw >>> 1) + 1);
+    }
     if (hi <= 0x1fffff) {
       const r = hi * TWO32 + (this.vLo >>> 0); // raw zig-zag, ≤ 2^53-1
       return r % 2 === 0 ? r / 2 : -(r + 1) / 2;
