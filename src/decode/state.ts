@@ -1439,6 +1439,41 @@ export class DecoderState {
             if (lo < minLo || lo > maxLo) this.outOfBound(idx);
             out[idx++] = lo;
           }
+          // The chunk's last VARINT_MAX_BYTES bytes. The drain above cannot run
+          // there — it reads without bounds tests — but an element that ENDS
+          // inside the chunk needs neither the resumable ladder nor
+          // {@link bulkStoreU}, which re-reads the bound and switches on the
+          // mode per element: the work the hand-off exists to do once. It is
+          // worth more than its size suggests, because a short message is ALL
+          // tail (every array of the arena's 434 B message starts within ten bytes of its end).
+          //
+          // A word that does not finish within three bytes leaves `i` where it
+          // was and breaks: nothing has been consumed, and the ladder below
+          // starts it from scratch exactly as before.
+          while (idx < count && i < n) {
+            let lo: number;
+            const b0 = input[i]!;
+            if (b0 < 0x80) {
+              lo = b0;
+              i += 1;
+            } else {
+              if (i + 1 >= n) break;
+              const b1 = input[i + 1]!;
+              if (b1 < 0x80) {
+                lo = (b0 & 0x7f) | (b1 << 7);
+                i += 2;
+              } else {
+                if (i + 2 >= n) break;
+                const b2 = input[i + 2]!;
+                if (b2 < 0x80) {
+                  lo = (b0 & 0x7f) | ((b1 & 0x7f) << 7) | (b2 << 14);
+                  i += 3;
+                } else break;
+              }
+            }
+            if (lo < minLo || lo > maxLo) this.outOfBound(idx);
+            out[idx++] = lo;
+          }
         } else if (mode === BM.Typed) {
           // The same two comparisons Values32 makes — the bound is the message's
           // verdict and a typed store would mask it away (§7.1) — over a
@@ -1501,6 +1536,41 @@ export class DecoderState {
                     }
                   }
                 }
+              }
+            }
+            if (lo < minLo || lo > maxLo) this.outOfBound(idx);
+            out[idx++] = lo;
+          }
+          // The chunk's last VARINT_MAX_BYTES bytes. The drain above cannot run
+          // there — it reads without bounds tests — but an element that ENDS
+          // inside the chunk needs neither the resumable ladder nor
+          // {@link bulkStoreU}, which re-reads the bound and switches on the
+          // mode per element: the work the hand-off exists to do once. It is
+          // worth more than its size suggests, because a short message is ALL
+          // tail (the same reason, one arm over).
+          //
+          // A word that does not finish within three bytes leaves `i` where it
+          // was and breaks: nothing has been consumed, and the ladder below
+          // starts it from scratch exactly as before.
+          while (idx < count && i < n) {
+            let lo: number;
+            const b0 = input[i]!;
+            if (b0 < 0x80) {
+              lo = b0;
+              i += 1;
+            } else {
+              if (i + 1 >= n) break;
+              const b1 = input[i + 1]!;
+              if (b1 < 0x80) {
+                lo = (b0 & 0x7f) | (b1 << 7);
+                i += 2;
+              } else {
+                if (i + 2 >= n) break;
+                const b2 = input[i + 2]!;
+                if (b2 < 0x80) {
+                  lo = (b0 & 0x7f) | ((b1 & 0x7f) << 7) | (b2 << 14);
+                  i += 3;
+                } else break;
               }
             }
             if (lo < minLo || lo > maxLo) this.outOfBound(idx);
