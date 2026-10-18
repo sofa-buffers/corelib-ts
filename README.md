@@ -697,8 +697,8 @@ Who owns the bytes:
 - **The static helper layer allocates, on your behalf.** `PayloadAcc`,
   `ElementSeq`, `FramedSeq`, `StringSeq`, `BlobSeq`, `decodeUtf8`, `elementsEqual`,
   `longElementsEqual`, `floatArrayBitsEqual`, `fp32ArrayBitsEqual`,
-  `fp64ArrayBitsEqual`, `fp32RawBytes` and the `reuseU8` … `reuseFp64` family are
-  the generated layer's
+  `fp64ArrayBitsEqual`, `fp32RawBytes`, `VisitorCache` and the `reuseU8` …
+  `reuseFp64` family are the generated layer's
   code shipped here for reuse (ARCHITECTURE §8), not part of the codec: the codec
   never calls them, and they allocate the values they build.
 - **String validity is checked where a string is materialized** (§6.4.5).
@@ -757,6 +757,16 @@ Who owns the bytes:
   `length` cannot be cut the way `ElementSeq` cuts a plain array's, so without it a
   decode that stopped early would leave the previous message's elements past the ones
   it wrote.
+  The **visitor** itself is the last per-decode allocation on that path, and
+  `VisitorCache` is where it stops being one: a visitor is bound to the destination
+  it was built for, so one cache per generated message type — `new
+  VisitorCache(make)`, then `get(destination)` — hands back the visitor that
+  destination already has, builds one only for a destination it has not seen, and
+  holds the destination **weakly**, so dropping a message drops its visitor too.
+  What that saves is the visitor, its `PayloadAcc`, the array target objects it
+  holds and every field initialiser of its constructor, once per message; what it
+  costs is that two decodes into the same destination at the same time share one
+  visitor, which they could not have done safely with the destination either.
 
 ### Receiver limits
 
