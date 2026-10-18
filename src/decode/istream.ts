@@ -156,10 +156,13 @@ export type ArrayTarget = IntegerArrayTarget | FloatArrayTarget | BoolArrayTarge
  */
 export interface BoolArrayTarget {
   /**
-   * Which destination this target sets — {@link BulkMode.Bool} here. **Optional,
-   * and an assertion when present**: see {@link ArrayTarget} and {@link BulkMode}.
+   * Which destination this target sets — {@link BulkMode.Bool}, the only one it can be — stated so the decoder does
+   * not work it out again for every array of every message. **Optional, and an
+   * assertion when present**: see {@link ArrayTarget} and {@link BulkMode} for
+   * what it asserts and what it gives up.
    */
   mode?: BulkMode;
+  /** One byte per element: `0` or `1`, normalized by the decoder (§4.4). */
   bool: Uint8Array;
 }
 
@@ -196,6 +199,14 @@ export interface BoolArrayTarget {
  * stated as such.
  */
 export interface IntegerArrayTarget {
+  /**
+   * Which destination this target sets — {@link BulkMode.Values}, {@link BulkMode.Typed},
+   * {@link BulkMode.Longs} or {@link BulkMode.Halves} — stated so the decoder does
+   * not work it out again for every array of every message. **Optional, and an
+   * assertion when present**: see {@link ArrayTarget} and {@link BulkMode} for
+   * what it asserts and what it gives up.
+   */
+  mode?: BulkMode;
   /**
    * Number-first destination: each element as the `value` its per-element
    * callback would have received — a `number` when it fits exactly (`≤ 2^53-1`,
@@ -256,12 +267,6 @@ export interface IntegerArrayTarget {
   /** The high halves; see {@link lo}. */
   hi?: Uint32Array;
   /** Low half of the smallest element the schema allows. */
-  /**
-   * Which destination this target sets — {@link BulkMode.Values} here. **Optional,
-   * and an assertion when present**: see {@link ArrayTarget} and {@link BulkMode}.
-   */
-  mode?: BulkMode;
-
   minLo: number;
   /** High half of the smallest element the schema allows. */
   minHi: number;
@@ -289,13 +294,15 @@ export interface IntegerArrayTarget {
  * carries all 64 bits, payload NaNs included.
  */
 export interface FloatArrayTarget {
-  /** Value destination for an `ArrayKind.Fp32` array. */
   /**
-   * Which destination this target sets — {@link BulkMode.F32} here. **Optional,
-   * and an assertion when present**: see {@link ArrayTarget} and {@link BulkMode}.
+   * Which destination this target sets — {@link BulkMode.F32}, {@link BulkMode.F32Bits} or
+   * {@link BulkMode.F64} — stated so the decoder does
+   * not work it out again for every array of every message. **Optional, and an
+   * assertion when present**: see {@link ArrayTarget} and {@link BulkMode} for
+   * what it asserts and what it gives up.
    */
   mode?: BulkMode;
-
+  /** Value destination for an `ArrayKind.Fp32` array. */
   f32?: Float32Array;
   /**
    * Bit destination for an `ArrayKind.Fp32` array: each element as its 4 wire
