@@ -1183,8 +1183,25 @@ export class DecoderState {
     // Ir an array on the optimizing tier and ~3,750 on the baseline one. What stays
     // is the length, because that is the one question about *this* array.
     const stated = t.mode;
-    this.bulkMode =
-      stated === undefined ? this.resolveTarget(t, kind, count) : this.statedMode(t, stated, count);
+    if (stated === undefined) {
+      this.bulkMode = this.resolveTarget(t, kind, count);
+    } else if (stated === BulkMode.Typed) {
+      // The one mode written out here rather than in {@link statedMode}: it is
+      // what generated code states for every `u8`..`u64` array, and the call it
+      // saves was half of what stating a mode bought on the optimizing tier.
+      const d = (t as IntegerArrayTarget).typed;
+      if (d === undefined || d.length < count) this.shortDestination(d, count, "typed");
+      if (d.BYTES_PER_ELEMENT === 8) {
+        // Eight bytes an element is the 64-bit pair, filled through a
+        // `Uint32Array` over its own storage: two halves and no `bigint`.
+        this.bulk64 = new Uint32Array(d.buffer, d.byteOffset, d.length * 2);
+        this.bulkMode = BM.Typed64;
+      } else {
+        this.bulkMode = BM.Typed;
+      }
+    } else {
+      this.bulkMode = this.statedMode(t, stated, count);
+    }
     this.bulk = t;
   }
 
@@ -1211,16 +1228,7 @@ export class DecoderState {
    * fill loop.
    */
   private statedMode(t: ArrayTarget, stated: BulkMode, count: number): BM {
-    if (stated === BulkMode.Typed) {
-      const d = (t as IntegerArrayTarget).typed;
-      if (d === undefined || d.length < count) this.shortDestination(d, count, "typed");
-      // Eight bytes an element is the 64-bit pair, which fills through a
-      // `Uint32Array` over its own storage — two halves per element and no
-      // `bigint`. Everything narrower stores the low half.
-      if (d.BYTES_PER_ELEMENT !== 8) return BM.Typed;
-      this.bulk64 = new Uint32Array(d.buffer, d.byteOffset, d.length * 2);
-      return BM.Typed64;
-    }
+    // `BulkMode.Typed` never arrives here — {@link askBulk} answers it inline.
     if (stated === BulkMode.Values) {
       const it = t as IntegerArrayTarget;
       if (it.values === undefined) this.shortDestination(undefined, count, "values");
