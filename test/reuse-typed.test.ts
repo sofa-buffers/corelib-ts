@@ -5,15 +5,17 @@
  *
  * Three rules, and they are the whole surface:
  *
- * - **An exact fit is reused, in place and zeroed.** Identity, not equality — a
- *   copy would defeat the point, and the zero is what keeps a decode that stops
- *   early from reading the previous message's tail as this message's elements.
+ * - **An exact fit is reused in place, exactly as it is.** Identity, not equality —
+ *   a copy would defeat the point — and *not* zeroed: a decode that completes the
+ *   array writes every slot of it, and the one that does not has its unwritten
+ *   slots zeroed by the decoder when it stops (`bulk-tail-zero.test.ts`). Zeroing
+ *   here cost 198 Ir per array for a case that had not happened yet.
  * - **Anything else allocates**, including a destination that is *longer* than the
  *   array, for the reason {@link PayloadAcc.takeInto} refuses one: a longer array
  *   would overstate the count. The old destination is left untouched, because a
  *   caller may still be holding it.
- * - **The zero follows the array**: `0n` for the 64-bit pair, `0` elsewhere, which
- *   is the one thing a single shared helper could get wrong per element type.
+ * - **A freshly built destination is zero by construction**, with the array's own
+ *   zero — `0n` for the 64-bit pair, `0` elsewhere.
  *
  * Driven through a table, because ten dull functions are exactly the shape where a
  * copy-paste slip — the wrong constructor, the wrong zero, `>=` for `===` — would
@@ -102,19 +104,21 @@ describe("the exact-width reuse family", () => {
       expect(elems(out)).toStrictEqual([w.zero, w.zero, w.zero, w.zero]);
     });
 
-    it("reuses an exact fit in place, zeroed", () => {
+    it("reuses an exact fit in place and does not touch it", () => {
       const kept = seeded(w, 3);
       const out = w.reuse(kept, 3);
       // The same object: a receive loop reusing it is the whole point.
       expect(out).toBe(kept);
-      expect(elems(out)).toStrictEqual([w.zero, w.zero, w.zero]);
+      // And its contents are the caller's until the decode overwrites them. The
+      // zero this used to do is the decoder's now, and only where it is needed —
+      // see `bulk-tail-zero.test.ts`.
+      expect(elems(out)).toStrictEqual([w.seed, w.seed, w.seed]);
     });
 
-    it("zeroes with the array's own zero", () => {
-      // The mistake a single shared helper can make once per element type: `0`
-      // into a 64-bit array is a TypeError, and `0n` into a narrow one is too.
-      const out = w.reuse(seeded(w, 2), 2);
-      const first = elems(out)[0];
+    it("builds the fresh destination with the array's own zero", () => {
+      // `0` into a 64-bit array is a TypeError and `0n` into a narrow one is too,
+      // so the constructor is the only thing that may produce this zero.
+      const first = elems(w.reuse(null, 2))[0];
       expect(typeof first).toBe(name === "u64" || name === "i64" ? "bigint" : "number");
       expect(first).toStrictEqual(w.zero);
     });
