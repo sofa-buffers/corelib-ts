@@ -1878,9 +1878,90 @@ export class DecoderState {
       if (this.vBytes === 0) {
         let idx = this.arrIndex;
         while (idx < count && i <= safeEnd) {
-          i = this.varintFull(input, i);
-          const raw = this.vLo >>> 0;
-          const rawHi = this.vHi >>> 0;
+          // {@link varintFull}'s body, inline: the call is past what the JIT
+          // inlines, and inside a fill loop it also erases what TurboFan knows
+          // about the maps in hand, so the loop re-loads the destination and its
+          // length per element — the mechanism PR #186's fp32 branch was
+          // root-caused to. One reader serves every mode here, because this arm
+          // has one loop and switches only on the STORE.
+          // 
+          // The drain runs only where VARINT_MAX_BYTES bytes are in hand, so no
+          // load needs a bounds test; the labelled block is the ladder's early
+          // return, and the overflow refusals are raised at the byte that
+          // decides them.
+          let raw = 0;
+          let rawHi = 0;
+          word: {
+            let b = input[i]!;
+            raw = b & 0x7f;
+            if (b < 0x80) {
+              i += 1;
+              break word;
+            }
+            b = input[i + 1]!;
+            raw |= (b & 0x7f) << 7;
+            if (b < 0x80) {
+              i += 2;
+              break word;
+            }
+            b = input[i + 2]!;
+            raw |= (b & 0x7f) << 14;
+            if (b < 0x80) {
+              i += 3;
+              break word;
+            }
+            b = input[i + 3]!;
+            raw |= (b & 0x7f) << 21;
+            if (b < 0x80) {
+              i += 4;
+              break word;
+            }
+            // The fifth byte straddles the 32-bit boundary: four bits to the low
+            // half, three to the high one.
+            b = input[i + 4]!;
+            raw |= (b & 0x0f) << 28;
+            rawHi = (b >> 4) & 0x07;
+            if (b < 0x80) {
+              i += 5;
+              break word;
+            }
+            b = input[i + 5]!;
+            rawHi |= (b & 0x7f) << 3;
+            if (b < 0x80) {
+              i += 6;
+              break word;
+            }
+            b = input[i + 6]!;
+            rawHi |= (b & 0x7f) << 10;
+            if (b < 0x80) {
+              i += 7;
+              break word;
+            }
+            b = input[i + 7]!;
+            rawHi |= (b & 0x7f) << 17;
+            if (b < 0x80) {
+              i += 8;
+              break word;
+            }
+            b = input[i + 8]!;
+            rawHi |= (b & 0x7f) << 24;
+            if (b < 0x80) {
+              i += 9;
+              break word;
+            }
+            // Tenth byte: only bit 63 is left below 64, so any higher payload bit
+            // — or an eleventh byte — is a >64-bit overflow (§4.1.3).
+            b = input[i + 9]!;
+            if (((b & 0x7f) >> 1) !== 0) this.fail("varint overflow");
+            rawHi |= (b & 0x7f) << 31;
+            if (b < 0x80) {
+              i += 10;
+              break word;
+            }
+            this.fail("varint overflow");
+          }
+          raw = raw >>> 0;
+          rawHi = rawHi >>> 0;
           const mask = -(raw & 1) >>> 0;
           const lo = ((((raw >>> 1) | (rawHi << 31)) >>> 0) ^ mask) >>> 0;
           const hi = ((rawHi >>> 1) ^ mask) >>> 0;
