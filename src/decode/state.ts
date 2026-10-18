@@ -1381,11 +1381,62 @@ export class DecoderState {
         if (mode === BM.Values32) {
           const out = t.values!;
           while (idx < count && i <= safeEnd) {
-            i = this.varintFull(input, i);
-            const lo = this.vLo >>> 0;
-            // A high half of its own puts the element past every 32-bit bound, so
-            // one test covers "too large to be this type" and "outside the bound".
-            if (this.vHi !== 0 || lo < minLo || lo > maxLo) this.outOfBound(idx);
+            // The element varint, read INLINE rather than through {@link varintFull}:
+            // the same argument the header/value fast lane in `run` makes for
+            // itself, and worth more here. A call in the middle of a fill loop does
+            // not only cost the call — it erases what TurboFan knows about the maps
+            // in hand, so the loop re-loads `out` and its length per element
+            // (PR #186's fp32 branch was root-caused to exactly that). The drain
+            // only runs where VARINT_MAX_BYTES bytes are in hand, so none of these
+            // loads needs a bounds test.
+            //
+            // Five bytes is the whole of this arm's domain: its bound has both high
+            // halves zero (see BM.Values32), so a sixth byte cannot carry a legal
+            // element. A word that long is left to the shared reader — which still
+            // judges a >64-bit one as INVALID — and refused here on the high half
+            // it reports.
+            let lo: number;
+            const b0 = input[i]!;
+            if (b0 < 0x80) {
+              lo = b0;
+              i += 1;
+            } else {
+              const b1 = input[i + 1]!;
+              if (b1 < 0x80) {
+                lo = (b0 & 0x7f) | (b1 << 7);
+                i += 2;
+              } else {
+                const b2 = input[i + 2]!;
+                if (b2 < 0x80) {
+                  lo = (b0 & 0x7f) | ((b1 & 0x7f) << 7) | (b2 << 14);
+                  i += 3;
+                } else {
+                  const b3 = input[i + 3]!;
+                  if (b3 < 0x80) {
+                    lo =
+                      ((b0 & 0x7f) | ((b1 & 0x7f) << 7) | ((b2 & 0x7f) << 14) | (b3 << 21)) >>> 0;
+                    i += 4;
+                  } else {
+                    const b4 = input[i + 4]!;
+                    if (b4 < 0x10) {
+                      lo =
+                        ((b0 & 0x7f) |
+                          ((b1 & 0x7f) << 7) |
+                          ((b2 & 0x7f) << 14) |
+                          ((b3 & 0x7f) << 21) |
+                          (b4 << 28)) >>>
+                        0;
+                      i += 5;
+                    } else {
+                      i = this.varintFull(input, i);
+                      lo = this.vLo >>> 0;
+                      if (this.vHi !== 0) this.outOfBound(idx);
+                    }
+                  }
+                }
+              }
+            }
+            if (lo < minLo || lo > maxLo) this.outOfBound(idx);
             out[idx++] = lo;
           }
         } else if (mode === BM.Typed) {
@@ -1395,9 +1446,64 @@ export class DecoderState {
           // bound, so the store itself needs no guard.
           const out = t.typed!;
           while (idx < count && i <= safeEnd) {
-            i = this.varintFull(input, i);
-            const lo = this.vLo >>> 0;
-            if (this.vHi !== 0 || lo < minLo || lo > maxLo) this.outOfBound(idx);
+            // The inline reader of the Values32 arm above, for the reason given
+            // there; textually the same, so each arm keeps its own inline caches.
+            // The element varint, read INLINE rather than through {@link varintFull}:
+            // the same argument the header/value fast lane in `run` makes for
+            // itself, and worth more here. A call in the middle of a fill loop does
+            // not only cost the call — it erases what TurboFan knows about the maps
+            // in hand, so the loop re-loads `out` and its length per element
+            // (PR #186's fp32 branch was root-caused to exactly that). The drain
+            // only runs where VARINT_MAX_BYTES bytes are in hand, so none of these
+            // loads needs a bounds test.
+            //
+            // Five bytes is the whole of this arm's domain: its bound has both high
+            // halves zero (see BM.Values32), so a sixth byte cannot carry a legal
+            // element. A word that long is left to the shared reader — which still
+            // judges a >64-bit one as INVALID — and refused here on the high half
+            // it reports.
+            let lo: number;
+            const b0 = input[i]!;
+            if (b0 < 0x80) {
+              lo = b0;
+              i += 1;
+            } else {
+              const b1 = input[i + 1]!;
+              if (b1 < 0x80) {
+                lo = (b0 & 0x7f) | (b1 << 7);
+                i += 2;
+              } else {
+                const b2 = input[i + 2]!;
+                if (b2 < 0x80) {
+                  lo = (b0 & 0x7f) | ((b1 & 0x7f) << 7) | (b2 << 14);
+                  i += 3;
+                } else {
+                  const b3 = input[i + 3]!;
+                  if (b3 < 0x80) {
+                    lo =
+                      ((b0 & 0x7f) | ((b1 & 0x7f) << 7) | ((b2 & 0x7f) << 14) | (b3 << 21)) >>> 0;
+                    i += 4;
+                  } else {
+                    const b4 = input[i + 4]!;
+                    if (b4 < 0x10) {
+                      lo =
+                        ((b0 & 0x7f) |
+                          ((b1 & 0x7f) << 7) |
+                          ((b2 & 0x7f) << 14) |
+                          ((b3 & 0x7f) << 21) |
+                          (b4 << 28)) >>>
+                        0;
+                      i += 5;
+                    } else {
+                      i = this.varintFull(input, i);
+                      lo = this.vLo >>> 0;
+                      if (this.vHi !== 0) this.outOfBound(idx);
+                    }
+                  }
+                }
+              }
+            }
+            if (lo < minLo || lo > maxLo) this.outOfBound(idx);
             out[idx++] = lo;
           }
         } else if (mode === BM.Typed64) {
