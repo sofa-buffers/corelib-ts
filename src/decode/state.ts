@@ -19,7 +19,8 @@
  * resumable switch, so a contiguous message runs the fast lane end to end.
  *
  * **Nothing here allocates** (§6.6). The parse stack is a fixed
- * {@link MAX_DEPTH}-slot `Int32Array` sized at construction; the varint and float
+ * {@link MAX_DEPTH}-slot array sized at construction — a plain one, for the 3 µs
+ * reason its own field documents; the varint and float
  * accumulators are plain number fields; payloads are reported as `(src, start,
  * end)` into the caller's own fed chunk rather than as views this decoder would
  * have to create (§6.6.3). The single exception the language forces is a `bigint`
@@ -567,7 +568,11 @@ export class DecoderState {
             const mask = -(lo & 1) >>> 0;
             this.cur.signed?.(
               id,
-              this.vSigned(),
+              // {@link vSigned}'s common arm, inlined as the unsigned site's is:
+              // with no high half the zig-zag is two shifts on the low one, and
+              // the result stays a small integer. The call is left for the words
+              // that actually reach the high half.
+              hi === 0 ? ((lo & 1) === 0 ? lo >>> 1 : -((lo >>> 1) + 1)) : this.vSigned(),
               ((((lo >>> 1) | (hi << 31)) >>> 0) ^ mask) >>> 0,
               ((hi >>> 1) ^ mask) >>> 0,
             );
