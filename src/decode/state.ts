@@ -654,8 +654,26 @@ export class DecoderState {
         }
 
         case S.ArrayCount: {
-          i = this.varintStep(input, i);
-          if (!this.vComplete) return;
+          // A one-byte count, read without a call — which is every array of
+          // fewer than 128 elements, i.e. nearly all of them. The fast lane in
+          // `run` has no arm for an array (its work is in the element loops
+          // below), so without this the count word of every array pays
+          // {@link varintStep}'s call and its resume bookkeeping.
+          if (this.vBytes === 0) {
+            const b0 = input[i]!;
+            if (b0 < 0x80) {
+              this.vLo = b0;
+              this.vHi = 0;
+              this.vComplete = true;
+              i += 1;
+            } else {
+              i = this.varintStep(input, i);
+              if (!this.vComplete) return;
+            }
+          } else {
+            i = this.varintStep(input, i);
+            if (!this.vComplete) return;
+          }
           const count = this.vNum();
           // `ARRAY_MAX` is the FORMAT's ceiling (§6.2), not a receiver cap: it
           // bounds what the wire may express, so exceeding it is `INVALID` for
@@ -1015,7 +1033,13 @@ export class DecoderState {
   private endArray(): void {
     this.state = S.Header;
     const t = this.bulk;
-    if (t !== null) this.trimPlain(t, this.arrIndex);
+    // Only the three growable destinations have a tail to cut; the typed ones
+    // cannot be trimmed at all (see {@link trimPlain}), and testing the mode
+    // here keeps the call off every array that has nothing to do in it.
+    const mode = this.bulkMode;
+    if (t !== null && (mode === BM.Values || mode === BM.Values32 || mode === BM.Longs)) {
+      this.trimPlain(t, this.arrIndex);
+    }
     this.bulk = null;
     this.bulk64 = null;
     this.cur.arrayEnd?.(this.id);
@@ -1039,6 +1063,9 @@ export class DecoderState {
    */
   private trimPlain(t: ArrayTarget, written: number): void {
     const mode = this.bulkMode;
+    // Still tested here, not only at the call site in {@link endArray}: the
+    // refusal path in {@link outOfBound} cuts the tail of a half-filled
+    // destination too, and it arrives with whatever mode the array had.
     if (mode !== BM.Values && mode !== BM.Values32 && mode !== BM.Longs) return;
     const out =
       mode === BM.Longs
