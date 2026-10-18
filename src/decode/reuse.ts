@@ -34,8 +34,15 @@
  * abandoned them is over: on the terminal refusal that stopped it, and when a
  * pooled machine is released — which is what `decode` and `tryDecode` do in a
  * `finally`, success or not. A plain-array destination is cut to the prefix
- * instead, as it always was. The guarantee is unchanged; what changed is that an
- * array nobody refused and nobody truncated no longer pays for it.
+ * instead, as it always was. What changed is that an array nobody refused and
+ * nobody truncated no longer pays for it.
+ *
+ * **That covers a destination handed over through `arrayBulk`**, which is the one
+ * these functions exist for: the decoder can only zero a tail it knows the extent
+ * of, and it knows that for the arrays it filled itself. A visitor that pre-sizes a
+ * destination here and then fills it from the per-element callbacks instead owns
+ * that tail itself — the zero this used to do for it is gone, and `fill(0)` before
+ * such a decode is the caller's line to write.
  *
  * **Why ten functions and not one taking the constructor.** `reuseTyped(kept,
  * count, Uint16Array)` was measured against the inline form above on a message of

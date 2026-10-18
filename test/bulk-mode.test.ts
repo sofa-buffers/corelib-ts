@@ -231,6 +231,59 @@ describe("a target that states its destination (BulkMode, #214)", () => {
       }
     });
 
+    it("a mode that cannot belong to the array's element kind", () => {
+      // A mode is a statement about the destination; the kind is a fact about
+      // the wire. Crossing them is a caller mistake, and before this check it
+      // was a `TypeError` out of the fill loop rather than a refusal with a
+      // code: the arm for the stated mode reached for a field the target had
+      // never set.
+      const fp32 = wire((os) => os.writeFp32Array(1, FVALS));
+      const fp64 = wire((os) => os.writeFp64Array(1, FVALS));
+      const signed = wire((os) => os.writeSignedArray(1, SVALS));
+      const crossed: [string, Uint8Array, ArrayTarget][] = [
+        ["F32 on an unsigned array", bytes, { mode: BulkMode.F32, f32: new Float32Array(5) }],
+        ["F64 on an unsigned array", bytes, { mode: BulkMode.F64, f64: new Float64Array(5) }],
+        [
+          "Typed on an fp32 array",
+          fp32,
+          { mode: BulkMode.Typed, typed: new Uint32Array(5), ...U16 },
+        ],
+        [
+          "Halves on an fp32 array",
+          fp32,
+          { mode: BulkMode.Halves, lo: new Uint32Array(5), hi: new Uint32Array(5), ...U64 },
+        ],
+        ["F32 on an fp64 array", fp64, { mode: BulkMode.F32, f32: new Float32Array(5) }],
+        ["F32Bits on an fp64 array", fp64, { mode: BulkMode.F32Bits, bits: new Uint32Array(5) }],
+        ["F64 on an fp32 array", fp32, { mode: BulkMode.F64, f64: new Float64Array(5) }],
+        // §4.4 gives a boolean no width bound and a zig-zag element no truth
+        // value, so `bool` is an unsigned array's destination only — which the
+        // untagged path refuses too.
+        ["Bool on a signed array", signed, { mode: BulkMode.Bool, bool: new Uint8Array(5) }],
+      ];
+      for (const [name, wireBytes, target] of crossed) {
+        expect(() => decode(wireBytes, handing(target)), name).toThrow(argument);
+      }
+    });
+
+    it("the legal float and bool statements are not caught by that", () => {
+      // The guard is a table, and a table is exactly where an off-by-one sends
+      // a legal statement to the refusal. Each of the eight is exercised on the
+      // kind it belongs to by the cases above this describe block; these are the
+      // three the table singles out.
+      const f32 = new Float32Array(5);
+      decode(wire((os) => os.writeFp32Array(1, FVALS)), handing({ mode: BulkMode.F32, f32 }));
+      expect([...f32]).toStrictEqual(FVALS);
+
+      const f64 = new Float64Array(5);
+      decode(wire((os) => os.writeFp64Array(1, FVALS)), handing({ mode: BulkMode.F64, f64 }));
+      expect([...f64]).toStrictEqual(FVALS);
+
+      const bool = new Uint8Array(5);
+      decode(bytes, handing({ mode: BulkMode.Bool, bool }));
+      expect([...bool]).toStrictEqual([1, 1, 1, 1, 1]);
+    });
+
     it("a mode that is not one of the eight", () => {
       expect(() =>
         decode(bytes, handing({ mode: 42, typed: new Uint16Array(5), ...U16 } as unknown as ArrayTarget)),

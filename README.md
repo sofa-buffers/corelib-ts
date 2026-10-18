@@ -755,13 +755,19 @@ Who owns the bytes:
   which holds the new payload's leading bytes over the old one's tail.
   A **native** array's exact-width destination is reused through one function per
   width — `reuseU8(kept, count)` … `reuseFp64(kept, count)` — and the ownership
-  there splits on the length: a destination that is exactly the wire count is zeroed
-  and refilled **in place**, so a reference you kept into it becomes a reference into
-  the message being decoded now, while a destination of any other length is left
-  untouched and a new one is built instead. The zero is not cosmetic: a typed array's
-  `length` cannot be cut the way `ElementSeq` cuts a plain array's, so without it a
-  decode that stopped early would leave the previous message's elements past the ones
-  it wrote.
+  there splits on the length: a destination that is exactly the wire count is refilled
+  **in place**, so a reference you kept into it becomes a reference into the message
+  being decoded now, while a destination of any other length is left untouched and a
+  new one is built instead. It is handed back *as it is*, not zeroed: an array the
+  decode completes has every slot of it written, and one it does not — a refused
+  element, a message that ends mid-array — has the slots it never reached zeroed by
+  the decoder instead, when the refusal is raised and when the machine is released.
+  A typed array's `length` cannot be cut the way `ElementSeq` cuts a plain array's,
+  so that zero is what keeps the previous message's elements from being read past the
+  ones this one wrote. **It covers the destinations handed over through `arrayBulk`**
+  — which is every destination a generated decode fills. A visitor that pre-sizes one
+  with `reuse*` and then fills it from the per-element callbacks owns that tail
+  itself.
   The **visitor** itself is the last per-decode allocation on that path, and
   `VisitorCache` is where it stops being one: a visitor is bound to the destination
   it was built for, so one cache per generated message type — `new

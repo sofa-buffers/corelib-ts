@@ -123,6 +123,30 @@ const CAP_I16 = TYPED_CAPACITY.get(Int16Array)!;
 const CAP_U32 = TYPED_CAPACITY.get(Uint32Array)!;
 const CAP_I32 = TYPED_CAPACITY.get(Int32Array)!;
 
+/**
+ * Which {@link ArrayKind}s each {@link BulkMode} may be stated for, one bit per
+ * kind — the check that keeps a mode crossing wires with the element kind on the
+ * `ARGUMENT` channel instead of letting a fill loop reach for a field the target
+ * never set and raise a `TypeError`.
+ *
+ * A table rather than a chain of comparisons, because it sits on the path the
+ * stated mode exists to shorten: one load, one shift and one test. An index past
+ * the end reads `undefined`, so a mode that is not one of the eight is refused
+ * by the same line.
+ */
+const MODE_KINDS: readonly number[] = [
+  /* Values  */ (1 << ArrayKind.Unsigned) | (1 << ArrayKind.Signed),
+  /* Typed   */ (1 << ArrayKind.Unsigned) | (1 << ArrayKind.Signed),
+  /* Longs   */ (1 << ArrayKind.Unsigned) | (1 << ArrayKind.Signed),
+  /* Halves  */ (1 << ArrayKind.Unsigned) | (1 << ArrayKind.Signed),
+  // §4.4 gives a boolean no width bound, and a zig-zag element has no truth
+  // value to normalize, so this one is unsigned-only.
+  /* Bool    */ 1 << ArrayKind.Unsigned,
+  /* F32     */ 1 << ArrayKind.Fp32,
+  /* F32Bits */ 1 << ArrayKind.Fp32,
+  /* F64     */ 1 << ArrayKind.Fp64,
+];
+
 /** Whether `d` is one of the two 64-bit destinations, which fill through halves. */
 function is64(d: object): boolean {
   return d instanceof BigUint64Array || d instanceof BigInt64Array;
@@ -1211,22 +1235,31 @@ export class DecoderState {
     const stated = t.mode;
     if (stated === undefined) {
       this.bulkMode = this.resolveTarget(t, kind, count);
-    } else if (stated === BulkMode.Typed) {
-      // The one mode written out here rather than in {@link statedMode}: it is
-      // what generated code states for every `u8`..`u64` array, and the call it
-      // saves was half of what stating a mode bought on the optimizing tier.
-      const d = (t as IntegerArrayTarget).typed;
-      if (d === undefined || d.length < count) this.shortDestination(d, count, "typed");
-      if (d.BYTES_PER_ELEMENT === 8) {
-        // Eight bytes an element is the 64-bit pair, filled through a
-        // `Uint32Array` over its own storage: two halves and no `bigint`.
-        this.bulk64 = new Uint32Array(d.buffer, d.byteOffset, d.length * 2);
-        this.bulkMode = BM.Typed64;
-      } else {
-        this.bulkMode = BM.Typed;
-      }
     } else {
-      this.bulkMode = this.statedMode(t, stated, count);
+      // A mode is a statement about the destination and the kind is a fact about
+      // the wire; a statement that crosses them is a caller mistake, and it has
+      // to be refused as one. Without this the fill arm for the stated mode
+      // reaches for a field the target never set — a `TypeError` out of the
+      // codec, on no error channel at all.
+      const kinds = MODE_KINDS[stated];
+      if (kinds === undefined || (kinds & (1 << kind)) === 0) this.wrongKind(stated, kind);
+      if (stated === BulkMode.Typed) {
+        // The one mode written out here rather than in {@link statedMode}: it is
+        // what generated code states for every `u8`..`u64` array, and the call
+        // it saves was half of what stating a mode bought on the optimizing tier.
+        const d = (t as IntegerArrayTarget).typed;
+        if (d === undefined || d.length < count) this.shortDestination(d, count, "typed");
+        if (d.BYTES_PER_ELEMENT === 8) {
+          // Eight bytes an element is the 64-bit pair, filled through a
+          // `Uint32Array` over its own storage: two halves and no `bigint`.
+          this.bulk64 = new Uint32Array(d.buffer, d.byteOffset, d.length * 2);
+          this.bulkMode = BM.Typed64;
+        } else {
+          this.bulkMode = BM.Typed;
+        }
+      } else {
+        this.bulkMode = this.statedMode(t, stated, count);
+      }
     }
     this.bulk = t;
   }
@@ -1264,11 +1297,12 @@ export class DecoderState {
     }
     if (stated === BulkMode.Halves) {
       const it = t as IntegerArrayTarget;
+      // Each half is reported on its own: a target whose `lo` is right and whose
+      // `hi` is short was being told that "halves" holds `count` of `count`.
       const lo = it.lo;
       const hi = it.hi;
-      if (lo === undefined || hi === undefined || lo.length < count || hi.length < count) {
-        this.shortDestination(lo === undefined ? undefined : lo, count, "halves");
-      }
+      if (lo === undefined || lo.length < count) this.shortDestination(lo, count, "lo");
+      if (hi === undefined || hi.length < count) this.shortDestination(hi, count, "hi");
       return BM.Halves;
     }
     if (stated === BulkMode.Longs) {
@@ -1298,6 +1332,14 @@ export class DecoderState {
       return BM.F32Bits;
     }
     throw argumentError(`array ${this.id}: ${String(stated)} is not a BulkMode`);
+  }
+
+  /** A stated mode that cannot belong to this array's element kind (MODE_KINDS). */
+  private wrongKind(stated: number, kind: ArrayKind): never {
+    throw argumentError(
+      `array ${this.id}: the target states mode ${stated}, which no ` +
+        `${ArrayKind.Unsigned === kind ? "unsigned" : ArrayKind.Signed === kind ? "signed" : ArrayKind.Fp32 === kind ? "fp32" : "fp64"} array can have`,
+    );
   }
 
   /** The one refusal {@link statedMode} raises, out of line so its arms stay small. */
