@@ -209,6 +209,30 @@ export class PayloadAcc {
    * Note that the failure need not arrive as a throw — `tryDecode` reports a
    * buffer that ends mid-payload by *returning* `Incomplete`.
    */
+  /**
+   * Drop the payload in progress, if there is one: what a decode that ended
+   * mid-payload left behind.
+   *
+   * An accumulator that outlives one decode — a generated `tryDecode` keeps one
+   * per destination ({@link VisitorCache}) — otherwise holds that partial
+   * payload's buffer until some later decode starts a payload, and that buffer is
+   * sized by a `total` the sender declared. Nothing READS it: a payload's first
+   * piece always arrives at `offset === 0`, which resets whatever was there, and a
+   * one-shot decode never continues a payload across calls. So this is liveness,
+   * not correctness — the same thing {@link DecoderState.release} does for the
+   * decoder's own references (CORELIB_PLAN §6.6/§6.7, "keep nothing of the
+   * caller's alive").
+   *
+   * Call it where the decode ends. Calling it mid-payload abandons that payload:
+   * the pieces already copied stay where they were written — in the caller's
+   * buffer under {@link takeInto}, in a buffer nobody else holds under
+   * {@link take} — and the continuation is dropped as a late piece.
+   */
+  release(): void {
+    this.buf = null;
+    this.len = 0;
+  }
+
   takeReusing(
     kept: Uint8Array | null,
     total: number,

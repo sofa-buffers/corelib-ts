@@ -718,7 +718,12 @@ Who owns the bytes:
   returns storage of its own that aliases nothing, on the whole-payload path exactly
   as on the split one. `takeInto(dst, total, offset, src, start, end)` is that same
   join into a buffer **you** hold, on the split path too; `dst.length` must be the
-  payload's `total`, or it is `ARGUMENT`, and what comes back is `dst` itself. `StringSeq` / `BlobSeq` collect the elements of a `string` /
+  payload's `total`, or it is `ARGUMENT`, and what comes back is `dst` itself.
+  `release()` drops a payload left in progress — what a decode that ended
+  mid-payload leaves behind, sized by a `total` the sender declared — and is for an
+  accumulator that outlives one decode: nothing reads that buffer either way, since
+  a payload's first piece resets at `offset === 0`, so this is liveness, like the
+  decoder's own `release`. `StringSeq` / `BlobSeq` collect the elements of a `string` /
   `blob` wrapper array; `ElementSeq` holds the index rules for any element kind
   (index bound, gap fill, last-write-wins) and `FramedSeq` is its twin for an element
   whose default is a fresh object — a `struct`, a `union`, a nested row — where one

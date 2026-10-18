@@ -21,6 +21,7 @@
 
 import { describe, expect, it } from "vitest";
 import { PayloadAcc, SofabError, SofabErrorCode } from "../src/index.js";
+import { survivors } from "./helpers/retention.js";
 
 /** `n` distinct bytes, so a mis-ordered join cannot pass by accident. */
 function payload(n: number): Uint8Array {
@@ -155,6 +156,48 @@ describe("PayloadAcc keeps consecutive payloads apart", () => {
     // …and the accumulator is still usable for a real payload afterwards.
     const p = payload(3);
     expect([...acc.take(3, 0, p, 0, p.length)!]).toStrictEqual([...p]);
+  });
+
+  it("is usable for the next payload after release, twice over", () => {
+    // What an accumulator kept across decodes would otherwise pin: a decode that
+    // ended mid-payload leaves that payload's buffer behind, sized by a `total`
+    // the sender declared. `release()` is where a caller that keeps the
+    // accumulator -- a generated tryDecode keeps one per destination -- drops it.
+    const acc = new PayloadAcc();
+    const abandoned = payload(9);
+    expect(acc.take(9, 0, abandoned, 0, 5)).toBeNull();
+    acc.release();
+    acc.release(); // released twice is released once
+    const next = payload(4);
+    expect([...acc.take(4, 0, next, 0, next.length)!]).toStrictEqual([...next]);
+  });
+
+  it("drops the partial payload it was holding", async () => {
+    // The liveness half, and the whole reason the method exists: after release,
+    // the buffer the abandoned payload was assembling in is unreachable. Under
+    // `takeInto` that buffer is the CALLER's, so this uses `take`, whose buffer
+    // the accumulator is otherwise the only holder of.
+    const acc = new PayloadAcc();
+    expect(
+      await survivors(() => {
+        // takeInto, because the buffer has to be one this test can WATCH: what
+        // `take` allocates for itself, the accumulator is the only holder of.
+        const dst = new Uint8Array(2048);
+        expect(acc.takeInto(dst, 2048, 0, payload(2048), 0, 8)).toBeNull();
+        acc.release();
+        return { dst };
+      }),
+    ).toEqual([]);
+  });
+
+  it("abandons a payload in progress rather than finishing it", () => {
+    // Called mid-payload, the continuation becomes a late piece with nothing to
+    // append to: null, not a payload nobody sent.
+    const acc = new PayloadAcc();
+    const p = payload(6);
+    expect(acc.take(6, 0, p, 0, 3)).toBeNull();
+    acc.release();
+    expect(acc.take(6, 3, p, 3, p.length)).toBeNull();
   });
 
   it("allocates nothing for a two-billion-byte claim it never starts", () => {
