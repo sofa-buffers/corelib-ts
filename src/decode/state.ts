@@ -400,7 +400,13 @@ export class DecoderState {
     this.view = null;
     this.viewOf = null;
     // A decode aborted inside an array leaves the visitor's destination here;
-    // a pooled machine must not keep it alive (see {@link bulk}).
+    // a pooled machine must not keep it alive (see {@link bulk}), and the slots
+    // that decode never reached are zeroed first — this is where a truncated
+    // one-shot decode's destination is settled (see {@link zeroBulkTail}).
+    // Guarded at the call site: a decode that ended cleanly has no open array,
+    // and this way it pays a load and a compare rather than a call into a
+    // method this size, which V8 does not inline.
+    if (this.bulk !== null) this.zeroBulkTail();
     this.bulk = null;
     this.bulk64 = null;
   }
@@ -863,9 +869,12 @@ export class DecoderState {
    */
   private latch<E extends SofabError>(e: E): E {
     this.refusal = e;
-    // Nothing more will be decoded, so the visitor's destination is dropped here
-    // as it would have been at `arrayEnd`: a latched stream the caller keeps must
-    // not keep *their* storage alive with it (§6.6; see {@link bulk}).
+    // Nothing more will be decoded, so the visitor's destination is settled and
+    // then dropped here, as it would have been at `arrayEnd`: the slots this
+    // array never wrote are zeroed (see {@link zeroBulkTail}), and a latched
+    // stream the caller keeps must not keep *their* storage alive with it
+    // (§6.6; see {@link bulk}).
+    if (this.bulk !== null) this.zeroBulkTail();
     this.bulk = null;
     this.bulk64 = null;
     return e;
@@ -1072,6 +1081,65 @@ export class DecoderState {
         ? (t as IntegerArrayTarget).longs!
         : (t as IntegerArrayTarget).values!;
     if (out.length > written) out.length = written;
+  }
+
+  /**
+   * Settle a destination this decode stopped inside: the slots from
+   * {@link arrIndex} to {@link arrCount} are the ones it never reached, and they
+   * are zeroed so a destination reused across messages cannot show the previous
+   * one's elements past this array's prefix. A plain-array destination is cut to
+   * the prefix instead, which is what it always was.
+   *
+   * **This is the whole of what `reuse*` used to pay for up front**, and the
+   * difference is where the information is: an array the decode completes has
+   * every slot of it written, so zeroing before the fill was work for a case that
+   * had not happened and usually would not — 198 Ir per array on the optimizing
+   * tier, 243 on the baseline one (see `decode/reuse.ts`). Here it costs nothing
+   * at all until a decode actually stops inside an array: on a completed array
+   * {@link endArray} has already dropped {@link bulk}, so this returns on its
+   * first test.
+   *
+   * Called from the two places a decode can be over while an array is still open:
+   * {@link latch}, which every terminal refusal passes through and which drops the
+   * destination right after, and {@link release}, which `decode` and `tryDecode`
+   * run in a `finally` — so a truncated message settles there. A
+   * *streaming* caller that abandons a decode mid-array without releasing the
+   * machine keeps what was written, which is what {@link ArrayTarget} says
+   * anyway: the destination is a statement about the array only once `arrayEnd`
+   * has been raised or an element has been refused.
+   */
+  private zeroBulkTail(): void {
+    const t = this.bulk;
+    if (t === null) return;
+    const from = this.arrIndex;
+    const to = this.arrCount;
+    if (from >= to) return;
+    const mode = this.bulkMode;
+    if (mode === BM.Typed) {
+      // The eight widths are a union, so the store needs one of them named;
+      // every narrow one takes a `number` zero.
+      ((t as IntegerArrayTarget).typed as Uint32Array).fill(0, from, to);
+    } else if (mode === BM.Typed64) {
+      // `fill` on a 64-bit typed array takes a `bigint`; the pair is the only
+      // destination whose zero is not `0`.
+      ((t as IntegerArrayTarget).typed as BigUint64Array).fill(0n, from, to);
+    } else if (mode === BM.Halves) {
+      const it = t as IntegerArrayTarget;
+      it.lo!.fill(0, from, to);
+      it.hi!.fill(0, from, to);
+    } else if (mode === BM.Bool) {
+      (t as BoolArrayTarget).bool.fill(0, from, to);
+    } else if (mode === BM.F32) {
+      (t as FloatArrayTarget).f32!.fill(0, from, to);
+    } else if (mode === BM.F32Bits) {
+      (t as FloatArrayTarget).bits!.fill(0, from, to);
+    } else if (mode === BM.F64) {
+      (t as FloatArrayTarget).f64!.fill(0, from, to);
+    } else {
+      // Values / Values32 / Longs: a plain array has no tail to zero, it has one
+      // to cut, and {@link trimPlain} is the same cut `arrayEnd` makes.
+      this.trimPlain(t, from);
+    }
   }
 
   /**
@@ -2196,6 +2264,10 @@ export class DecoderState {
     // is left is what this array wrote (see {@link trimPlain}).
     const t = this.bulk;
     if (t !== null) this.trimPlain(t, index);
+    // The fill loops keep their index in a local and publish it once per drain,
+    // so the field is stale here — and it is what {@link zeroBulkTail} reads to
+    // find the slots this array never wrote. This is the stopped position.
+    this.arrIndex = index;
     this.fail(`array ${this.id}: element ${index} outside the schema bound`);
   }
 

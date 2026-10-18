@@ -111,7 +111,14 @@ import { DecoderState } from "./state.js";
  *
  * A decode that fails *inside* an array for any other reason — malformed bytes, or
  * input that simply ends — leaves the destination holding what had been written
- * when it stopped. `length` is a statement about the array only once `arrayEnd`
+ * when it stopped, and **the slots past that are zeroed**: the refusal that stopped
+ * it zeroes them, and so does releasing the machine, which `decode` and
+ * `tryDecode` do in a `finally`. So a destination reused across messages cannot
+ * show the previous one's elements past this array's prefix, which is the promise
+ * `decode/reuse.ts` used to buy by zeroing every destination before every fill —
+ * 198 Ir per array for a case that had usually not happened. A plain-array
+ * destination is cut to the prefix instead, which is the same cut `arrayEnd`
+ * makes. `length` is a statement about the array only once `arrayEnd`
  * has been raised or an element has been refused. This is the one
  * place the codec holds a reference to the caller's storage between calls (§6.6
  * otherwise holds nothing past a callback), and the reference is dropped at
