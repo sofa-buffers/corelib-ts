@@ -63,6 +63,52 @@ export const ArrayKind = {
 /** An array field's element kind: one of the {@link ArrayKind} values. */
 export type ArrayKind = (typeof ArrayKind)[keyof typeof ArrayKind];
 
+/**
+ * Which destination field an {@link ArrayTarget} sets — stated by the caller, so
+ * the decoder does not have to work it out again for every array of every message.
+ *
+ * **It is an assertion, not a hint.** A target that states its mode is taken at its
+ * word: the decoder stops looking at the other destination fields, stops checking
+ * that exactly one of them is set, and stops re-reading whether the stated bound is
+ * four well-formed halves or whether a typed destination's width covers it. What it
+ * still does, every time, is the one thing that changes per message — compare the
+ * destination's length against the element count — because that is the only check
+ * that is about *this* array rather than about the schema.
+ *
+ * So a wrong mode is a caller mistake of the same severity as a wrong bound, and it
+ * fails the same way: the decoder fills the destination the mode names, with the
+ * bound the target states, and a mode that does not match the object either refuses
+ * a legal message or writes into the wrong field. Generated code derives both from
+ * the same schema field and cannot disagree with itself; a hand-written visitor that
+ * is not sure should simply **leave it out**, which is every target that exists today
+ * and which keeps the full per-array validation (§6.3).
+ *
+ * The members name *fields*, not fill strategies: the decoder still picks the 32-bit
+ * drain over the wide one from the bound it was given, and the halves-filled 64-bit
+ * store from the destination's own element width. Those two are a compare each; the
+ * work this saves is the search for the field in the first place.
+ */
+export const BulkMode = {
+  /** {@link IntegerArrayTarget.values} — a plain array, number-first. */
+  Values: 0,
+  /** {@link IntegerArrayTarget.typed} — an exact-width typed array. */
+  Typed: 1,
+  /** {@link IntegerArrayTarget.longs} — a plain array of {@link Long}. */
+  Longs: 2,
+  /** {@link IntegerArrayTarget.lo} and `hi` — the raw halves, nothing joined. */
+  Halves: 3,
+  /** {@link BoolArrayTarget.bool} — one normalized byte per element. */
+  Bool: 4,
+  /** {@link FloatArrayTarget.f32} — fp32 values. */
+  F32: 5,
+  /** {@link FloatArrayTarget.bits} — the fp32 wire words, so an sNaN survives. */
+  F32Bits: 6,
+  /** {@link FloatArrayTarget.f64} — fp64 values. */
+  F64: 7,
+} as const;
+/** The destination an array target names: one of the {@link BulkMode} values. */
+export type BulkMode = (typeof BulkMode)[keyof typeof BulkMode];
+
 /** Largest permitted field id and fixlen length / array count: `INT32_MAX`. */
 export const ID_MAX = 0x7fff_ffff;
 /** Largest permitted fixlen byte length: `INT32_MAX`. */

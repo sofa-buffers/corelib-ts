@@ -30,6 +30,7 @@
 
 import {
   ARRAY_MAX,
+  BulkMode,
   ArrayKind,
   DecodeStatus,
   FIXLEN_MAX,
@@ -1174,8 +1175,104 @@ export class DecoderState {
     // Resolve *before* storing: a target this machine cannot fill is a caller
     // mistake (§6.3's third row), and it is refused with nothing written and the
     // array still on the per-element path's terms.
-    this.bulkMode = this.resolveTarget(t, kind, count);
+    //
+    // A target that states its mode is taken at its word (see {@link BulkMode}):
+    // which field it set, that it set only that one, and that its bound is four
+    // well-formed halves inside the destination's width are all answers the schema
+    // gave at codegen time, and re-deriving them per array and per message is 186
+    // Ir an array on the optimizing tier and ~3,750 on the baseline one. What stays
+    // is the length, because that is the one question about *this* array.
+    const stated = t.mode;
+    this.bulkMode =
+      stated === undefined ? this.resolveTarget(t, kind, count) : this.statedMode(t, stated, count);
     this.bulk = t;
+  }
+
+  /**
+   * The hand-off for a target that **states** its destination: store the mode it
+   * declared and compare the one thing that is about this array rather than about
+   * the schema — whether that destination holds `count` elements.
+   *
+   * Everything {@link resolveTarget} does beyond that is a question the schema
+   * answered when the visitor was generated: which field is set, that only one is,
+   * that the bound is four well-formed halves, that the interval is not empty, and
+   * that a typed destination's width covers it. A stated mode is an assertion that
+   * those answers hold (§6.3, and {@link BulkMode} for what a wrong one costs the
+   * caller), so none of them is asked again.
+   *
+   * Two refinements stay here because they are a compare each and they are about
+   * the *fill*, not about the target's shape: a bound whose high halves are both
+   * zero takes the 32-bit arm, and a destination of eight-byte elements is filled
+   * through the halves view rather than element by element. Generated code states
+   * the field it set; it does not have to know which drain that becomes.
+   *
+   * The destination is read either way, so an absent one is caught for free and
+   * refused as the caller mistake it is rather than becoming a `TypeError` in the
+   * fill loop.
+   */
+  private statedMode(t: ArrayTarget, stated: BulkMode, count: number): BM {
+    if (stated === BulkMode.Typed) {
+      const d = (t as IntegerArrayTarget).typed;
+      if (d === undefined || d.length < count) this.shortDestination(d, count, "typed");
+      // Eight bytes an element is the 64-bit pair, which fills through a
+      // `Uint32Array` over its own storage — two halves per element and no
+      // `bigint`. Everything narrower stores the low half.
+      if (d.BYTES_PER_ELEMENT !== 8) return BM.Typed;
+      this.bulk64 = new Uint32Array(d.buffer, d.byteOffset, d.length * 2);
+      return BM.Typed64;
+    }
+    if (stated === BulkMode.Values) {
+      const it = t as IntegerArrayTarget;
+      if (it.values === undefined) this.shortDestination(undefined, count, "values");
+      // A plain array needs no length: it grows on write, and its tail is cut
+      // where the fill ended ({@link trimPlain}).
+      return it.minHi === 0 && it.maxHi === 0 ? BM.Values32 : BM.Values;
+    }
+    if (stated === BulkMode.Halves) {
+      const it = t as IntegerArrayTarget;
+      const lo = it.lo;
+      const hi = it.hi;
+      if (lo === undefined || hi === undefined || lo.length < count || hi.length < count) {
+        this.shortDestination(lo === undefined ? undefined : lo, count, "halves");
+      }
+      return BM.Halves;
+    }
+    if (stated === BulkMode.Longs) {
+      if ((t as IntegerArrayTarget).longs === undefined) {
+        this.shortDestination(undefined, count, "longs");
+      }
+      return BM.Longs;
+    }
+    if (stated === BulkMode.Bool) {
+      const d = (t as BoolArrayTarget).bool;
+      if (d === undefined || d.length < count) this.shortDestination(d, count, "bool");
+      return BM.Bool;
+    }
+    if (stated === BulkMode.F32) {
+      const d = (t as FloatArrayTarget).f32;
+      if (d === undefined || d.length < count) this.shortDestination(d, count, "f32");
+      return BM.F32;
+    }
+    if (stated === BulkMode.F64) {
+      const d = (t as FloatArrayTarget).f64;
+      if (d === undefined || d.length < count) this.shortDestination(d, count, "f64");
+      return BM.F64;
+    }
+    if (stated === BulkMode.F32Bits) {
+      const d = (t as FloatArrayTarget).bits;
+      if (d === undefined || d.length < count) this.shortDestination(d, count, "bits");
+      return BM.F32Bits;
+    }
+    throw argumentError(`array ${this.id}: ${String(stated)} is not a BulkMode`);
+  }
+
+  /** The one refusal {@link statedMode} raises, out of line so its arms stay small. */
+  private shortDestination(d: { length: number } | undefined, count: number, what: string): never {
+    throw argumentError(
+      d === undefined
+        ? `array ${this.id}: the target states the ${what} destination and does not set it`
+        : `array ${this.id}: ${what} destination holds ${d.length} of ${count} elements`,
+    );
   }
 
   /**

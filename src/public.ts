@@ -6,6 +6,7 @@
 export {
   API_VERSION,
   ArrayKind,
+  BulkMode,
   DecodeStatus,
   FixlenSubtype,
   WireType,
