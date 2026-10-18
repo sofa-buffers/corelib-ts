@@ -44,6 +44,7 @@ export type {
 export { decodeUtf8 } from "./decode/text.js";
 export { PayloadAcc } from "./decode/acc.js";
 export { BlobSeq, ElementSeq, FramedSeq, StringSeq, UNBOUNDED } from "./decode/seq.js";
+export { VisitorCache } from "./decode/vcache.js";
 export {
   reuseFp32,
   reuseFp64,
