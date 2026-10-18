@@ -740,7 +740,28 @@ export class DecoderState {
           // start a fresh one and drop it.
           if (this.vBytes === 0) {
             while (idx < count && i <= safeEnd) {
-              i = this.varintFull(input, i);
+              // An element nobody asked for needs its LENGTH, not its value:
+              // walk to the byte that clears the continuation bit instead of
+              // accumulating halves nothing will read. {@link varintFull} costs
+              // ~85 Ir an element here, and almost all of it is work for a value
+              // that is discarded.
+              //
+              // **Both of its refusals are kept**, because §4.1.3 is about the
+              // bytes and not about who wanted them: a verdict that depended on
+              // whether a visitor declined the field would be a different verdict
+              // for the same message. So an eleventh byte is INVALID, and so is a
+              // tenth carrying more than bit 63.
+              let k = 1;
+              let b = input[i]!;
+              while (b >= 0x80) {
+                if (k === VARINT_MAX_BYTES) this.fail("varint overflow");
+                b = input[i + k]!;
+                k++;
+              }
+              if (k === VARINT_MAX_BYTES && ((b & 0x7f) >> 1) !== 0) {
+                this.fail("varint overflow");
+              }
+              i += k;
               idx++;
             }
             this.arrIndex = idx;
