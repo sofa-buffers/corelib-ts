@@ -1584,8 +1584,10 @@ export class DecoderState {
    * and a loop deciding that per element would give back what the hand-off saves.
    * `arrIndex` is likewise written once per drain instead of once per element,
    * which is part of why a bulk fill costs less than *discarding* the same
-   * elements. A refusal mid-loop leaves it at the last committed value; nothing
-   * reads it afterwards, because that verdict is terminal (§5.2.1).
+   * elements. A refusal mid-loop publishes it first ({@link failAt},
+   * {@link outOfBound}): the verdict is terminal (§5.2.1), but
+   * {@link zeroBulkTail} still reads the field to tell this array's written
+   * prefix from the slots it never reached.
    */
   private uBulkArm(
     input: Uint8Array,
@@ -1658,6 +1660,9 @@ export class DecoderState {
                         0;
                       i += 5;
                     } else {
+                      // `varintFull` raises the overflow refusal itself, so the
+                      // stopped position is published before the call.
+                      this.arrIndex = idx;
                       i = this.varintFull(input, i);
                       lo = this.vLo >>> 0;
                       if (this.vHi !== 0) this.outOfBound(idx);
@@ -1760,6 +1765,9 @@ export class DecoderState {
                         0;
                       i += 5;
                     } else {
+                      // `varintFull` raises the overflow refusal itself, so the
+                      // stopped position is published before the call.
+                      this.arrIndex = idx;
                       i = this.varintFull(input, i);
                       lo = this.vLo >>> 0;
                       if (this.vHi !== 0) this.outOfBound(idx);
@@ -1882,13 +1890,13 @@ export class DecoderState {
               // Tenth byte: only bit 63 is left below 64, so any higher payload bit
               // — or an eleventh byte — is a >64-bit overflow (§4.1.3).
               b = input[i + 9]!;
-              if (((b & 0x7f) >> 1) !== 0) this.fail("varint overflow");
+              if (((b & 0x7f) >> 1) !== 0) this.failAt(idx, "varint overflow");
               hi |= (b & 0x7f) << 31;
               if (b < 0x80) {
                 i += 10;
                 break word;
               }
-              this.fail("varint overflow");
+              this.failAt(idx, "varint overflow");
             }
             lo = lo >>> 0;
             hi = hi >>> 0;
@@ -1911,12 +1919,15 @@ export class DecoderState {
           // encoder may write back — so the normalization is the store.
           const out = (this.bulk as BoolArrayTarget).bool;
           while (idx < count && i <= safeEnd) {
+            // Published before the call for the reason {@link failAt} gives.
+            this.arrIndex = idx;
             i = this.varintFull(input, i);
             out[idx++] = this.vLo !== 0 || this.vHi !== 0 ? 1 : 0;
           }
         } else if (mode === BM.Values) {
           const out = t.values!;
           while (idx < count && i <= safeEnd) {
+            this.arrIndex = idx;
             i = this.varintFull(input, i);
             const lo = this.vLo >>> 0;
             const hi = this.vHi >>> 0;
@@ -1933,6 +1944,7 @@ export class DecoderState {
         } else if (mode === BM.Longs) {
           const out = t.longs!;
           while (idx < count && i <= safeEnd) {
+            this.arrIndex = idx;
             i = this.varintFull(input, i);
             const lo = this.vLo >>> 0;
             const hi = this.vHi >>> 0;
@@ -2014,13 +2026,13 @@ export class DecoderState {
               // Tenth byte: only bit 63 is left below 64, so any higher payload bit
               // — or an eleventh byte — is a >64-bit overflow (§4.1.3).
               b = input[i + 9]!;
-              if (((b & 0x7f) >> 1) !== 0) this.fail("varint overflow");
+              if (((b & 0x7f) >> 1) !== 0) this.failAt(idx, "varint overflow");
               hi |= (b & 0x7f) << 31;
               if (b < 0x80) {
                 i += 10;
                 break word;
               }
-              this.fail("varint overflow");
+              this.failAt(idx, "varint overflow");
             }
             lo = lo >>> 0;
             hi = hi >>> 0;
@@ -2151,13 +2163,13 @@ export class DecoderState {
             // Tenth byte: only bit 63 is left below 64, so any higher payload bit
             // — or an eleventh byte — is a >64-bit overflow (§4.1.3).
             b = input[i + 9]!;
-            if (((b & 0x7f) >> 1) !== 0) this.fail("varint overflow");
+            if (((b & 0x7f) >> 1) !== 0) this.failAt(idx, "varint overflow");
             rawHi |= (b & 0x7f) << 31;
             if (b < 0x80) {
               i += 10;
               break word;
             }
-            this.fail("varint overflow");
+            this.failAt(idx, "varint overflow");
           }
           raw = raw >>> 0;
           rawHi = rawHi >>> 0;
@@ -2381,6 +2393,22 @@ export class DecoderState {
       t.lo![idx] = lo;
       t.hi![idx] = hi;
     }
+  }
+
+  /**
+   * Fail out of a fill loop at element `idx` — publishing it first.
+   *
+   * The drains keep their index in a local and write {@link arrIndex} once per
+   * drain, so at a refusal raised *inside* the loop the field still holds the
+   * value it had when the drain began. {@link zeroBulkTail} reads that field to
+   * find the slots this array never wrote, so a stale one makes it zero the
+   * elements the decode had already delivered — the prefix {@link ArrayTarget}
+   * promises stands. {@link outOfBound} publishes it for the same reason; this is
+   * the other way out of those loops.
+   */
+  private failAt(idx: number, message: string): never {
+    this.arrIndex = idx;
+    this.fail(message);
   }
 
   /**
