@@ -38,7 +38,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
 
       - name: Resolve and validate version from tag
         id: resolve
@@ -151,7 +151,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version: 26
           # Sets the registry in .npmrc so publish targets the public npm
           # registry. Trusted Publishing needs no token here.
           registry-url: https://registry.npmjs.org
