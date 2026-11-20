@@ -152,7 +152,11 @@ jobs:
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
           EOF
           for attempt in 1 2 3; do sudo apt-get update -qq && break || sleep 10; done
-          sudo apt-get install -y -qq qemu-user libc6:s390x libstdc++6:s390x
+          # The image ships its own build of the gcc runtime libraries under the
+          # archive's version string; apt counts swapping in the archive build (to
+          # pair it with the s390x copies) as a downgrade.
+          sudo apt-get install -y -qq --allow-downgrades \
+            qemu-user libc6:s390x libstdc++6:s390x libatomic1:s390x
 
       - name: Fetch Node's own s390x build
         run: |
